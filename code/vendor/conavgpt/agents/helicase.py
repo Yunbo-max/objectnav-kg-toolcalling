@@ -24,8 +24,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Set
 import json
 
-# KG with object merging + spatial edges (local module)
-from kg_construction import KnowledgeGraph, KGNode, KGEdge, KGUpdater
+# Use the new KG with proper object merging + spatial edges
+from agents.helicase_kg import KnowledgeGraph, KGNode, KGEdge, KGUpdater
 
 
 # ═══════════════════════════════════════════════════════
