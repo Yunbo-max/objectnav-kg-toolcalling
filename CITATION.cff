@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+title: "MindNav: Knowledge-Graph Tool Calling for Training-Free Multi-Robot Object Navigation"
+message: If you use this code or paper, please cite.
+type: software
+authors:
+  - family-names: Long
+    given-names: Yunbo
+preferred-citation:
+  type: conference-paper
+  title: "MindNav: Knowledge-Graph Tool Calling for Training-Free Multi-Robot Object Navigation"
+  year: 2026
+  conference:
+    name: EMNLP
+  authors:
+    - family-names: Long
+      given-names: Yunbo

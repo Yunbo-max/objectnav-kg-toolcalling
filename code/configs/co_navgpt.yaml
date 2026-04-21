@@ -1,0 +1,13 @@
+method: co_navgpt
+num_robots: 2
+max_steps: 500
+global_plan_every: 25
+
+brain:
+  mode: flat_text        # or "random" for the random-frontier ablation
+  llm_path: /tf/notebooks/models/Qwen2.5-7B-Instruct
+  device: cuda:3
+
+dataset:
+  name: hm3d_v0.2
+  split: val_mini

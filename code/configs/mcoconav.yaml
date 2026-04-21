@@ -1,0 +1,12 @@
+method: mcoconav
+num_robots: 2
+max_steps: 500
+global_plan_every: 25
+
+brain:
+  vlm_path: /tf/notebooks/models/Qwen2.5-VL-7B-Instruct
+  device: cuda:2
+
+dataset:
+  name: hm3d_v0.2
+  split: val_mini

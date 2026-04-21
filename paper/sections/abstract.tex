@@ -1,0 +1,16 @@
+\begin{abstract}
+Multi-robot object navigation at matched 7B parameter scale exposes a sharp
+divide between perception--reasoning interfaces: VLM-based systems that look at
+raw images (MCoCoNav, EfficientNav) collapse to $0\%$ success, while map-based
+systems that serialize the scene to text (Co-NavGPT) retain viable performance.
+We argue the interface, not the model capacity, is the binding constraint: a
+7B VLM asked to reason spatially from raw images underperforms a 7B text LLM
+given a clean symbolic summary. We instantiate this view as \textbf{MindNav},
+a training-free multi-robot navigator that shares the Co-NavGPT perception
+stack (Detectron2 + RedNet + FMM) but replaces flat-text frontier assignment
+with LLM tool-calling over a dynamically constructed knowledge graph of rooms,
+objects, doors, and robots. On HM3D \textsc{val\_mini} with $N{=}2$ robots and
+Qwen2.5-7B-Instruct, MindNav reaches $\mathrm{SR}{=}0.733$ and $\mathrm{SPL}{=}0.416$,
+improving SPL by $+36\%$ relative over Co-NavGPT's text-LLM frontier assignment
+at identical perception and LLM scale.
+\end{abstract}

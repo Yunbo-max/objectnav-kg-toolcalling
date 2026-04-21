@@ -1,0 +1,29 @@
+\section{Related Work}
+
+\subsection{LLM / VLM Multi-Robot ObjectNav}
+Co-NavGPT \citep{conavgpt} established the central-LLM frontier-assignment
+recipe with Detectron2+RedNet perception, a 2D semantic map, and flat-text
+LLM reasoning. MCoCoNav \citep{mcoconav} swaps the text LLM for a VLM on the
+same substrate; EfficientNav \citep{efficientnav} explores a more compact
+VLM decision head with panoramic stitches. All three keep the perception map
+and differ in what the reasoner sees.
+
+\subsection{Knowledge Graphs for Navigation}
+Scene graphs have a long history in embodied navigation as offline priors
+\citep{sgnav}. Most systems either build a single monolithic graph offline
+or require graph-specific training. MindNav's KG is \emph{online},
+\emph{incremental}, \emph{training-free}, and \emph{multi-robot}: it is
+updated every 25 local steps from the shared semantic map, merges multiple
+detections into single nodes via noisy-OR certainty, and is consumed by a
+frozen LLM that reasons with parametric priors, not graph embeddings.
+
+\subsection{LLM Tool Calling}
+Tool calling \citep{toolformer} and structured output with JSON schemas are
+well established in general LLM use. Their application to multi-agent
+embodied navigation is less explored: most navigation systems ask the LLM for
+a single JSON dictionary (e.g., the Co-NavGPT frontier assignment). MindNav
+exposes three tools --- \texttt{query\_room\_objects},
+\texttt{estimate\_room\_probability}, \texttt{assign\_frontiers} --- that the
+LLM chains over the KG. This is conceptually equivalent to Chain-of-Tools
+\citep{chainoftools} but targeted at a live KG rather than a static knowledge
+base.

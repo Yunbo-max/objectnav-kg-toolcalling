@@ -1,0 +1,64 @@
+\section{Method: MindNav}
+
+\subsection{Problem Formulation}
+Multi-robot ObjectNav: given target category $g\in\mathcal{G}$, $K{=}2$ robots
+cooperatively explore an unknown indoor environment to locate the nearest
+instance within $1.0$\,m geodesic distance. Each robot observes RGB-D
+$\{(I_k^t,D_k^t)\}$; a shared 2D semantic map $M^t$ is maintained. Every
+$N{=}25$ local steps the global planner extracts frontiers
+$\mathcal{F}=\{f_1,\ldots,f_m\}$ and assigns robots to them. MindNav
+\emph{replaces the frontier-assignment module only}; perception, mapping,
+planning, and control are inherited from Co-NavGPT unchanged.
+
+\subsection{Knowledge Graph Construction}
+
+\paragraph{Node types.} Four: Room ($v_r$), Object ($v_o$), Robot ($v_k$),
+Door ($v_d$). Room IDs are grid-discretized position strings
+$\text{room}\_{\lfloor y/s\rfloor}\_{\lfloor x/s\rfloor}$ for temporal
+stability across frames.
+
+\paragraph{Object merging.} New detections of the same category within
+$\delta{=}30$\,px of an existing node are merged. Position is updated by an
+exponential moving average; certainty is aggregated via noisy-OR:
+\begin{equation}
+\text{cert}(v_o)=1-\prod_{i=1}^{n}(1-c_i),\quad\text{capped at }0.99
+\end{equation}
+where $c_i$ is the $i$-th detection confidence from Detectron2.
+
+\paragraph{Edge types.} Six: \textsc{contains}($v_r,v_o$),
+\textsc{next\_to}($v_{o_1},v_{o_2}$, $<20$\,px),
+\textsc{near}($v_{o_1},v_{o_2}$, $<60$\,px),
+\textsc{connected\_to}($v_{r_1},v_{r_2}$, with distance),
+\textsc{separated\_by\_wall}, and \textsc{in}($v_k,v_r$).
+
+\subsection{LLM Tool Calling over the KG}
+
+At each global step the KG is serialized to structured text and passed to the
+frozen LLM. The LLM is given three tools, and its response is expected to
+call them in order:
+\begin{enumerate}
+    \item \texttt{query\_room\_objects(room\_id)} returns the contained
+    objects and their certainties.
+    \item \texttt{estimate\_room\_probability(room\_id, target)} returns the
+    LLM's own estimate of $P(g\mid\text{room})$ based on the object set
+    (parametric world knowledge --- e.g.
+    $\{\text{sink},\text{towel\_rack}\}\Rightarrow$ bathroom $\Rightarrow$
+    toilet likely).
+    \item \texttt{assign\_frontiers(\{robot\_k: frontier\_j\}, diversity)}
+    returns the final assignment, with an explicit \texttt{diversity} term
+    that penalizes routing both robots to the same area.
+\end{enumerate}
+
+Priority target: if any $\text{cert}(v_o) > \tau{=}0.5$ for an object of the
+target category, the brain bypasses tool calling and sends the nearest robot
+directly --- the same rule Co-NavGPT uses.
+
+\subsection{Why KG Over Flat Text}
+
+Co-NavGPT's flat serialization discards three pieces of structure that our KG
+preserves: (i) aggregated certainty across multiple detections, (ii) room
+connectivity (which frontiers can actually be reached from which room
+without a wall in the way), and (iii) inter-frontier spatial diversity for
+multi-robot coverage. Each of these enters a separate tool call rather than
+being compressed into a single paragraph of text. The LLM still does the
+reasoning with parametric priors; the KG gives it a cleaner question.

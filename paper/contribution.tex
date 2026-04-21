@@ -1,0 +1,55 @@
+\section{Method: MindNav}
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item \textbf{KG-driven autonomous frontier reasoning}: MindNav is the first multi-robot navigation method where the LLM reasons over a dynamically-constructed knowledge graph to estimate target-object probabilities and assign frontiers---replacing both hard-coded heuristics (Co-NavGPT) and unreliable VLM spatial reasoning (MCoCoNav).
+
+    \item \textbf{Incremental KG construction with object merging}: A dynamic knowledge graph that merges multi-detection objects using noisy-OR certainty aggregation ($\text{cert} = 1 - \prod_i(1-c_i)$), builds spatial edges (proximity, containment, room connectivity), and uses position-based room identifiers for temporal stability.
+
+    \item \textbf{Empirical analysis of perception-reasoning interface}: First systematic comparison of VLM-based (image→VLM→decision), text-based (image→perception→text→LLM→decision), and KG-based (image→perception→KG→LLM→decision) reasoning for multi-robot navigation at matched 7B model scale.
+\end{enumerate}
+
+\subsection{Problem Formulation}
+
+Multi-robot ObjectNav: Given target category $g \in \mathcal{G}$, $K=2$ robots cooperatively explore unknown indoor environment to locate nearest instance within 1.0m geodesic distance.
+
+Each robot $k$ observes RGB-D: $\{(I_k^t, D_k^t)\}_{t=1}^T$. Shared global semantic map $M^t$ updated each step. Every $N=25$ local steps, global planner extracts frontiers $\mathcal{F} = \{f_1, \ldots, f_m\}$ and assigns robots to frontiers.
+
+\textbf{MindNav replaces the frontier assignment module.}
+
+\subsection{Knowledge Graph Construction}
+
+\paragraph{Node types.} Four types: Room ($v_r$), Object ($v_o$), Robot ($v_k$), Door ($v_d$).
+
+Room IDs: $\text{room}\_{\lfloor y/s \rfloor}\_{\lfloor x/s \rfloor}$ (position-based for temporal stability).
+
+Object merging: same category within $\delta=30$px merged into single node.
+
+\paragraph{Certainty computation (Noisy-OR).}
+\begin{equation}
+    \text{cert}(v_o) = 1 - \prod_{i=1}^{n} (1 - c_i), \quad \text{capped at } 0.99
+\end{equation}
+
+\paragraph{Edge types.} Six types:
+\begin{itemize}
+    \item \textsc{contains}($v_r$, $v_o$): room contains object
+    \item \textsc{next\_to}($v_{o_1}$, $v_{o_2}$): objects within 20px
+    \item \textsc{near}($v_{o_1}$, $v_{o_2}$): objects within 60px
+    \item \textsc{connected\_to}($v_{r_1}$, $v_{r_2}$): traversable rooms with distance
+    \item \textsc{separated\_by\_wall}($v_{r_1}$, $v_{r_2}$): wall-separated rooms
+    \item \textsc{in}($v_k$, $v_r$): robot in room
+\end{itemize}
+
+\subsection{KG-Driven Brain Reasoning}
+
+KG serialized to structured text → LLM prompt:
+\begin{enumerate}
+    \item Estimate $P(\text{target} \mid \text{room})$ from KG object-room relationships
+    \item Assign each robot to different frontier (maximize coverage)
+    \item Use inter-frontier distances for spatial diversity
+\end{enumerate}
+
+\textbf{Key: No hard-coded heuristics.} LLM infers from KG that $\{\text{sink}, \text{towel\_rack}\} \Rightarrow$ bathroom $\Rightarrow$ likely toilet, using parametric world knowledge.
+
+Priority target: if target detected with cert $> \tau = 0.5$, bypass reasoning, send nearest robot.

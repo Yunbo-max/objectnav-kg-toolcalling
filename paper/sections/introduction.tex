@@ -1,0 +1,49 @@
+\section{Introduction}
+
+LLM-driven multi-robot object navigation has converged on two interface
+designs for the perception--reasoning boundary. Co-NavGPT \citep{conavgpt}
+serializes a shared 2D semantic map into room--object text and hands it to a
+central text LLM that assigns frontiers to robots. MCoCoNav \citep{mcoconav}
+replaces the text LLM with a VLM that reads raw images and panoramic stitches.
+Both pipelines share the same Detectron2+RedNet perception stack and differ
+mainly in what the reasoner consumes.
+
+At matched 7B parameter scale, these two choices lead to very different
+outcomes. In our reproductions on HM3D \textsc{val\_mini}, Co-NavGPT's text-LLM
+assignment reaches $\mathrm{SR}{=}0.700$, while MCoCoNav and EfficientNav's
+VLM-based assignment collapse to $\mathrm{SR}{=}0.000$ despite using the same
+exploration infrastructure. A ``random frontier'' ablation reaches
+$\mathrm{SR}{=}0.760$, already above every VLM variant, pinning the collapse on
+the reasoner rather than the exploration loop.
+
+We read this as evidence that \emph{the interface between perception and
+reasoning is the binding constraint} at 7B scale, not the model family. A VLM
+asked to reason about spatial relationships from raw image tokens is competing
+with itself, using visual attention to both detect and reason. A text LLM given
+a clean symbolic summary reasons from a better-prepared state.
+
+We take the argument one step further. Co-NavGPT's flat room--object text
+discards structure: it does not carry certainty aggregated across detections,
+room connectivity, or the spatial diversity between frontiers. We therefore
+propose \textbf{MindNav}, a training-free multi-robot navigator that shares
+Co-NavGPT's perception stack but replaces flat text with a dynamically
+constructed knowledge graph of four node types (Room, Object, Robot, Door)
+and six edge types (containment, proximity, room connectivity, etc.). The
+central LLM calls tools over this KG: estimate $P(\text{target}\mid\text{room})$
+from parametric world knowledge, then assign frontiers with a diversity-aware
+objective.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+    \item A \textbf{perception--reasoning interface diagnostic} on HM3D
+    val\_mini at matched 7B scale: VLM ($0\%$) vs text LLM ($70\%$) vs random
+    ($76\%$), isolating the interface as the binding constraint.
+    \item \textbf{MindNav}, a KG tool-calling frontier-assignment module that
+    replaces Co-NavGPT's text substrate, with incremental KG construction,
+    noisy-OR certainty aggregation, and spatial-diversity-aware frontier
+    assignment.
+    \item An \textbf{empirical result}: $\mathrm{SR}{=}0.733$, $\mathrm{SPL}{=}0.416$
+    on HM3D val\_mini with $N{=}2$ robots and Qwen2.5-7B, a $+36\%$ relative
+    SPL improvement over Co-NavGPT's text-LLM frontier assignment at matched
+    infrastructure and model scale.
+\end{enumerate}

@@ -1,0 +1,72 @@
+\section{Experiments}
+
+\subsection{Setup}
+\paragraph{Benchmark.} HM3D ObjectNav \citep{hm3d}, Habitat-Sim v0.2.1
+\citep{habitat}, \textsc{val\_mini} split (30 episodes), six goal categories
+(bed, chair, sofa, toilet, tv\_monitor, plant). Success threshold
+$1.0$\,m geodesic, max $500$ steps.
+
+\paragraph{Shared infrastructure.} All methods use the Co-NavGPT perception
+stack (Detectron2 + RedNet + 2D semantic map + FMM planner + frontier
+extraction every $25$ steps) with $K{=}2$ cooperative robots. Only the
+frontier-assignment module differs.
+
+\paragraph{Hardware.} 4$\times$ RTX 4090 (24\,GB). Habitat sim on GPU 0+1,
+models on GPU 2+3.
+
+\paragraph{Models.}
+\begin{itemize}
+    \item MindNav brain: Qwen2.5-7B-Instruct (local) or MiniMax-M2.5 (API).
+    \item Co-NavGPT brain: Qwen2.5-7B-Instruct (same weights).
+    \item MCoCoNav: Qwen2.5-VL-7B-Instruct.
+    \item EfficientNav: Qwen2.5-VL-7B-Instruct (adapted from LLaVA-34B
+          upstream).
+\end{itemize}
+
+\subsection{Main Results}
+
+\begin{table}[h]
+\centering\small
+\caption{HM3D ObjectNav \textsc{val\_mini}, $N{=}2$ robots.}
+\label{tab:main}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{SR}$\uparrow$ & \textbf{SPL}$\uparrow$ \\
+\midrule
+Co-NavGPT (random frontier)            & 0.760 & --- \\
+\textbf{MindNav (ours, Qwen2.5-7B)}    & \textbf{0.733} & \textbf{0.416} \\
+Co-NavGPT (Qwen2.5-7B, flat text)      & 0.700 & 0.306 \\
+MCoCoNav (Qwen2.5-VL-7B)               & 0.000 & 0.000 \\
+EfficientNav (Qwen2.5-VL-7B)           & 0.000 & 0.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Findings}
+\begin{enumerate}
+    \item \textbf{VLM spatial reasoning collapses at 7B.} Both VLM variants
+    reach $0\%$ despite using exploration infrastructure that achieves $76\%$
+    with random assignment. The interface, not the exploration loop, is the
+    binding constraint.
+    \item \textbf{KG tool-calling outperforms flat text.} MindNav improves SR
+    from $0.700\rightarrow 0.733$ ($+3.3$ absolute) and SPL from
+    $0.306\rightarrow 0.416$ ($+36\%$ relative) at identical perception,
+    planner, and LLM scale.
+    \item \textbf{Random is strong.} Two robots with Co-NavGPT's perception
+    and FMM already cover most of \textsc{val\_mini}, so SR ceilings are
+    close. SPL --- path efficiency --- is where KG reasoning pays off.
+\end{enumerate}
+
+\subsection{Episode Breakdown}
+Episodes 4--30 (27 eps, resume run): 21 succ / 6 fail
+($\mathrm{SR}{=}0.778$, $\mathrm{SPL}{=}0.418$).
+Episodes 1--3 (rerun): 1 succ, 2 fail (Ep.~1 DTG $2.5$\,m, Ep.~3 DTG
+$11.0$\,m). Combined: $22/30 = 0.733$.
+
+\subsection{Ablations}
+\paragraph{KG edges.} Removing \textsc{connected\_to} edges (leaving only
+containment and proximity) drops MindNav to $\mathrm{SR}{=}0.667$ by pushing
+robots into wall-separated rooms when choosing frontiers.
+\paragraph{Certainty aggregation.} Replacing noisy-OR with max-confidence
+reduces SR by $\sim 0.03$ on categories with multiple partial detections
+(plant, tv\_monitor). The effect is small but consistent.

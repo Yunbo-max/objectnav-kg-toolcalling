@@ -1,0 +1,22 @@
+\section{Discussion \& Limitations}
+
+\paragraph{Why does 7B VLM collapse?} At 7B, the VLM must use a fixed
+attention budget to both localize objects and reason about their spatial
+relationships. Empirically this collapses on HM3D val\_mini. A text LLM at
+the same scale, given a cleaner symbolic summary, preserves the reasoning
+capacity. MindNav's KG improves on the text LLM by preserving structure the
+flat serialization discards.
+
+\paragraph{Limitations.} (i) The evaluation is on val\_mini (30 episodes);
+val\_full is queued. (ii) MindNav's KG is built from the same Detectron2
+detector as Co-NavGPT, inheriting its $\sim 24\%$ false-positive rate
+reported for that pipeline. The KG's noisy-OR partially absorbs this, but
+does not eliminate it. (iii) The tool-calling protocol is JSON-parsed ---
+a fallback to random assignment handles parse failures, which occur on
+$\sim 4\%$ of calls with Qwen2.5-7B.
+
+\section{Conclusion}
+A training-free KG tool-calling interface, sitting between the same
+perception stack and the same LLM, recovers the performance that a 7B VLM
+loses. MindNav is the minimum viable demonstration: perception unchanged,
+planner unchanged, LLM unchanged, symbolic interface replaced.
