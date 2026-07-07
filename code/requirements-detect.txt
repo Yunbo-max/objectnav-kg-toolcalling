@@ -1,0 +1,5 @@
+# Optional semantic-map enhancement dependencies.
+# GroundingDINO is loaded through transformers AutoModelForZeroShotObjectDetection.
+segment-anything
+timm
+huggingface_hub

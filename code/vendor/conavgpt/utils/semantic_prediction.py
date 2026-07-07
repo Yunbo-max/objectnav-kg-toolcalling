@@ -38,12 +38,19 @@ class SemanticPredMaskRCNN():
 
         semantic_input = np.zeros((img.shape[0], img.shape[1], 15 + 1))
 
-        for j, class_idx in enumerate(
-                seg_predictions[0]['instances'].pred_classes.cpu().numpy()):
+        instances = seg_predictions[0]['instances']
+        pred_classes = instances.pred_classes.cpu().numpy()
+        if hasattr(instances, "scores"):
+            scores = instances.scores.cpu().numpy()
+        else:
+            scores = np.ones(len(pred_classes), dtype=np.float32)
+
+        for j, class_idx in enumerate(pred_classes):
             if class_idx in list(coco_categories_mapping.keys()):
                 idx = coco_categories_mapping[class_idx]
                 obj_mask = seg_predictions[0]['instances'].pred_masks[j] * 1.
-                semantic_input[:, :, idx] += obj_mask.cpu().numpy()
+                scored_mask = obj_mask.cpu().numpy() * float(scores[j])
+                semantic_input[:, :, idx] = np.maximum(semantic_input[:, :, idx], scored_mask)
 
         return semantic_input, img
 

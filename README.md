@@ -1,58 +1,77 @@
-# MindNav: Knowledge-Graph Tool Calling for Training-Free Multi-Robot Object Navigation
+# ObjectNav KG Tool-Calling
 
-Reference code and paper for a training-free multi-robot ObjectNav system that
-replaces Co-NavGPT's flat-text frontier assignment with LLM tool-calling over
-a dynamically constructed knowledge graph (KG) of rooms, objects, doors, and
-robots.
-
-Paper: [`paper/main.pdf`](paper/main.pdf) (EMNLP submission).
-
-## Headline result (HM3D `val_mini`, N=2, Qwen2.5-7B-Instruct)
-
-| Method | SR ↑ | SPL ↑ |
-|---|---|---|
-| Co-NavGPT (random frontier) | 0.760 | — |
-| **MindNav (ours)** | **0.733** | **0.416** |
-| Co-NavGPT (LLM, flat text) | 0.700 | 0.306 |
-| MCoCoNav (VLM 7B) | 0.000 | 0.000 |
-| EfficientNav (VLM 7B) | 0.000 | 0.000 |
-
-At matched perception + LLM scale, KG tool calling gives **+36% SPL**
-(relative) over Co-NavGPT's text-LLM frontier assignment.
-
-## Contents
-
-| Path               | What it is |
-|--------------------|------------|
-| `paper/`           | LaTeX source + references.bib + sections |
-| `code/src/`        | KG construction + MindNav brain modules |
-| `code/configs/`    | Launch configs for MindNav and each baseline |
-| `code/scripts/`    | Batch runners and result aggregators |
-| `baselines/`       | Upstream repos + how we ran them |
-| `data/`            | HM3D setup (no data committed) |
-| `results/`         | Raw CSVs, episode logs, plotting scripts |
-| `docs/`            | `INSTALL.md`, `RUN_EXPERIMENTS.md` |
-
-## Quickstart
+This repository is configured for the local workspace:
 
 ```bash
-pip install -r code/requirements.txt
-
-# Run MindNav on val_mini with Qwen2.5-7B brain
-bash code/scripts/run_mindnav.sh
+PROJECT=/home/huaziheng/project/objectnav-kg-toolcalling
+CONAVGPT=$PROJECT/code/vendor/conavgpt
 ```
 
-## Citation
+Python and Habitat commands should use the `mindnav38` conda environment.
 
-```bibtex
-@inproceedings{mindnav2026,
-  title     = {MindNav: Knowledge-Graph Tool Calling for Training-Free Multi-Robot Object Navigation},
-  author    = {Anonymous},
-  booktitle = {EMNLP},
-  year      = {2026}
-}
+## What Is In This Repo
+
+- `code/vendor/conavgpt/`: local Co-NavGPT vendor tree, Habitat entry points, MindNav implementation, and run scripts.
+- `code/scripts/`: reproducibility checks and experiment launch wrappers.
+- `data/README.md`: local HM3D v0.2 layout and dataset verification.
+- `docs/INSTALL.md`: environment, models, DeepSeek API, and HM3D setup.
+- `docs/RUN_EXPERIMENTS.md`: smoke tests, full-val runs, and baseline commands.
+- `results/README.md`: current result files and aggregation notes.
+
+## Local Assets
+
+Current local paths:
+
+```text
+/home/huaziheng/models/Qwen2.5-7B-Instruct
+/home/huaziheng/models/Qwen2.5-VL-7B-Instruct
+code/vendor/conavgpt/RedNet/model/rednet_semmap_mp3d_40.pth
+code/vendor/conavgpt/data/datasets/objectnav_hm3d_v2/
+code/vendor/conavgpt/data/hm3d-v0.2-full/
+code/vendor/conavgpt/data/scene_datasets/hm3d_v0.2
 ```
 
-## License
+`hm3d_v0.2` is a symlink to the downloaded full HM3D v0.2 val assets.
 
-Code: MIT (see `LICENSE`). Paper: CC-BY-4.0.
+## Quick Check
+
+```bash
+cd /home/huaziheng/project/objectnav-kg-toolcalling
+conda run -n mindnav38 python code/scripts/check_repro_env.py \
+  --model-path /home/huaziheng/models/Qwen2.5-7B-Instruct
+```
+
+Before launching Habitat evaluations, check GPU availability and keep the
+default separation: one GPU for Habitat simulation, one for semantic perception,
+and one for local LLM/VLM if using local models.
+
+## Smoke Test
+
+Run one full HM3D `val` episode with KG tool-calling MindNav and DeepSeek:
+
+```bash
+SPLIT=val MAX_EPISODES=1 MAX_EPISODE_LENGTH=60 \
+EXP_NAME=mindnav_kg_deepseek_val_smoke \
+LOG=results/runs/mindnav_kg_deepseek_val_smoke.log \
+JSONL=results/runs/mindnav_kg_deepseek_val_smoke.jsonl \
+BRAIN_BACKEND=deepseek BRAIN_MODEL=deepseek-v4-flash DEEPSEEK_THINKING=disabled \
+bash code/scripts/run_mindnav.sh --method_name mindnav_kg_deepseek_val_smoke
+```
+
+DeepSeek API settings are loaded from the project-root `.env` file. The file is
+gitignored and should stay local.
+
+## Full Evaluation
+
+The full HM3D ObjectNav `val` split has 1000 episodes. Use:
+
+```bash
+SPLIT=val MAX_EPISODES=0 \
+EXP_NAME=mindnav_kg_deepseek_val_full \
+LOG=results/runs/mindnav_kg_deepseek_val_full.log \
+JSONL=results/runs/mindnav_kg_deepseek_val_full.jsonl \
+BRAIN_BACKEND=deepseek BRAIN_MODEL=deepseek-v4-flash DEEPSEEK_THINKING=disabled \
+bash code/scripts/run_mindnav.sh --method_name mindnav_kg_deepseek
+```
+
+For details and baseline commands, see `docs/RUN_EXPERIMENTS.md`.

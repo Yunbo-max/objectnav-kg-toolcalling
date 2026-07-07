@@ -5,7 +5,7 @@ global_plan_every: 25
 
 brain:
   mode: flat_text        # or "random" for the random-frontier ablation
-  llm_path: /tf/notebooks/models/Qwen2.5-7B-Instruct
+  llm_path: /home/huaziheng/models/Qwen2.5-7B-Instruct
   device: cuda:3
 
 dataset:

@@ -1,10 +1,14 @@
 torch==2.1.0
 torchvision==0.16.0
 transformers==4.51.3
+accelerate>=0.30
 numpy==1.26.4
 networkx>=3.2
 Pillow>=10.0
 pyyaml>=6.0
+opencv-python-headless>=4.8
+scikit-image>=0.21
+openai>=1.0
 habitat-sim==0.2.1
 habitat-lab==0.2.1
 # Co-NavGPT perception stack (pinned)

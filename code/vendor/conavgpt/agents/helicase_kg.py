@@ -34,10 +34,11 @@ class KGEdge:
 
 
 class KnowledgeGraph:
-    def __init__(self):
+    def __init__(self, certainty_cap: float = 0.99):
         self.nodes: Dict[str, KGNode] = {}
         self.edges: List[KGEdge] = []
         self._edge_set: Set[Tuple[str, str, str]] = set()
+        self.certainty_cap = certainty_cap
 
     def reset(self):
         self.nodes.clear()
@@ -49,7 +50,7 @@ class KnowledgeGraph:
             existing = self.nodes[node.id]
             # Merge certainty: 1 - (1-old)(1-new)
             existing.certainty = 1.0 - (1.0 - existing.certainty) * (1.0 - node.certainty)
-            existing.certainty = min(existing.certainty, 0.99)
+            existing.certainty = min(existing.certainty, self.certainty_cap)
             if node.position != (0, 0):
                 # Average position for stability
                 if existing.position != (0, 0):
@@ -74,6 +75,16 @@ class KnowledgeGraph:
                 if (e.source, e.target, e.relation) == key:
                     e.distance = edge.distance
                     break
+
+    def remove_edge(self, source: str, target: str, relation: str):
+        key = (source, target, relation)
+        if key not in self._edge_set:
+            return
+        self.edges = [
+            e for e in self.edges
+            if (e.source, e.target, e.relation) != key
+        ]
+        self._edge_set.discard(key)
 
     def get_nodes_by_type(self, node_type: str) -> List[KGNode]:
         return [n for n in self.nodes.values() if n.node_type == node_type]
@@ -132,7 +143,10 @@ class KnowledgeGraph:
 
         # Unexplored rooms
         rooms = self.get_nodes_by_type("room")
-        unexplored = [r for r in rooms if not r.properties.get("explored")]
+        unexplored = [
+            r for r in rooms
+            if not r.properties.get("explored") and r.properties.get("active_frontier")
+        ]
         explored_rooms = [r for r in rooms if r.properties.get("explored")]
 
         if unexplored:
@@ -200,29 +214,133 @@ ROOM_HINTS = {
 MERGE_DISTANCE = 30  # pixels — same object if within this distance
 
 
+def _semantic_categories_for_map(full_map_pred):
+    try:
+        from constants import hm3d_category, category_to_id_mp3d
+    except ImportError:
+        return []
+    if full_map_pred is not None and full_map_pred[4:].shape[0] > len(hm3d_category):
+        return category_to_id_mp3d
+    return hm3d_category
+
+
 class KGUpdater:
-    def __init__(self, kg: KnowledgeGraph):
+    def __init__(
+        self,
+        kg: KnowledgeGraph,
+        room_grid_scale: int = 50,
+        merge_radius_px: float = MERGE_DISTANCE,
+        object_merge_enabled: bool = True,
+        object_merge_radius_px: Optional[float] = None,
+        next_to_px: float = 20,
+        near_px: float = 60,
+        room_connect_px: float = 150,
+        max_room_connections: int = 3,
+        create_pseudo_doors: bool = False,
+        suggests_as_property: bool = True,
+        certainty_cap: Optional[float] = None,
+    ):
         self.kg = kg
-        self._grid_size = 50
+        self._grid_size = int(room_grid_scale)
+        self.merge_radius_px = float(merge_radius_px)
+        self.object_merge_enabled = bool(object_merge_enabled)
+        self.object_merge_radius_px = float(
+            object_merge_radius_px if object_merge_radius_px is not None else merge_radius_px
+        )
+        self.next_to_px = float(next_to_px)
+        self.near_px = float(near_px)
+        self.room_connect_px = float(room_connect_px)
+        self.max_room_connections = int(max_room_connections) if max_room_connections is not None else 0
+        self.create_pseudo_doors = bool(create_pseudo_doors)
+        self.suggests_as_property = bool(suggests_as_property)
+        self.certainty_cap = float(certainty_cap if certainty_cap is not None else kg.certainty_cap)
 
     def _pos_to_room_id(self, y, x):
         gy = int(y // self._grid_size)
         gx = int(x // self._grid_size)
         return f"room_{gy}_{gx}"
 
+    def _room_id_center(self, room_id):
+        try:
+            _, gy, gx = room_id.split("_", 2)
+            return ((int(gy) + 0.5) * self._grid_size, (int(gx) + 0.5) * self._grid_size)
+        except Exception:
+            return (0, 0)
+
+    def _ensure_region_node(self, room_id, position=None, **properties):
+        if room_id in self.kg.nodes:
+            return
+        pos = position if position is not None else self._room_id_center(room_id)
+        props = {"explored": False, "active_frontier": False, "inferred": True}
+        props.update(properties)
+        self.kg.add_node(KGNode(
+            id=room_id,
+            node_type="room",
+            name="unknown",
+            certainty=0.1,
+            position=pos,
+            properties=props,
+        ))
+
+    def _clamp_confidence(self, value, default=0.5):
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            confidence = default
+        if not np.isfinite(confidence) or confidence <= 0:
+            confidence = default
+        return max(0.0, min(confidence, self.certainty_cap))
+
+    def _object_contour_position_confidence(self, obj_name, contour, full_map_pred):
+        pts = np.asarray(contour).reshape(-1, 2)
+        if pts.size == 0:
+            return (0, 0), 0.0
+
+        xs = pts[:, 0].astype(float)
+        ys = pts[:, 1].astype(float)
+        obj_pos = (float(ys.mean()), float(xs.mean()))
+
+        if full_map_pred is None:
+            return obj_pos, self._clamp_confidence(0.9)
+
+        categories = _semantic_categories_for_map(full_map_pred)
+        try:
+            cat_idx = categories.index(obj_name)
+        except ValueError:
+            return obj_pos, self._clamp_confidence(0.9)
+
+        sem = full_map_pred[4:]
+        if cat_idx >= sem.shape[0]:
+            return obj_pos, self._clamp_confidence(0.9)
+
+        y_min = max(0, int(np.floor(ys.min())))
+        y_max = min(int(sem.shape[1]) - 1, int(np.ceil(ys.max())))
+        x_min = max(0, int(np.floor(xs.min())))
+        x_max = min(int(sem.shape[2]) - 1, int(np.ceil(xs.max())))
+        if y_max < y_min or x_max < x_min:
+            return obj_pos, self._clamp_confidence(0.9)
+
+        patch = sem[cat_idx, y_min:y_max + 1, x_min:x_max + 1]
+        if hasattr(patch, "detach"):
+            patch = patch.detach().cpu().numpy()
+        positive = patch[patch > 0]
+        confidence = float(positive.max()) if positive.size else 0.9
+        return obj_pos, self._clamp_confidence(confidence, default=0.9)
+
     def _find_or_create_object(self, category, pos, confidence):
         """Find existing object node nearby, or create new one. Merge if close."""
+        confidence = self._clamp_confidence(confidence)
         # Search for existing object of same category within MERGE_DISTANCE
         for node in self.kg.get_nodes_by_type("object"):
             if node.properties.get("category") != category:
                 continue
             dist = np.sqrt((node.position[0] - pos[0])**2 +
                           (node.position[1] - pos[1])**2)
-            if dist < MERGE_DISTANCE:
+            if dist < self.merge_radius_px:
                 # Merge: update certainty and position
                 old_cert = node.certainty
                 node.certainty = 1.0 - (1.0 - old_cert) * (1.0 - confidence)
-                node.certainty = min(node.certainty, 0.99)
+                node.certainty = min(node.certainty, self.certainty_cap)
                 # Running average position
                 node.position = (
                     0.7 * node.position[0] + 0.3 * pos[0],
@@ -249,9 +367,195 @@ class KGUpdater:
         ))
         return obj_id, True  # new node
 
+    def _record_roomtype_suggestion(self, obj_id, obj_name):
+        if obj_name not in ROOM_HINTS:
+            return
+        room_type = ROOM_HINTS[obj_name]
+        if self.suggests_as_property and obj_id in self.kg.nodes:
+            node = self.kg.nodes[obj_id]
+            suggestions = set(node.properties.get("suggests_room_types", []))
+            suggestions.add(room_type)
+            node.properties["suggests_room_types"] = sorted(suggestions)
+        else:
+            self.kg.add_edge(KGEdge(obj_id, f"roomtype_{room_type}", "suggests"))
+
+    def _clear_inferred_connections(self):
+        """Rebuild inferred topology each update so stale dense edges do not accumulate."""
+        self.kg.edges = [
+            e for e in self.kg.edges
+            if e.relation not in ("connected_to", "connected_via")
+        ]
+        self.kg._edge_set = {
+            (e.source, e.target, e.relation)
+            for e in self.kg.edges
+        }
+        for node_id, node in list(self.kg.nodes.items()):
+            if node.node_type == "door":
+                del self.kg.nodes[node_id]
+
+    def _clear_object_spatial_edges(self):
+        """Rebuild object-object proximity edges from the current deduplicated nodes."""
+        self.kg.edges = [
+            e for e in self.kg.edges
+            if e.relation not in ("next_to", "near")
+        ]
+        self.kg._edge_set = {
+            (e.source, e.target, e.relation)
+            for e in self.kg.edges
+        }
+
+    def _rewrite_edges_after_object_merge(self, replacement: Dict[str, str]):
+        if not replacement:
+            return
+
+        new_edges = []
+        new_edge_set = set()
+        for edge in self.kg.edges:
+            source = replacement.get(edge.source, edge.source)
+            target = replacement.get(edge.target, edge.target)
+            if source == target:
+                continue
+            if source not in self.kg.nodes or target not in self.kg.nodes:
+                continue
+            key = (source, target, edge.relation)
+            if key in new_edge_set:
+                continue
+            new_edges.append(KGEdge(
+                source=source,
+                target=target,
+                relation=edge.relation,
+                distance=edge.distance,
+                properties=dict(edge.properties),
+            ))
+            new_edge_set.add(key)
+
+        self.kg.edges = new_edges
+        self.kg._edge_set = new_edge_set
+
+    def _merge_object_cluster(self, cluster: List[KGNode]) -> Tuple[str, List[str]]:
+        cluster = sorted(
+            cluster,
+            key=lambda node: (
+                not node.properties.get("is_target", False),
+                -node.properties.get("detection_count", 1),
+                -node.certainty,
+                node.id,
+            ),
+        )
+        keep = cluster[0]
+        remove = cluster[1:]
+        if not remove:
+            return keep.id, []
+
+        total_weight = 0.0
+        weighted_y = 0.0
+        weighted_x = 0.0
+        certainty_product = 1.0
+        detection_count = 0
+        suggestions = set(keep.properties.get("suggests_room_types", []))
+
+        for node in cluster:
+            count = max(1, int(node.properties.get("detection_count", 1)))
+            weight = max(0.05, float(node.certainty)) * count
+            total_weight += weight
+            weighted_y += node.position[0] * weight
+            weighted_x += node.position[1] * weight
+            certainty_product *= (1.0 - float(node.certainty))
+            detection_count += count
+            suggestions.update(node.properties.get("suggests_room_types", []))
+
+        if total_weight > 0:
+            keep.position = (weighted_y / total_weight, weighted_x / total_weight)
+        keep.certainty = min(1.0 - certainty_product, self.certainty_cap)
+        keep.properties["detection_count"] = detection_count
+        keep.properties["merged_object_count"] = len(cluster)
+        keep.properties["merged_from"] = sorted(node.id for node in remove)
+        if suggestions:
+            keep.properties["suggests_room_types"] = sorted(suggestions)
+
+        for node in remove:
+            del self.kg.nodes[node.id]
+
+        return keep.id, [node.id for node in remove]
+
+    def _deduplicate_objects(self):
+        """Merge same-category object nodes whose map positions are close.
+
+        This second-stage merge is intentionally separate from detection-time
+        merging. It catches duplicates accumulated through frontier priors and
+        contour detections across update steps.
+        """
+        if not self.object_merge_enabled or self.object_merge_radius_px <= 0:
+            return
+
+        objects_by_category: Dict[str, List[KGNode]] = {}
+        for node in self.kg.get_nodes_by_type("object"):
+            if node.properties.get("is_target"):
+                continue
+            category = node.properties.get("category") or node.name
+            objects_by_category.setdefault(category, []).append(node)
+
+        replacement: Dict[str, str] = {}
+        for _, objects in objects_by_category.items():
+            remaining = set(node.id for node in objects)
+            by_id = {node.id: node for node in objects}
+            while remaining:
+                seed_id = min(remaining)
+                seed = by_id[seed_id]
+                remaining.remove(seed_id)
+                cluster = [seed]
+
+                changed = True
+                while changed:
+                    changed = False
+                    for other_id in list(remaining):
+                        other = by_id[other_id]
+                        if any(
+                            np.sqrt((other.position[0] - member.position[0])**2 +
+                                    (other.position[1] - member.position[1])**2)
+                            <= self.object_merge_radius_px
+                            for member in cluster
+                        ):
+                            cluster.append(other)
+                            remaining.remove(other_id)
+                            changed = True
+
+                keep_id, removed_ids = self._merge_object_cluster(cluster)
+                for removed_id in removed_ids:
+                    replacement[removed_id] = keep_id
+
+        self._rewrite_edges_after_object_merge(replacement)
+
+    def _rebuild_object_spatial_edges(self):
+        self._clear_object_spatial_edges()
+        objects = self.kg.get_nodes_by_type("object")
+        for i, o1 in enumerate(objects):
+            if o1.position == (0, 0):
+                continue
+            for j, o2 in enumerate(objects):
+                if i >= j or o2.position == (0, 0):
+                    continue
+                dist = np.sqrt((o1.position[0] - o2.position[0])**2 +
+                               (o1.position[1] - o2.position[1])**2)
+                if dist < self.next_to_px:
+                    self.kg.add_edge(KGEdge(o1.id, o2.id, "next_to", distance=dist))
+                elif dist < self.near_px:
+                    self.kg.add_edge(KGEdge(o1.id, o2.id, "near", distance=dist))
+
+    def _rooms_separated_by_wall(self, room_a, room_b):
+        return (
+            (room_a, room_b, "separated_by_wall") in self.kg._edge_set
+            or (room_b, room_a, "separated_by_wall") in self.kg._edge_set
+        )
+
     def update(self, enriched_frontiers, object_list, pose_pred,
                wall_list, full_map_pred, target_name):
         """Update KG from current map state."""
+
+        # Frontier indices are step-local. Clear them before marking the current
+        # frontier set so the brain cannot assign robots to stale rooms.
+        for room in self.kg.get_nodes_by_type("room"):
+            room.properties["active_frontier"] = False
 
         # ── Robots ──
         for i, pos in enumerate(pose_pred):
@@ -286,15 +590,21 @@ class KGUpdater:
             room_id = self._pos_to_room_id(cy, cx)
             nearby = ef.get('nearby_objects', [])
 
-            # Infer room type
-            room_type = "unknown"
-            for obj in nearby:
-                if obj in ROOM_HINTS:
-                    room_type = f"likely_{ROOM_HINTS[obj]}"
-                    break
+            enriched_room_type = ef.get("room_type", "unknown") or "unknown"
+            if enriched_room_type.startswith("likely_"):
+                room_type = enriched_room_type
+                enriched_room_type = enriched_room_type[len("likely_"):]
+            elif enriched_room_type != "unknown":
+                room_type = f"likely_{enriched_room_type}"
+            else:
+                room_type = "unknown"
+            room_confidence = self._clamp_confidence(
+                ef.get("room_confidence", 0.0),
+                default=0.0,
+            )
 
             is_explored = self.kg.nodes.get(room_id, KGNode("","","",0)).properties.get("explored", False)
-            cert = 0.1 if not nearby else 0.3
+            cert = 0.1 if enriched_room_type == "unknown" else max(0.1, room_confidence)
             if is_explored:
                 cert = 0.8
 
@@ -302,66 +612,45 @@ class KGUpdater:
                 id=room_id, node_type="room", name=room_type,
                 certainty=cert, position=(cy, cx),
                 properties={"frontier_idx": ef['idx'], "size": ef['area'],
-                           "explored": is_explored}
+                           "explored": is_explored,
+                           "active_frontier": not is_explored,
+                           "room_type": enriched_room_type,
+                           "room_confidence": room_confidence,
+                           "target_prior": ef.get("target_prior", 0.0),
+                           "second_room": ef.get("second_room", "unknown"),
+                           "room_margin": ef.get("room_margin", 0.0),
+                           "room_scores": ef.get("room_scores", {})}
             ))
 
             # Add nearby objects with real confidence (from enriched data)
+            nearby_scores = ef.get('nearby_object_scores', {})
             for obj_name in nearby:
                 obj_pos = (cy, cx)  # approximate position near frontier
-                obj_id, is_new = self._find_or_create_object(obj_name, obj_pos, 0.7)
+                confidence = nearby_scores.get(obj_name, 0.7)
+                obj_id, is_new = self._find_or_create_object(obj_name, obj_pos, confidence)
                 self.kg.add_edge(KGEdge(room_id, obj_id, "contains"))
-                if obj_name in ROOM_HINTS:
-                    self.kg.add_edge(KGEdge(obj_id, f"roomtype_{ROOM_HINTS[obj_name]}", "suggests"))
+                self._record_roomtype_suggestion(obj_id, obj_name)
 
         # ── Objects from Detectron2 (with real confidence) ──
         if object_list:
             for obj_name, positions in object_list.items():
                 for pos_data in positions[:5]:
                     try:
-                        coords = pos_data[0][0] if len(pos_data) > 0 else (0, 0)
-                        obj_pos = (float(coords[0]), float(coords[1]))
-                    except:
+                        obj_pos, confidence = self._object_contour_position_confidence(
+                            obj_name,
+                            pos_data,
+                            full_map_pred,
+                        )
+                    except Exception:
                         continue
                     if obj_pos == (0, 0):
                         continue
 
-                    # Use sem_pred_prob_thr as default confidence (0.9 in Co-NavGPT)
-                    confidence = 0.9
-
                     obj_id, is_new = self._find_or_create_object(obj_name, obj_pos, confidence)
                     room_id = self._pos_to_room_id(obj_pos[0], obj_pos[1])
+                    self._ensure_region_node(room_id, position=obj_pos, inferred_from="object")
                     self.kg.add_edge(KGEdge(room_id, obj_id, "contains"))
-
-                    if obj_name in ROOM_HINTS:
-                        self.kg.add_edge(KGEdge(obj_id, f"roomtype_{ROOM_HINTS[obj_name]}", "suggests"))
-
-            # ── Spatial edges between objects in same room ──
-            objects = self.kg.get_nodes_by_type("object")
-            for i, o1 in enumerate(objects):
-                for j, o2 in enumerate(objects):
-                    if i >= j:
-                        continue
-                    if o1.position == (0, 0) or o2.position == (0, 0):
-                        continue
-                    dist = np.sqrt((o1.position[0] - o2.position[0])**2 +
-                                  (o1.position[1] - o2.position[1])**2)
-                    if dist < 20:
-                        self.kg.add_edge(KGEdge(o1.id, o2.id, "next_to", distance=dist))
-                    elif dist < 60:
-                        self.kg.add_edge(KGEdge(o1.id, o2.id, "near", distance=dist))
-
-        # ── Room connections with distance ──
-        rooms = self.kg.get_nodes_by_type("room")
-        for i, r1 in enumerate(rooms):
-            for j, r2 in enumerate(rooms):
-                if i >= j:
-                    continue
-                dist = np.sqrt((r1.position[0] - r2.position[0])**2 +
-                              (r1.position[1] - r2.position[1])**2)
-                if dist < 150:
-                    wall_key = (r1.id, r2.id, "separated_by_wall")
-                    if wall_key not in self.kg._edge_set:
-                        self.kg.add_edge(KGEdge(r1.id, r2.id, "connected_to", distance=dist))
+                    self._record_roomtype_suggestion(obj_id, obj_name)
 
         # ── Walls ──
         if wall_list is not None and len(wall_list) > 0:
@@ -378,24 +667,70 @@ class KGUpdater:
                         side_a = self._pos_to_room_id(wall_mid_y + norm_y, wall_mid_x + norm_x)
                         side_b = self._pos_to_room_id(wall_mid_y - norm_y, wall_mid_x - norm_x)
                         if side_a != side_b:
-                            self.kg.add_edge(KGEdge(side_a, side_b, "separated_by_wall"))
+                            if side_a in self.kg.nodes and side_b in self.kg.nodes:
+                                self.kg.add_edge(KGEdge(side_a, side_b, "separated_by_wall"))
+                                self.kg.remove_edge(side_a, side_b, "connected_to")
+                                self.kg.remove_edge(side_b, side_a, "connected_to")
                 except:
                     pass
 
+        # ── Room connections with distance ──
+        self._clear_inferred_connections()
+        rooms = self.kg.get_nodes_by_type("room")
+        candidates = []
+        for i, r1 in enumerate(rooms):
+            for j, r2 in enumerate(rooms):
+                if i >= j:
+                    continue
+                if self._rooms_separated_by_wall(r1.id, r2.id):
+                    continue
+                dist = np.sqrt((r1.position[0] - r2.position[0])**2 +
+                               (r1.position[1] - r2.position[1])**2)
+                if dist < self.room_connect_px:
+                    candidates.append((float(dist), r1, r2))
+
+        degree = {room.id: 0 for room in rooms}
+        for dist, r1, r2 in sorted(candidates, key=lambda item: item[0]):
+            if self.max_room_connections > 0:
+                if degree.get(r1.id, 0) >= self.max_room_connections:
+                    continue
+                if degree.get(r2.id, 0) >= self.max_room_connections:
+                    continue
+            self.kg.add_edge(KGEdge(r1.id, r2.id, "connected_to", distance=dist))
+            degree[r1.id] = degree.get(r1.id, 0) + 1
+            degree[r2.id] = degree.get(r2.id, 0) + 1
+
+            if self.create_pseudo_doors:
+                door_id = f"door_{r1.id}_{r2.id}"
+                door_pos = (
+                    (r1.position[0] + r2.position[0]) / 2.0,
+                    (r1.position[1] + r2.position[1]) / 2.0,
+                )
+                self.kg.add_node(KGNode(
+                    id=door_id, node_type="door", name="door",
+                    certainty=0.6, position=door_pos,
+                    properties={"rooms": [r1.id, r2.id], "inferred": True}
+                ))
+                self.kg.add_edge(KGEdge(r1.id, door_id, "connected_via", distance=dist / 2.0))
+                self.kg.add_edge(KGEdge(door_id, r2.id, "connected_via", distance=dist / 2.0))
+
         # ── Check target on map ──
         if target_name and full_map_pred is not None:
-            from constants import hm3d_category
             import torch
             sem = full_map_pred[4:]
-            for i, cat in enumerate(hm3d_category):
+            for i, cat in enumerate(_semantic_categories_for_map(full_map_pred)):
                 if cat == target_name and i < sem.shape[0]:
                     count = (sem[i] > 0.1).sum().item()
                     if count > 5:
                         ys, xs = torch.where(sem[i] > 0.1)
+                        confidence = self._clamp_confidence(sem[i][ys, xs].max().item(), default=0.95)
                         target_pos = (int(ys.float().mean()), int(xs.float().mean()))
                         self.kg.add_node(KGNode(
                             id=f"TARGET_{target_name}",
                             node_type="object", name=f"TARGET:{target_name}",
-                            certainty=0.95, position=target_pos,
+                            certainty=confidence, position=target_pos,
                             properties={"category": target_name, "is_target": True}
                         ))
+
+        self._deduplicate_objects()
+        self._rebuild_object_spatial_edges()

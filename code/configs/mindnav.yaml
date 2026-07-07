@@ -6,13 +6,19 @@ global_plan_every: 25
 kg:
   room_grid_scale: 40     # pixels per room-grid cell
   merge_radius_px: 30     # same-category merge threshold
+  object_merge_enabled: true
+  object_merge_radius_px: 60
   next_to_px: 20
   near_px: 60
+  room_connect_px: 150
+  max_room_connections: 3
+  create_pseudo_doors: false
+  suggests_as_property: true
   certainty_cap: 0.99
   priority_target_tau: 0.5
 
 brain:
-  llm_path: /tf/notebooks/models/Qwen2.5-7B-Instruct
+  llm_path: /home/huaziheng/models/Qwen2.5-7B-Instruct
   device: cuda:3
   max_tokens: 512
   tools:

@@ -34,6 +34,7 @@ from habitat.sims.habitat_simulator.actions import (
     HabitatSimActions,
     HabitatSimV1ActionSpaceConfiguration,
 )
+from habitat.tasks.nav.nav import SimulatorTaskAction
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.functional")
@@ -101,9 +102,8 @@ LOCAL_MODEL_PATHS = [
 ]
 # GPT Type
 gpt_name = [
-    'text-davinci-003',
-    'gpt-3.5-turbo',
-    'gpt-4',
+    'Qwen2.5-3B',
+    'Qwen2.5-7B',
 ]
 
 def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visited_vis, map_edge, goal_points):
@@ -257,7 +257,7 @@ def Frontiers(full_map_pred):
     wall_edge = local_ex_map - target_edge
 
     # contours, hierarchy = cv2.findContours(cv2.inRange(wall_edge,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    _, contours, hierarchy = cv2.findContours(cv2.inRange(wall_edge,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(cv2.inRange(wall_edge,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[-2:]
     # if len(contours)>0:
     #     dst = np.zeros(wall_edge.shape)
     #     cv2.drawContours(dst, contours, -1, 1, 1)
@@ -317,7 +317,7 @@ def Objects_Extract(full_map_pred):
             se_object_map[se_object_map>0.1] = 1
             se_object_map = cv2.morphologyEx(se_object_map, cv2.MORPH_CLOSE, kernel)
             # contours, hierarchy = cv2.findContours(cv2.inRange(se_object_map,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-            _, contours, hierarchy = cv2.findContours(cv2.inRange(se_object_map,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+            contours, hierarchy = cv2.findContours(cv2.inRange(se_object_map,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)[-2:]
             for cnt in contours:
                 if len(cnt) > 30:
                     epsilon = 0.05 * cv2.arcLength(cnt, True)
@@ -407,6 +407,7 @@ def form_prompt_for_chatgpt(goal_name, pose_pred, object_list, Wall_list, Fronti
 
 
 def parse_answer(response_message):
+    import re
     lines = response_message.split('\n')
     parsed_dict_num = {}
     
@@ -416,24 +417,110 @@ def parse_answer(response_message):
         if not line or line.startswith('[output:]'):
             continue
         
-        # Look for lines that contain robot_ assignments
-        if 'robot_' in line and ':' in line:
+        # Handle noisy local-LLM formats such as
+        # "robot_0:! frontier_1", "robot_1!! frontier_3", "robot_1!(front!_1".
+        if 'robot' in line.lower() and 'front' in line.lower():
             try:
-                # Handle different possible formats
-                parts = line.split(':')
-                if len(parts) == 2:
-                    key = parts[0].strip()
-                    value = parts[1].strip()
-                    
-                    # Extract the frontier number
-                    if 'frontier_' in value:
-                        frontier_num = int(value.split('_')[1])
-                        parsed_dict_num[key] = frontier_num
+                match = re.search(r'robot[_\W]*(\d+).*?front(?:ier)?[_\W]*(\d+)', line, re.IGNORECASE)
+                if match:
+                    parsed_dict_num[f"robot_{int(match.group(1))}"] = int(match.group(2))
             except (ValueError, IndexError) as e:
                 print(f"Warning: Could not parse line: {line}")
                 continue
-    
+
     return parsed_dict_num
+
+
+def write_episode_jsonl(args, episode_idx, metrics):
+    if not args.jsonl_log:
+        return
+    record = {
+        "method": args.method_name or "co_navgpt",
+        "episode": episode_idx,
+        "success": float(metrics.get("success", 0.0)),
+        "spl": float(metrics.get("spl", metrics.get("SPL", 0.0))),
+    }
+    with open(args.jsonl_log, "a") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+def request_llm_response(args, model_name, messages, max_tokens=256):
+    """Return a Co-NavGPT flat-text frontier assignment from the configured backend."""
+    backend = getattr(args, "brain_backend", "local")
+    if backend == "local":
+        response = chat_completion_create(
+            model=model_name,
+            messages=messages,
+            temperature=0,
+            max_tokens=max_tokens,
+        )
+        return response["choices"][0]["message"]["content"], model_name
+
+    if backend == "siliconflow":
+        import openai as _oai
+
+        api_key = os.environ.get("SILICONFLOW_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("SILICONFLOW_API_KEY is required for --brain_backend=siliconflow")
+
+        base_url = getattr(args, "brain_base_url", None) or "https://api.siliconflow.cn/v1"
+        client = _oai.OpenAI(api_key=api_key, base_url=base_url)
+        resp = client.chat.completions.create(
+            model=args.brain_model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0,
+        )
+        return resp.choices[0].message.content.strip(), args.brain_model
+
+    if backend == "deepseek":
+        import urllib.error
+        import urllib.request
+
+        api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("DEEPSEEK_API_KEY is required for --brain_backend=deepseek")
+
+        base_url = (
+            getattr(args, "brain_base_url", None)
+            or os.environ.get("DEEPSEEK_BASE_URL")
+            or "https://api.deepseek.com"
+        ).rstrip("/")
+        model = getattr(args, "brain_model", None) or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash"
+        if model == "Pro/MiniMaxAI/MiniMax-M2.5":
+            model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+        }
+        if getattr(args, "deepseek_thinking", os.environ.get("DEEPSEEK_THINKING", "disabled")) == "disabled":
+            payload["thinking"] = {"type": "disabled"}
+
+        req = urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"DeepSeek API request failed: HTTP {exc.code} {detail[:500]}") from exc
+
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if content is None:
+            content = ""
+        return content.strip(), model
+
+    raise ValueError(f"Unsupported brain backend: {backend}")
 
 @habitat.registry.register_action_space_configuration
 class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
@@ -451,13 +538,31 @@ class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
 
         return config
 
+
+@habitat.registry.register_task_action
+class TurnLeftAction_S(SimulatorTaskAction):
+    def step(self, *args, **kwargs):
+        return self._sim.step(HabitatSimActions.TURN_LEFT_S)
+
+
+@habitat.registry.register_task_action
+class TurnRightAction_S(SimulatorTaskAction):
+    def step(self, *args, **kwargs):
+        return self._sim.step(HabitatSimActions.TURN_RIGHT_S)
+
 def main():
     args = get_args()
 
-    # Load local LLM (replaces OpenAI API)
-    model_path = LOCAL_MODEL_PATHS[args.gpt_type]
-    vlm_device = f"cuda:{args.sem_gpu_id}"
-    load_model(model_path, device=vlm_device, model_type="text")
+    model_idx = min(args.gpt_type, len(LOCAL_MODEL_PATHS) - 1)
+    if args.brain_backend == "local":
+        model_path = args.llm_path or LOCAL_MODEL_PATHS[model_idx]
+        model_name = args.llm_path or gpt_name[model_idx]
+        llm_gpu_id = args.llm_gpu_id if args.llm_gpu_id >= 0 else args.sem_gpu_id
+        vlm_device = f"cuda:{llm_gpu_id}"
+        load_model(model_path, device=vlm_device, model_type="text")
+    else:
+        model_name = args.brain_model
+        print(f"Using remote Co-NavGPT brain: {model_name}")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -472,6 +577,10 @@ def main():
     # Apply split argument
     config_env.DATASET.SPLIT = args.split
     config_env.DATASET.DATA_PATH = config_env.DATASET.DATA_PATH.replace("{split}", args.split)
+    try:
+        config_env.ENVIRONMENT.MAX_EPISODE_STEPS = args.max_episode_length
+    except Exception:
+        pass
 
     config_env.TASK.POSSIBLE_ACTIONS = config_env.TASK.POSSIBLE_ACTIONS + [
         "TURN_LEFT_S",
@@ -488,6 +597,8 @@ def main():
     env = Multi_Agent_Env(config_env=config_env)
 
     num_episodes = env.number_of_episodes
+    if args.max_episodes and args.max_episodes > 0:
+        num_episodes = min(num_episodes, args.max_episodes)
 
     assert num_episodes > 0, "num_episodes should be greater than 0"
 
@@ -507,6 +618,11 @@ def main():
         os.makedirs(log_dir)
     if not os.path.exists(dump_dir):
         os.makedirs(dump_dir)
+    if args.jsonl_log:
+        jsonl_dir = os.path.dirname(args.jsonl_log)
+        if jsonl_dir:
+            os.makedirs(jsonl_dir, exist_ok=True)
+        open(args.jsonl_log, "w").close()
 
     logging.basicConfig(
         filename=log_dir + 'output.log',
@@ -586,38 +702,48 @@ def main():
                     retries = 10    
                     while retries > 0:  
                         try: 
-                            response = chat_completion_create(
-                                model=gpt_name[args.gpt_type],
+                            response_message, response_model_name = request_llm_response(
+                                args,
                                 messages=message_list,
-                                temperature=0,
+                                model_name=model_name,
+                                max_tokens=args.brain_max_tokens,
                             )
 
-                            response_message = response["choices"][0]["message"]["content"]
                             usage = 0
-                            print(gpt_name[args.gpt_type] + " response: ")
+                            print(str(response_model_name) + " response: ")
                             print(response_message)
-                            if gpt_name[args.gpt_type] == 'gpt-4':
-                                usage = response['usage']['prompt_tokens'] * 0.03 / 1000 + response['usage']['completion_tokens'] * 0.06 / 1000
-                            elif gpt_name[args.gpt_type] == 'gpt-3.5-turbo':
-                                usage = response['usage']['total_tokens'] * 0.002 / 1000
                             total_usage.append(usage)
                             goal_frontiers = parse_answer(response_message)
 
-                            last_decision.clear()
+                            parsed_goal_points = []
+                            parsed_last_decision = []
                             for i in range(num_agents):
-                                goal_points.append(target_point_map[goal_frontiers["robot_"+ str(i)]])
+                                robot_key = "robot_" + str(i)
+                                if robot_key not in goal_frontiers:
+                                    raise ValueError(f"Missing frontier assignment for {robot_key}")
+                                frontier_idx = goal_frontiers[robot_key]
+                                if frontier_idx < 0 or frontier_idx >= len(target_point_map):
+                                    raise ValueError(f"Invalid frontier assignment for {robot_key}: frontier_{frontier_idx}")
+                                parsed_goal_points.append(target_point_map[frontier_idx])
+                                parsed_last_decision.append(Frontiers_dict["frontier_" + str(frontier_idx)])
 
-                                last_decision.append(Frontiers_dict["frontier_"+str(goal_frontiers["robot_"+ str(i)])] ) 
+                            goal_points.extend(parsed_goal_points)
+                            last_decision.clear()
+                            last_decision.extend(parsed_last_decision)
                             
                             break
-                        except OpenAIError as e:
-                            if e:
-                                print(e)
-                                print('Timeout error, retrying...')    
-                                retries -= 1
-                                time.sleep(5)
-                            else:
-                                raise e
+                        except Exception as e:
+                            print(e)
+                            print('LLM error, retrying...')
+                            retries -= 1
+                            time.sleep(5)
+                    if len(goal_points) < num_agents:
+                        print("LLM retries exhausted; falling back to the first available frontiers.")
+                        last_decision.clear()
+                        for i in range(num_agents):
+                            frontier_idx = min(i, len(target_point_map) - 1)
+                            goal_points.append(target_point_map[frontier_idx])
+                            last_decision.append(Frontiers_dict["frontier_" + str(frontier_idx)])
                 else:
                     for i in range(num_agents):
                         actions = np.random.rand(1, 2).squeeze()*(target_edge_map.shape[0] - 1)
@@ -659,6 +785,7 @@ def main():
         ]) + '\n'
 
         metrics = env.get_metrics()
+        write_episode_jsonl(args, count_episodes, metrics)
         for m, v in metrics.items():
             if isinstance(v, dict):
                 for sub_m, sub_v in v.items():

@@ -286,15 +286,24 @@ class KGUpdater:
             room_id = self._pos_to_room_id(cy, cx)
             nearby = ef.get('nearby_objects', [])
 
-            # Infer room type
-            room_type = "unknown"
-            for obj in nearby:
-                if obj in ROOM_HINTS:
-                    room_type = f"likely_{ROOM_HINTS[obj]}"
-                    break
+            enriched_room_type = ef.get("room_type", "unknown") or "unknown"
+            if enriched_room_type.startswith("likely_"):
+                room_type = enriched_room_type
+                enriched_room_type = enriched_room_type[len("likely_"):]
+            elif enriched_room_type != "unknown":
+                room_type = f"likely_{enriched_room_type}"
+            else:
+                room_type = "unknown"
+            try:
+                room_confidence = float(ef.get("room_confidence", 0.0))
+            except (TypeError, ValueError):
+                room_confidence = 0.0
+            if not np.isfinite(room_confidence):
+                room_confidence = 0.0
+            room_confidence = max(0.0, min(room_confidence, 0.99))
 
             is_explored = self.kg.nodes.get(room_id, KGNode("","","",0)).properties.get("explored", False)
-            cert = 0.1 if not nearby else 0.3
+            cert = 0.1 if enriched_room_type == "unknown" else max(0.1, room_confidence)
             if is_explored:
                 cert = 0.8
 
@@ -302,7 +311,13 @@ class KGUpdater:
                 id=room_id, node_type="room", name=room_type,
                 certainty=cert, position=(cy, cx),
                 properties={"frontier_idx": ef['idx'], "size": ef['area'],
-                           "explored": is_explored}
+                           "explored": is_explored,
+                           "room_type": enriched_room_type,
+                           "room_confidence": room_confidence,
+                           "target_prior": ef.get("target_prior", 0.0),
+                           "second_room": ef.get("second_room", "unknown"),
+                           "room_margin": ef.get("room_margin", 0.0),
+                           "room_scores": ef.get("room_scores", {})}
             ))
 
             # Add nearby objects with real confidence (from enriched data)

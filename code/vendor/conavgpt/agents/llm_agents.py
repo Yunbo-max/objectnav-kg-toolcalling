@@ -38,10 +38,17 @@ from utils.semantic_prediction import SemanticPredMaskRCNN
 import utils.visualization as vu
 from arguments import get_args
 
-from constants import coco_categories, color_palette, category_to_id
+from constants import (
+    coco_categories,
+    color_palette,
+    category_to_id,
+    category_to_id_mp3d,
+    hm3d_category,
+)
 
 from RedNet.RedNet_model import load_rednet
-from constants import mp_categories_mapping
+from constants import mp_categories_mapping, mp_categories_mapping21
+from agents.semantic_boost import get_semantic_booster
 
 
 class LLM_Agent(Agent):
@@ -68,6 +75,8 @@ class LLM_Agent(Agent):
         )
         self.red_sem_pred.eval()
         self.red_sem_pred.to(self.device)
+        semantic_boost_device = getattr(args, "semantic_boost_device", None) or self.device
+        self.semantic_booster = get_semantic_booster(args, semantic_boost_device)
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
@@ -227,11 +236,14 @@ class LLM_Agent(Agent):
             self.global_goals = [min(global_goals[0], int(self.local_w - 1)),
                              min(global_goals[1], int(self.local_h - 1))] 
 
-            self.goal_name = category_to_id[observations['objectgoal'][0]]
+            if 'objectnav_mp3d' in self.args.task_config:
+                self.goal_name = category_to_id_mp3d[observations['objectgoal'][0]]
+            else:
+                self.goal_name = category_to_id[observations['objectgoal'][0]]
             self.goal_id = observations['objectgoal'][0]
 
             if self.args.visualize or self.args.print_images:
-                self.vis_image = vu.init_vis_image(category_to_id[observations['objectgoal'][0]], 0)
+                self.vis_image = vu.init_vis_image(self.goal_name, 0)
             # print("objectgoal: ", observations['objectgoal'])
 
             if observations['objectgoal'][0] == 3:
@@ -359,7 +371,10 @@ class LLM_Agent(Agent):
         local_goal_maps[goal_points[0], goal_points[1]] = 1
             # print("Don't Find the edge")
 
-        cn = coco_categories[self.goal_id] + 4
+        if 'objectnav_mp3d' in self.args.task_config:
+            cn = self.goal_id + 4
+        else:
+            cn = coco_categories[self.goal_id] + 4
         if self.local_map[cn, :, :].sum() != 0.:
             cat_semantic_map = self.local_map[cn, :, :].cpu().numpy()
             cat_semantic_scores = cat_semantic_map
@@ -513,6 +528,9 @@ class LLM_Agent(Agent):
             if relative_angle > 180:
                 relative_angle -= 360
 
+            default_allow_look = "0" if "objectnav_mp3d" in self.args.task_config else "1"
+            allow_look_actions = bool(int(os.environ.get("ALLOW_LOOK_ACTIONS", default_allow_look)))
+
             ## add the evelution angle
             eve_start_x = int(5 * math.sin(angle_st_goal) + start[0])
             eve_start_y = int(5 * math.cos(angle_st_goal) + start[1])
@@ -520,10 +538,10 @@ class LLM_Agent(Agent):
             if eve_start_y >= map_pred.shape[0]: eve_start_y = map_pred.shape[0]-1 
             if eve_start_x < 0: eve_start_x = 0 
             if eve_start_y < 0: eve_start_y = 0 
-            if exp_pred[eve_start_x, eve_start_y] == 0 and self.eve_angle > -60:
+            if allow_look_actions and exp_pred[eve_start_x, eve_start_y] == 0 and self.eve_angle > -60:
                 action = 5
                 self.eve_angle -= 30
-            elif exp_pred[eve_start_x, eve_start_y] == 1 and self.eve_angle < 0:
+            elif allow_look_actions and exp_pred[eve_start_x, eve_start_y] == 1 and self.eve_angle < 0:
                 action = 4
                 self.eve_angle += 30
             elif relative_angle > self.args.turn_angle:
@@ -599,17 +617,62 @@ class LLM_Agent(Agent):
         red_semantic_pred, semantic_pred = self._get_sem_pred(
             rgb.astype(np.uint8), depth, use_seg=use_seg)
 
-        sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], 15 + 1))   
-        for i in range(0, 15):
-            # print(mp_categories_mapping[i])
-            sem_seg_pred[:,:,i][red_semantic_pred == mp_categories_mapping[i]] = 1
+        if 'objectnav_mp3d' in args.task_config:
+            sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], args.num_sem_categories))
+            for i in range(min(args.num_sem_categories, len(mp_categories_mapping21))):
+                sem_seg_pred[:, :, i][red_semantic_pred == mp_categories_mapping21[i]] = 1
 
-        sem_seg_pred[:,:,0][semantic_pred[:,:,0] == 0] = 0
-        sem_seg_pred[:,:,1][semantic_pred[:,:,1] == 0] = 0
-        sem_seg_pred[:,:,2][semantic_pred[:,:,2] == 1] = 1
-        sem_seg_pred[:,:,3][semantic_pred[:,:,3] == 0] = 0
-        sem_seg_pred[:,:,4][semantic_pred[:,:,4] == 1] = 1
-        sem_seg_pred[:,:,5][semantic_pred[:,:,5] == 1] = 1
+            # MaskRCNN predicts a small COCO subset; write those into the
+            # matching MP3D channels instead of the HM3D channel order.
+            coco_to_mp3d = {0: 0, 1: 5, 2: 8, 3: 6, 4: 10, 5: 13}
+            for coco_idx, mp3d_idx in coco_to_mp3d.items():
+                if coco_idx < semantic_pred.shape[2] and mp3d_idx < sem_seg_pred.shape[2]:
+                    sem_seg_pred[:, :, mp3d_idx] = np.maximum(
+                        sem_seg_pred[:, :, mp3d_idx],
+                        semantic_pred[:, :, coco_idx],
+                    )
+        else:
+            sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], 15 + 1))   
+            for i in range(0, 15):
+                # print(mp_categories_mapping[i])
+                sem_seg_pred[:,:,i][red_semantic_pred == mp_categories_mapping[i]] = 1
+
+            sem_seg_pred[:,:,0][semantic_pred[:,:,0] == 0] = 0
+            sem_seg_pred[:,:,1][semantic_pred[:,:,1] == 0] = 0
+            sem_seg_pred[:,:,2][semantic_pred[:,:,2] == 1] = 1
+            sem_seg_pred[:,:,3][semantic_pred[:,:,3] == 0] = 0
+            sem_seg_pred[:,:,4][semantic_pred[:,:,4] == 1] = 1
+            sem_seg_pred[:,:,5][semantic_pred[:,:,5] == 1] = 1
+
+        if getattr(self.semantic_booster, "enabled", False):
+            interval = max(1, int(getattr(args, "semantic_boost_interval", 1)))
+            if self.l_step % interval == 0:
+                categories = category_to_id_mp3d if 'objectnav_mp3d' in args.task_config else hm3d_category
+                try:
+                    semantic_boost = self.semantic_booster.predict(rgb.astype(np.uint8), categories)
+                    if semantic_boost is not None:
+                        num_channels = min(semantic_boost.shape[2], sem_seg_pred.shape[2])
+                        added = (semantic_boost[:, :, :num_channels] > sem_seg_pred[:, :, :num_channels]) & (
+                            semantic_boost[:, :, :num_channels] > 0
+                        )
+                        added_counts = added.reshape(-1, num_channels).sum(axis=0)
+                        if added_counts.sum() > 0:
+                            added_names = [
+                                "{}:{}".format(categories[i], int(count))
+                                for i, count in enumerate(added_counts)
+                                if count > 0
+                            ]
+                            print(
+                                "[semantic_boost] step={} added semantic pixels {}".format(
+                                    self.l_step, ", ".join(added_names[:8])
+                                )
+                            )
+                        sem_seg_pred[:, :, :num_channels] = np.maximum(
+                            sem_seg_pred[:, :, :num_channels],
+                            semantic_boost[:, :, :num_channels],
+                        )
+                except Exception as exc:
+                    print("[semantic_boost] frame skipped: {}".format(exc))
         # sem_seg_pred = self._get_sem_pred(
         #     rgb.astype(np.uint8), depth, use_seg=use_seg)
 
@@ -835,7 +898,7 @@ class LLM_Agent(Agent):
 
         sem_map += 5
 
-        no_cat_mask = sem_map == 20
+        no_cat_mask = sem_map == self.args.num_sem_categories + 4
         map_mask = np.rint(map_pred) == 1
         exp_mask = np.rint(exp_pred) == 1
         vis_mask = self.visited_vis[gx1:gx2, gy1:gy2] == 1
@@ -907,9 +970,8 @@ class LLM_Agent(Agent):
             cv2.imshow("episode_n {} agent_{}".format(self.episode_n, self.agent_id), self.vis_image)
             cv2.waitKey(1)
 
-        # if args.print_images:
-        #     fn = '{}/episodes/eps_{}/agent-{}-Vis-{}.png'.format(
-        #         dump_dir, self.episode_n,
-        #         self.agent_id, self.l_step)
-        #     cv2.imwrite(fn, self.vis_image)
-
+        if args.print_images:
+            fn = '{}/episodes/eps_{}/agent-{}-{}-Vis-{}.png'.format(
+                dump_dir, self.l_step,
+                self.episode_n, self.agent_id, self.l_step)
+            cv2.imwrite(fn, self.vis_image)

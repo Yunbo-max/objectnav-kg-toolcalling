@@ -34,6 +34,7 @@ from habitat.sims.habitat_simulator.actions import (
     HabitatSimActions,
     HabitatSimV1ActionSpaceConfiguration,
 )
+from habitat.tasks.nav.nav import SimulatorTaskAction
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.functional")
@@ -450,6 +451,18 @@ class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
         )
 
         return config
+
+
+@habitat.registry.register_task_action
+class TurnLeftAction_S(SimulatorTaskAction):
+    def step(self, *args, **kwargs):
+        return self._sim.step(HabitatSimActions.TURN_LEFT_S)
+
+
+@habitat.registry.register_task_action
+class TurnRightAction_S(SimulatorTaskAction):
+    def step(self, *args, **kwargs):
+        return self._sim.step(HabitatSimActions.TURN_RIGHT_S)
 
 def main():
     args = get_args()

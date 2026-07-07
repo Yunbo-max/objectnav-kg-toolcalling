@@ -1,36 +1,88 @@
 # Co-NavGPT
 
-Upstream: https://github.com/yuyang-J/Co-NavGPT
+Upstream: https://github.com/ybgdgh/Co-NavGPT
 
-## What it is
-Original flat-text LLM frontier-assignment baseline. Perception stack
-(Detectron2 + RedNet + 2D semantic map + FMM planner) is shared with
-MindNav — only the brain differs.
+## What It Is
 
-## Our reproduction
-Local path: `/tf/notebooks/Co-NavGPT/`
+Co-NavGPT is the flat-text LLM frontier-assignment baseline. It shares the
+perception and planning stack with MindNav:
 
-Key substitutions:
-  * Upstream uses GPT-4 via OpenAI API; we swap in Qwen2.5-7B-Instruct for
-    matched-scale comparison with MindNav.
-  * `exp_main_original_minimax.py` uses MiniMax-M2.5 via SiliconFlow API;
-    results are within noise of Qwen2.5-7B-Instruct local.
+- Detectron2 / RedNet semantic perception
+- 2D semantic map
+- frontier extraction
+- FMM local planner
+
+The brain receives robot positions, detected objects, walls, previous
+frontiers, and unexplored frontiers as text, then emits:
+
+```text
+robot_0: frontier_i
+robot_1: frontier_j
+```
+
+It does not use a knowledge graph or KG tool-calling.
+
+## Local Implementation
+
+Local path:
+
+```text
+/home/huaziheng/project/objectnav-kg-toolcalling/code/vendor/conavgpt/
+```
+
+Entry point:
+
+```text
+code/vendor/conavgpt/exp_main_original.py
+```
+
+Run script:
+
+```text
+code/scripts/run_co_navgpt.sh
+```
+
+This local version supports:
+
+- `BRAIN_BACKEND=local` with `/home/huaziheng/models/Qwen2.5-7B-Instruct`
+- `BRAIN_BACKEND=deepseek` with the project-root `.env`
 
 ## Run
 
+Qwen local flat-text baseline:
+
 ```bash
-bash code/scripts/run_co_navgpt.sh
+cd /home/huaziheng/project/objectnav-kg-toolcalling
+SPLIT=val MAX_EPISODES=100 \
+MODEL_PATH=/home/huaziheng/models/Qwen2.5-7B-Instruct \
+BRAIN_BACKEND=local \
+EXP_NAME=co_navgpt_qwen_val_100 \
+LOG=results/runs/co_navgpt_qwen_val_100.log \
+JSONL=results/runs/co_navgpt_qwen_val_100.jsonl \
+bash code/scripts/run_co_navgpt.sh --method_name co_navgpt_qwen
 ```
 
-This invokes `/tf/notebooks/Co-NavGPT/exp_main_original.py` with our
-config. Logs land in `results/runs/co_navgpt_val_mini.log`.
+DeepSeek flat-text baseline:
 
-## Numbers (HM3D val_mini, N=2)
-- Co-NavGPT (random frontier): SR 0.760
-- Co-NavGPT (Qwen2.5-7B flat text): SR 0.700, SPL 0.306
-- Co-NavGPT (MiniMax-M2.5): SR ≈ 0.700, SPL ≈ 0.306
+```bash
+cd /home/huaziheng/project/objectnav-kg-toolcalling
+SPLIT=val MAX_EPISODES=100 \
+BRAIN_BACKEND=deepseek BRAIN_MODEL=deepseek-v4-flash DEEPSEEK_THINKING=disabled \
+EXP_NAME=co_navgpt_deepseek_val_100 \
+LOG=results/runs/co_navgpt_deepseek_val_100.log \
+JSONL=results/runs/co_navgpt_deepseek_val_100.jsonl \
+bash code/scripts/run_co_navgpt.sh --method_name co_navgpt_deepseek
+```
 
-## Notes
-- val_mini has 30 episodes but runs 1000 iterations (2 agents, repeated scenes).
-- Reported 24% false-positive rate on Detectron2+RedNet detections is
-  inherited by every method on this stack.
+## Current Legacy Numbers
+
+These are small `val_mini` sanity results, not full-val paper numbers:
+
+| Method | Episodes | Success | SR | SPL |
+|---|---:|---:|---:|---:|
+| Co-NavGPT, Qwen | 30 | 20 | 0.667 | 0.332 |
+| Co-NavGPT, DeepSeek | 30 | 19 | 0.633 | 0.317 |
+
+The DeepSeek flat-text version did not improve Co-NavGPT on `val_mini`. This
+supports the current interpretation that the main gain comes from KG
+tool-calling structure, not from simply swapping in a stronger LLM.

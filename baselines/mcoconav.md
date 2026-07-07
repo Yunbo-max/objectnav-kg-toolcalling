@@ -1,29 +1,53 @@
 # MCoCoNav
 
-Upstream: https://github.com/lqn-lab/MCoCoNav
+Upstream: https://github.com/FrankZxShen/MCoCoNav.git
 
-## What it is
-VLM extension of Co-NavGPT's perception stack. Same 2D semantic map,
-different brain: the VLM reads images (or rendered map snapshots) directly
-and emits a frontier assignment.
+## What It Is
 
-## Our reproduction
-Local path: `/tf/notebooks/godie/repos/MCoCoNav/`
+MCoCoNav is a VLM extension of the Co-NavGPT perception stack. It uses the same
+2D semantic map and frontier/planner infrastructure, but asks a VLM to make the
+frontier decision from visual/map context.
 
-Key substitutions:
-  * VLM: Qwen2.5-VL-7B-Instruct (`/tf/notebooks/models/Qwen2.5-VL-7B-Instruct`).
-  * OOM patch: `gc.collect() + torch.cuda.empty_cache()` added to the VLM
-    server to avoid the ~979-call OOM on Habitat 0.2.1.
+## Local Implementation
+
+Local path:
+
+```text
+/home/huaziheng/project/objectnav-kg-toolcalling/code/vendor/mcoconav/
+```
+
+Local VLM path:
+
+```text
+/home/huaziheng/models/Qwen2.5-VL-7B-Instruct
+```
+
+Run script:
+
+```text
+code/scripts/run_mcoconav.sh
+```
 
 ## Run
 
 ```bash
+cd /home/huaziheng/project/objectnav-kg-toolcalling
+SPLIT=val MAX_EPISODES=100 \
+VLM_PATH=/home/huaziheng/models/Qwen2.5-VL-7B-Instruct \
+EXP_NAME=mcoconav_qwen_vl_val_100 \
+LOG=results/runs/mcoconav_qwen_vl_val_100.log \
+JSONL=results/runs/mcoconav_qwen_vl_val_100.jsonl \
 bash code/scripts/run_mcoconav.sh
 ```
 
-## Numbers (HM3D val_mini, N=2)
-- Qwen2.5-VL-7B: SR 0.000 (VLM spatial reasoning collapse)
+## Current Legacy Numbers
 
-This is the central result of the paper's interface-diagnostic table:
-with the same perception stack and infrastructure, swapping the brain
-from text LLM to VLM of equal parameter count collapses the method.
+These are small `val_mini` sanity results:
+
+| Method | Episodes | SR |
+|---|---:|---:|
+| MCoCoNav, Qwen2.5-VL-7B | 30 | 0.000 |
+
+The observed failure mode is spatial frontier-assignment collapse under the
+VLM prompt. Full-val runs should be treated as confirmation runs, not as the
+first debugging target.

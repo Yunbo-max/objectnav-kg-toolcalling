@@ -1,4 +1,5 @@
 coco_categories = [0, 3, 2, 4, 5, 1]
+coco_categories_hm3d2mp3d = [0, 6, 8, 10, 13, 5]
 category_to_id = [
         "chair",
         "bed",
@@ -15,6 +16,30 @@ category_to_id_gibson = [
         "bed",
         "toilet",
         "tv"
+]
+
+category_to_id_mp3d = [
+    'chair',
+    'table',
+    'picture',
+    'cabinet',
+    'cushion',
+    'sofa',
+    'bed',
+    'chest_of_drawers',
+    'plant',
+    'sink',
+    'toilet',
+    'stool',
+    'towel',
+    'tv_monitor',
+    'shower',
+    'bathtub',
+    'counter',
+    'fireplace',
+    'gym_equipment',
+    'seating',
+    'clothes',
 ]
 
 mp3d_category_id = {
@@ -35,6 +60,7 @@ mp3d_category_id = {
 # mp_categories_mapping = [4, 11, 15, 12, 19, 23, 6, 7, 15, 38, 40, 28, 29, 8, 17]
 
 mp_categories_mapping = [4, 11, 15, 12, 19, 23, 26, 24, 28, 38, 21, 16, 14, 6, 16]
+mp_categories_mapping21 = [4, 6, 7, 8, 9, 11, 12, 14, 15, 16, 19, 20, 21, 23, 24, 26, 27, 28, 34, 35, 39]
 
 hm3d_category = [
         "chair",
@@ -53,6 +79,8 @@ hm3d_category = [
         "table",
         "stairs"
 ]
+
+object_category = category_to_id_mp3d + ['background']
 
 
 coco_categories_mapping = {

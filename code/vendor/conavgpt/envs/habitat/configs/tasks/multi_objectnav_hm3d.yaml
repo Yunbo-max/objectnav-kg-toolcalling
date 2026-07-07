@@ -31,7 +31,7 @@ SIMULATOR:
     MIN_DEPTH: 0.5
     MAX_DEPTH: 5.0
     POSITION: [0, 0.88, 0]
-  SCENE_DATASET: "data/scene_datasets/hm3d_v0.2/hm3d_annotated_basis.scene_dataset_config.json"
+  SCENE_DATASET: "data/scene_datasets/hm3d_v0.2/{split}/hm3d_{split}_basis.scene_dataset_config.json"
 TASK:
   TYPE: ObjectNav-v1
   POSSIBLE_ACTIONS: ["STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP", "LOOK_DOWN"]
@@ -48,4 +48,3 @@ DATASET:
   SPLIT: val
   DATA_PATH: "data/datasets/objectnav_hm3d_v2/{split}/{split}.json.gz"
   SCENES_DIR: "data/scene_datasets"
-

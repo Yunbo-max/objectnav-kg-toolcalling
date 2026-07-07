@@ -25,14 +25,16 @@ def load_model(model_path, device="cuda:0", model_type="text"):
 
     print(f"Loading model from {model_path} on {device}...")
     start = time.time()
+    torch_dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
+    device_map = {"": device}
 
     if model_type == "vl":
         # Vision-Language model (Qwen2.5-VL)
         from transformers import Qwen2_5_VLForConditionalGeneration
         _model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_path,
-            torch_dtype=torch.float16,
-            device_map=device,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
         )
         _processor = AutoProcessor.from_pretrained(model_path)
         _tokenizer = None
@@ -41,8 +43,8 @@ def load_model(model_path, device="cuda:0", model_type="text"):
         _tokenizer = AutoTokenizer.from_pretrained(model_path)
         _model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16,
-            device_map=device,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
         )
         _processor = None
 
@@ -167,7 +169,13 @@ def chat_completion_create(model, messages, temperature=0, **kwargs):
         elif msg["role"] == "user":
             user_prompt = msg["content"]
 
-    content = generate_response(system_prompt, user_prompt, temperature=max(temperature, 0.01))
+    max_new_tokens = kwargs.get("max_tokens", kwargs.get("max_new_tokens", 256))
+    content = generate_response(
+        system_prompt,
+        user_prompt,
+        max_new_tokens=max_new_tokens,
+        temperature=max(temperature, 0.01),
+    )
     return LocalLLMResponse(content)
 
 

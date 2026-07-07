@@ -10,8 +10,9 @@ from pathlib import Path
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--logs", default="../results/runs")
-    p.add_argument("--out", default="../results/table1.csv")
+    repo_root = Path(__file__).resolve().parents[2]
+    p.add_argument("--logs", default=str(repo_root / "results" / "runs"))
+    p.add_argument("--out", default=str(repo_root / "results" / "table1.csv"))
     args = p.parse_args()
 
     agg: dict[str, dict[str, float]] = defaultdict(

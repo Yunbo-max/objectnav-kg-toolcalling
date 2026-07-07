@@ -1,18 +1,36 @@
 # EfficientNav
 
-Upstream: (NeurIPS 2025, code release pending)
+Upstream: NeurIPS 2025 method; public code release was not vendored into this
+checkout.
 
-## What it is
-VLM-head variant designed for tighter action budgets; originally used
-LLaVA-34B. We adapted the decision head to Qwen2.5-VL-7B for a
-matched-scale comparison.
+## What It Is
 
-## Our reproduction
-Local path: `/tf/notebooks/godie/repos/EfficientNav/`
+EfficientNav is a VLM-head navigation variant originally reported with a
+larger VLM. In this project it is tracked as an external baseline candidate,
+not as a first-class local implementation.
 
-## Status
-Data set up; runs queued pending GPU availability alongside the other
-baselines.
+## Local Status
 
-## Numbers (HM3D val_mini, N=2)
-- Qwen2.5-VL-7B: SR 0.000 (same collapse as MCoCoNav).
+There is no local EfficientNav checkout under:
+
+```text
+/home/huaziheng/project/objectnav-kg-toolcalling/code/vendor/
+```
+
+The existing VLM failure analysis is represented by the local MCoCoNav
+reproduction in:
+
+```text
+code/vendor/mcoconav/
+```
+
+## Current Legacy Numbers
+
+The old `val_mini` table recorded the same collapse pattern as MCoCoNav:
+
+| Method | Episodes | SR |
+|---|---:|---:|
+| EfficientNav-style Qwen2.5-VL-7B head | 30 | 0.000 |
+
+Do not treat this as a full local EfficientNav reproduction unless the upstream
+code is added to the repository and rerun on HM3D `val`.

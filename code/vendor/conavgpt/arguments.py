@@ -1,4 +1,5 @@
 import argparse
+import os
 import torch
 
 
@@ -17,6 +18,8 @@ def get_args():
                         help="gpu id on which scenes are loaded")
     parser.add_argument("--sem_gpu_id", type=int, default=0,
                         help="""gpu id for semantic model,""")
+    parser.add_argument("--llm_gpu_id", type=int, default=-1,
+                        help="gpu id for local LLM; defaults to --sem_gpu_id when negative")
 
     # Logging, loading models, visualization
     parser.add_argument('--log_interval', type=int, default=10,
@@ -50,6 +53,12 @@ def get_args():
                         help='Frame height (default:120)')
     parser.add_argument('-el', '--max_episode_length', type=int, default=500,
                         help="""Maximum episode length""")
+    parser.add_argument('--max_episodes', type=int,
+                        default=int(os.environ.get("MAX_EPISODES", "0")),
+                        help='maximum number of episodes to run; 0 means all episodes in split')
+    parser.add_argument('--start_episode_index', type=int,
+                        default=int(os.environ.get("START_EPISODE_INDEX", "0")),
+                        help='number of Habitat iterator episodes to skip before evaluation')
     parser.add_argument("--task_config", type=str,
                         default="tasks/multi_objectnav_hm3d.yaml",
                         help="path to config yaml containing task information")
@@ -81,7 +90,7 @@ def get_args():
     parser.add_argument('--num_local_steps', type=int, default=25,
                         help="""Number of steps the local policy
                                 between each global step""")
-    parser.add_argument('--num_sem_categories', type=float, default=16)
+    parser.add_argument('--num_sem_categories', type=int, default=16)
     parser.add_argument('--sem_pred_prob_thr', type=float, default=0.9,
                         help="Semantic prediction confidence threshold")
 
@@ -104,6 +113,97 @@ def get_args():
                                 1: gpt-3.5-turbo
                                 2: gpt-4
                                 (default: 1)""")
+    parser.add_argument('--brain', type=str, default="helicase",
+                        help='navigation brain name kept for script compatibility')
+    parser.add_argument('--llm_path', type=str, default=None,
+                        help='local text LLM path; overrides --gpt_type model defaults')
+    parser.add_argument('--brain_backend', type=str,
+                        choices=("local", "siliconflow", "deepseek"),
+                        default=os.environ.get("BRAIN_BACKEND", "local"),
+                        help='MindNav decision backend')
+    parser.add_argument('--brain_model', type=str,
+                        default=os.environ.get("BRAIN_MODEL", os.environ.get("DEEPSEEK_MODEL", "Pro/MiniMaxAI/MiniMax-M2.5")),
+                        help='remote brain model name for API backends')
+    parser.add_argument('--brain_base_url', type=str,
+                        default=os.environ.get("BRAIN_BASE_URL", os.environ.get("DEEPSEEK_BASE_URL", None)),
+                        help='OpenAI-compatible base URL for API brain backends')
+    parser.add_argument('--deepseek_thinking', type=str,
+                        choices=("disabled", "enabled"),
+                        default=os.environ.get("DEEPSEEK_THINKING", "disabled"),
+                        help='DeepSeek reasoning mode; keep disabled for non-thinking responses')
+    parser.add_argument('--mindnav_mode', type=str,
+                        choices=("kg", "semantic", "heuristic"),
+                        default=os.environ.get("MINDNAV_MODE", "kg"),
+                        help='MindNav frontier assignment mode')
+    parser.add_argument('--mindnav_config', type=str,
+                        default=os.environ.get("MINDNAV_CONFIG", None),
+                        help='optional MindNav YAML config with KG/tool-calling parameters')
+    parser.add_argument('--brain_max_tokens', type=int,
+                        default=int(os.environ.get("BRAIN_MAX_TOKENS", "512")),
+                        help='maximum new tokens for MindNav brain responses')
+    parser.add_argument('--mindnav_target_tau', type=float,
+                        default=float(os.environ.get("MINDNAV_TARGET_TAU", "0.5")),
+                        help='certainty threshold for direct target pursuit')
+    parser.add_argument('--jsonl_log', type=str, default=None,
+                        help='optional per-episode JSONL metrics path')
+    parser.add_argument('--append_jsonl', type=int,
+                        default=int(os.environ.get("APPEND_JSONL", "0")),
+                        help='1: append to existing JSONL metrics instead of truncating')
+    parser.add_argument('--method_name', type=str, default=None,
+                        help='method name written to JSONL metrics')
+    parser.add_argument('--kg_trace_dir', type=str,
+                        default=os.environ.get("KG_TRACE_DIR", None),
+                        help='optional directory for MindNav KG JSONL traces and plots')
+    parser.add_argument('--kg_trace_plots', type=int,
+                        default=int(os.environ.get("KG_TRACE_PLOTS", "1")),
+                        help='1: render KG topology and map-overlay plots when tracing')
+
+    parser.add_argument('--semantic_boost_backend', type=str,
+                        choices=("none", "grounded_sam"),
+                        default=os.environ.get(
+                            "SEMANTIC_BOOST_BACKEND",
+                            os.environ.get("SEMANTIC_BOOST", "none"),
+                        ),
+                        help='optional semantic-map enhancer')
+    parser.add_argument('--semantic_boost_model_id', type=str,
+                        default=os.environ.get(
+                            "SEMANTIC_BOOST_MODEL_ID",
+                            "IDEA-Research/grounding-dino-base",
+                        ),
+                        help='HuggingFace zero-shot detector model id')
+    parser.add_argument('--semantic_boost_sam_type', type=str,
+                        default=os.environ.get("SEMANTIC_BOOST_SAM_TYPE", "vit_b"),
+                        help='SAM model type from segment-anything')
+    parser.add_argument('--semantic_boost_sam_checkpoint', type=str,
+                        default=os.environ.get(
+                            "SEMANTIC_BOOST_SAM_CHECKPOINT",
+                            "/home/huaziheng/models/vision/sam/sam_vit_b_01ec64.pth",
+                        ),
+                        help='SAM checkpoint path')
+    parser.add_argument('--semantic_boost_device', type=str,
+                        default=os.environ.get("SEMANTIC_BOOST_DEVICE", None),
+                        help='device for semantic boost models; defaults to semantic model device')
+    parser.add_argument('--semantic_boost_interval', type=int,
+                        default=int(os.environ.get("SEMANTIC_BOOST_INTERVAL", "5")),
+                        help='run semantic boost once every N local frames')
+    parser.add_argument('--semantic_boost_box_threshold', type=float,
+                        default=float(os.environ.get("SEMANTIC_BOOST_BOX_THRESHOLD", "0.25")),
+                        help='GroundingDINO box threshold')
+    parser.add_argument('--semantic_boost_text_threshold', type=float,
+                        default=float(os.environ.get("SEMANTIC_BOOST_TEXT_THRESHOLD", "0.20")),
+                        help='GroundingDINO text threshold')
+    parser.add_argument('--semantic_boost_sam_iou_threshold', type=float,
+                        default=float(os.environ.get("SEMANTIC_BOOST_SAM_IOU_THRESHOLD", "0.75")),
+                        help='minimum SAM mask quality score')
+    parser.add_argument('--semantic_boost_min_mask_area', type=int,
+                        default=int(os.environ.get("SEMANTIC_BOOST_MIN_MASK_AREA", "20")),
+                        help='discard masks smaller than this many pixels')
+    parser.add_argument('--semantic_boost_max_mask_frac', type=float,
+                        default=float(os.environ.get("SEMANTIC_BOOST_MAX_MASK_FRAC", "0.45")),
+                        help='discard masks covering more than this image fraction')
+    parser.add_argument('--semantic_boost_max_detections_per_category', type=int,
+                        default=int(os.environ.get("SEMANTIC_BOOST_MAX_DETECTIONS_PER_CATEGORY", "3")),
+                        help='maximum detected boxes to segment per category per frame')
                                 
     # for sem exp
     parser.add_argument('--lr', type=float, default=2.5e-5,
@@ -146,5 +246,7 @@ def get_args():
     args = parser.parse_args()
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
+    if "objectnav_mp3d" in args.task_config and args.num_sem_categories == 16:
+        args.num_sem_categories = 21
 
     return args

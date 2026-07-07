@@ -5,7 +5,7 @@ from a single clone.
 
 ## `conavgpt/`
 
-Minimal Co-NavGPT upstream — https://github.com/yuyang-J/Co-NavGPT — containing
+Minimal Co-NavGPT upstream — https://github.com/ybgdgh/Co-NavGPT — containing
 the subset needed to run MindNav and the Co-NavGPT baseline:
 
 | Path | Purpose |

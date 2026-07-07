@@ -1,0 +1,36 @@
+method: mindnav
+num_robots: 2
+max_steps: 500
+global_plan_every: 25
+
+kg:
+  room_grid_scale: 40
+  merge_radius_px: 30
+  object_merge_enabled: false
+  object_merge_radius_px: 60
+  next_to_px: 20
+  near_px: 60
+  room_connect_px: 150
+  max_room_connections: 3
+  create_pseudo_doors: false
+  suggests_as_property: true
+  certainty_cap: 0.99
+  priority_target_tau: 0.5
+
+brain:
+  llm_path: /home/huaziheng/models/Qwen2.5-7B-Instruct
+  device: cuda:3
+  max_tokens: 512
+  tools:
+    - query_room_objects
+    - estimate_room_probability
+    - assign_frontiers
+
+perception:
+  detectron2_config: checkpoints/mask_rcnn_X_101_32x8d_FPN_3x.yaml
+  rednet_checkpoint: checkpoints/rednet.pth
+
+dataset:
+  name: hm3d_v0.2
+  split: val_mini
+  episodes: 30
