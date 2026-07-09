@@ -18,14 +18,9 @@ from agents.helicase_kg import KnowledgeGraph, KGUpdater
 from agents.kg_logging import KGTraceLogger
 from agents.mindnav_kg_brain import KGToolCallingBrain
 from agents.mindnav_heuristic import MindNavHeuristicBrain
-from envs.habitat.multi_agent_env import Multi_Agent_Env
-from constants import (
-    color_palette,
-    coco_categories,
-    hm3d_category,
-    category_to_id,
-    category_to_id_mp3d,
-)
+from envs.habitat.multi_agent_env import Multi_Agent_Env as PredMultiAgentEnv
+from envs.habitat.multi_agent_sem_env import Multi_Agent_Env as GTMultiAgentEnv
+from constants import color_palette
 import utils.visualization as vu
 from arguments import get_args
 
@@ -156,27 +151,26 @@ def cfg_bool(config, key, default=False):
 
 
 def is_mp3d_task(args):
-    return "objectnav_mp3d" in args.task_config
+    return getattr(args, "dataset", None) == "mp3d" or "objectnav_mp3d" in args.task_config
 
 
 def semantic_categories(args):
-    if is_mp3d_task(args):
-        return category_to_id_mp3d
-    return hm3d_category
+    return args.semantic_categories
 
 
-def goal_channel(args, goal_id):
-    if is_mp3d_task(args):
-        return int(goal_id) + 4
-    return coco_categories[int(goal_id)] + 4
+def goal_label(args, goal_name):
+    if isinstance(goal_name, (int, np.integer)):
+        goal_id = int(goal_name)
+        if 0 <= goal_id < len(args.goal_id_to_name):
+            return args.goal_id_to_name[goal_id]
+        return str(goal_id)
+    return str(goal_name)
 
 
-def goal_label(args, goal_id):
-    categories = category_to_id_mp3d if is_mp3d_task(args) else category_to_id
-    goal_id = int(goal_id)
-    if 0 <= goal_id < len(categories):
-        return categories[goal_id]
-    return str(goal_id)
+def goal_channel(args, goal_name):
+    goal_cat = goal_label(args, goal_name)
+    goal_ch = args.category_to_channel.get(goal_cat)
+    return goal_ch + 4 if goal_ch is not None else None
 
 
 def sanitize_navigation_actions(args, actions):
@@ -209,11 +203,12 @@ def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visi
     map_pred = full_map_pred[0, :, :].cpu().numpy()
     exp_pred = full_map_pred[1, :, :].cpu().numpy()
 
-    sem_map = full_map_pred[4:, :,:].argmax(0).cpu().numpy()
+    semantic_scores = full_map_pred[4:, :, :]
+    sem_map = semantic_scores.argmax(0).cpu().numpy()
+    no_cat_mask = (torch.max(semantic_scores, dim=0)[0] <= 0).cpu().numpy()
 
     sem_map += 5
 
-    no_cat_mask = sem_map == args.num_sem_categories + 4
     map_mask = np.rint(map_pred) == 1
     exp_mask = np.rint(exp_pred) == 1
     edge_mask = map_edge == 1
@@ -246,7 +241,7 @@ def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visi
 
     goal = np.zeros((full_w, full_w)) 
     cn = goal_channel(args, goal_name)
-    if full_map_pred[cn, :, :].sum() != 0.:
+    if cn is not None and full_map_pred[cn, :, :].sum() != 0.:
         cat_semantic_map = full_map_pred[cn, :, :].cpu().numpy()
         cat_semantic_scores = cat_semantic_map
         cat_semantic_scores[cat_semantic_scores > 0] = 1.
@@ -399,15 +394,17 @@ def Frontiers(full_map_pred):
 # Room type inference from nearby objects. Values are evidence weights, not
 # normalized signature membership; a single strong object can identify a room.
 ROOM_SIGNATURES = {
-    "bathroom": {"toilet": 1.0, "shower": 1.0, "bathtub": 1.0, "sink": 0.7, "towel": 0.7, "counter": 0.4, "cabinet": 0.3},
-    "bedroom": {"bed": 1.0, "chest_of_drawers": 0.9, "drawer": 0.9, "clothes": 0.8, "cabinet": 0.4, "picture": 0.3, "chair": 0.3},
-    "living_room": {"sofa": 1.0, "couch": 1.0, "tv_monitor": 0.9, "tv": 0.9, "fireplace": 0.9, "cushion": 0.7, "seating": 0.7, "chair": 0.5, "table": 0.4, "picture": 0.4, "plant": 0.4},
-    "kitchen": {"counter": 1.0, "sink": 0.8, "cabinet": 0.7, "table": 0.5, "stool": 0.5, "chair": 0.3, "appliances": 0.9},
-    "dining_room": {"table": 1.0, "chair": 0.8, "stool": 0.5, "cabinet": 0.4, "picture": 0.3},
-    "office_room": {"chair": 0.8, "table": 0.8, "cabinet": 0.5, "picture": 0.3, "plant": 0.3},
+    "bathroom": {"toilet": 1.0, "shower": 1.0, "bathtub": 1.0, "sink": 0.7, "towel": 0.7, "mirror": 0.8, "counter": 0.4, "cabinet": 0.3},
+    "bedroom": {"bed": 1.0, "chest_of_drawers": 0.9, "drawer": 0.9, "clothes": 0.8, "curtain": 0.45, "blinds": 0.45, "cabinet": 0.4, "window": 0.35, "mirror": 0.35, "picture": 0.3, "chair": 0.3, "shelving": 0.25},
+    "living_room": {"sofa": 1.0, "couch": 1.0, "tv_monitor": 0.9, "tv": 0.9, "fireplace": 0.9, "cushion": 0.7, "seating": 0.7, "chair": 0.5, "shelving": 0.45, "table": 0.4, "picture": 0.4, "plant": 0.4, "curtain": 0.35, "blinds": 0.35, "window": 0.25},
+    "kitchen": {"counter": 1.0, "appliances": 0.9, "sink": 0.8, "cabinet": 0.7, "table": 0.5, "stool": 0.5, "shelving": 0.4, "chair": 0.3, "window": 0.15, "blinds": 0.15},
+    "dining_room": {"table": 1.0, "chair": 0.8, "stool": 0.5, "cabinet": 0.4, "picture": 0.3, "window": 0.2, "curtain": 0.2, "blinds": 0.2, "shelving": 0.2},
+    "office_room": {"chair": 0.8, "table": 0.8, "shelving": 0.6, "cabinet": 0.5, "picture": 0.3, "plant": 0.3, "window": 0.25, "blinds": 0.25},
     "gym": {"gym_equipment": 1.0, "gym equipment": 1.0, "treadmill": 1.0, "exercise machine": 1.0},
     "lounge": {"sofa": 0.9, "couch": 0.9, "seating": 0.9, "chair": 0.6, "table": 0.5, "plant": 0.4, "picture": 0.4, "tv_monitor": 0.4, "tv": 0.4},
     "laundry_room": {"clothes": 0.8, "towel": 0.7, "sink": 0.5, "cabinet": 0.4, "counter": 0.3},
+    "hallway": {"stairs": 1.0, "door": 0.9, "window": 0.2, "mirror": 0.2},
+    "storage_room": {"shelving": 0.8, "door": 0.3, "appliances": 0.3},
 }
 
 # Adjacency priors: if we've explored room X, what room is likely next?
@@ -422,53 +419,55 @@ ROOM_ADJACENCY = {
     "gym": {"lounge": 0.2, "living_room": 0.15, "bathroom": 0.1},
     "lounge": {"living_room": 0.3, "dining_room": 0.15, "office_room": 0.15, "kitchen": 0.1, "gym": 0.05},
     "laundry_room": {"kitchen": 0.25, "bedroom": 0.2, "bathroom": 0.2, "living_room": 0.1},
-    "unknown": {"bedroom": 0.15, "living_room": 0.15, "bathroom": 0.15, "kitchen": 0.15, "dining_room": 0.1, "office_room": 0.1, "lounge": 0.1, "laundry_room": 0.05, "gym": 0.05},
+    "hallway": {"living_room": 0.25, "bedroom": 0.2, "bathroom": 0.15, "kitchen": 0.15, "dining_room": 0.1, "office_room": 0.1, "storage_room": 0.08},
+    "storage_room": {"hallway": 0.25, "bedroom": 0.2, "kitchen": 0.18, "laundry_room": 0.12},
+    "unknown": {"bedroom": 0.15, "living_room": 0.15, "bathroom": 0.15, "kitchen": 0.15, "dining_room": 0.1, "office_room": 0.1, "lounge": 0.1, "hallway": 0.08, "storage_room": 0.06, "laundry_room": 0.05, "gym": 0.05},
 }
 
 # Object co-occurrence: P(target | observed_object_nearby)
 # When we see object X nearby, how much does it boost the probability of target Y?
 OBJECT_COOCCURRENCE = {
-    "toilet": {"sink": 0.85, "bathtub": 0.9, "shower": 0.9, "towel": 0.7},
-    "sink": {"toilet": 0.7, "shower": 0.65, "bathtub": 0.65, "towel": 0.55, "counter": 0.45},
-    "shower": {"toilet": 0.75, "sink": 0.65, "towel": 0.7, "bathtub": 0.55},
-    "bathtub": {"toilet": 0.75, "sink": 0.65, "towel": 0.7, "shower": 0.55},
+    "toilet": {"sink": 0.85, "bathtub": 0.9, "shower": 0.9, "towel": 0.7, "mirror": 0.55},
+    "sink": {"toilet": 0.7, "shower": 0.65, "bathtub": 0.65, "towel": 0.55, "mirror": 0.55, "counter": 0.45, "appliances": 0.55},
+    "shower": {"toilet": 0.75, "sink": 0.65, "towel": 0.7, "bathtub": 0.55, "mirror": 0.45},
+    "bathtub": {"toilet": 0.75, "sink": 0.65, "towel": 0.7, "shower": 0.55, "mirror": 0.45},
     "towel": {"toilet": 0.65, "sink": 0.6, "shower": 0.7, "bathtub": 0.7, "bed": 0.25},
-    "bed": {"chest_of_drawers": 0.85, "clothes": 0.65, "picture": 0.45, "towel": 0.3},
-    "chest_of_drawers": {"bed": 0.85, "clothes": 0.65, "cabinet": 0.35},
-    "clothes": {"bed": 0.65, "chest_of_drawers": 0.65, "cabinet": 0.45},
-    "chair": {"table": 0.7, "sofa": 0.5, "tv_monitor": 0.4, "picture": 0.3},
-    "table": {"chair": 0.75, "stool": 0.45, "counter": 0.35, "sofa": 0.25},
-    "stool": {"table": 0.55, "counter": 0.55, "chair": 0.45},
-    "tv_monitor": {"sofa": 0.8, "chair": 0.5, "fireplace": 0.4, "seating": 0.6},
-    "sofa": {"tv_monitor": 0.7, "chair": 0.5, "fireplace": 0.4, "table": 0.3, "cushion": 0.75},
-    "cushion": {"sofa": 0.75, "seating": 0.65, "chair": 0.45},
-    "seating": {"sofa": 0.6, "chair": 0.55, "cushion": 0.65, "tv_monitor": 0.45},
-    "picture": {"sofa": 0.45, "bed": 0.4, "table": 0.25, "fireplace": 0.35, "cabinet": 0.25},
-    "cabinet": {"counter": 0.55, "sink": 0.35, "table": 0.3, "picture": 0.25},
-    "counter": {"sink": 0.55, "cabinet": 0.55, "stool": 0.45, "table": 0.3},
+    "bed": {"chest_of_drawers": 0.85, "clothes": 0.65, "picture": 0.45, "mirror": 0.35, "window": 0.35, "curtain": 0.35, "blinds": 0.35, "towel": 0.3},
+    "chest_of_drawers": {"bed": 0.85, "clothes": 0.65, "shelving": 0.45, "mirror": 0.4, "window": 0.3, "curtain": 0.3, "blinds": 0.3, "cabinet": 0.35},
+    "clothes": {"bed": 0.65, "chest_of_drawers": 0.65, "shelving": 0.55, "cabinet": 0.45, "mirror": 0.35},
+    "chair": {"table": 0.7, "sofa": 0.5, "tv_monitor": 0.4, "picture": 0.3, "window": 0.25, "curtain": 0.25, "blinds": 0.25, "door": 0.15, "stairs": 0.15},
+    "table": {"chair": 0.75, "stool": 0.45, "appliances": 0.35, "counter": 0.35, "shelving": 0.25, "sofa": 0.25},
+    "stool": {"table": 0.55, "counter": 0.55, "chair": 0.45, "appliances": 0.35},
+    "tv_monitor": {"sofa": 0.8, "chair": 0.5, "fireplace": 0.4, "seating": 0.6, "window": 0.25, "curtain": 0.25, "blinds": 0.25},
+    "sofa": {"tv_monitor": 0.7, "chair": 0.5, "fireplace": 0.4, "table": 0.3, "window": 0.25, "curtain": 0.25, "blinds": 0.25, "cushion": 0.75},
+    "cushion": {"sofa": 0.75, "seating": 0.65, "chair": 0.45, "window": 0.25, "curtain": 0.25, "blinds": 0.25},
+    "seating": {"sofa": 0.6, "chair": 0.55, "cushion": 0.65, "tv_monitor": 0.45, "window": 0.25, "curtain": 0.25, "blinds": 0.25, "door": 0.15, "stairs": 0.15},
+    "picture": {"sofa": 0.45, "bed": 0.4, "window": 0.3, "curtain": 0.3, "blinds": 0.3, "shelving": 0.25, "table": 0.25, "fireplace": 0.35, "cabinet": 0.25, "door": 0.15, "stairs": 0.15},
+    "cabinet": {"counter": 0.55, "appliances": 0.55, "shelving": 0.55, "sink": 0.35, "table": 0.3, "picture": 0.25},
+    "counter": {"appliances": 0.75, "sink": 0.55, "cabinet": 0.55, "stool": 0.45, "table": 0.3},
     "fireplace": {"sofa": 0.65, "tv_monitor": 0.35, "chair": 0.35, "picture": 0.35},
-    "plant": {"chair": 0.3, "sofa": 0.3, "table": 0.3, "stairs": 0.4},
+    "plant": {"stairs": 0.4, "chair": 0.3, "sofa": 0.3, "table": 0.3, "door": 0.25},
     "gym_equipment": {"treadmill": 0.7, "picture": 0.2},
 }
 
 # Object co-occurrence priors: P(target | room_type)
 # Based on common indoor layouts
 TARGET_ROOM_PRIOR = {
-    "chair": {"office_room": 0.45, "dining_room": 0.4, "living_room": 0.35, "lounge": 0.3, "kitchen": 0.25, "bedroom": 0.12, "bathroom": 0.02},
-    "table": {"dining_room": 0.55, "kitchen": 0.4, "office_room": 0.35, "living_room": 0.25, "lounge": 0.22, "bedroom": 0.08, "bathroom": 0.01},
-    "picture": {"living_room": 0.35, "bedroom": 0.3, "office_room": 0.25, "lounge": 0.25, "dining_room": 0.18, "kitchen": 0.1, "bathroom": 0.06},
-    "cabinet": {"kitchen": 0.4, "bedroom": 0.32, "bathroom": 0.22, "office_room": 0.22, "dining_room": 0.18, "living_room": 0.16, "laundry_room": 0.14},
+    "chair": {"office_room": 0.45, "dining_room": 0.4, "living_room": 0.35, "lounge": 0.3, "kitchen": 0.25, "bedroom": 0.12, "hallway": 0.1, "bathroom": 0.02},
+    "table": {"dining_room": 0.55, "kitchen": 0.4, "office_room": 0.35, "living_room": 0.25, "lounge": 0.22, "hallway": 0.08, "bedroom": 0.08, "bathroom": 0.01},
+    "picture": {"living_room": 0.35, "bedroom": 0.3, "office_room": 0.25, "lounge": 0.25, "hallway": 0.18, "dining_room": 0.18, "kitchen": 0.1, "bathroom": 0.06},
+    "cabinet": {"kitchen": 0.4, "bedroom": 0.32, "storage_room": 0.3, "bathroom": 0.22, "office_room": 0.22, "dining_room": 0.18, "living_room": 0.16, "laundry_room": 0.14, "hallway": 0.1},
     "cushion": {"living_room": 0.75, "lounge": 0.65, "bedroom": 0.15, "dining_room": 0.05, "kitchen": 0.02, "bathroom": 0.01},
     "sofa": {"living_room": 0.75, "lounge": 0.65, "bedroom": 0.08, "dining_room": 0.04, "kitchen": 0.02, "bathroom": 0.01},
     "couch": {"living_room": 0.75, "lounge": 0.65, "bedroom": 0.08, "dining_room": 0.04, "kitchen": 0.02, "bathroom": 0.01},
     "bed": {"bedroom": 0.9, "living_room": 0.04, "lounge": 0.03, "kitchen": 0.01, "bathroom": 0.01, "dining_room": 0.01},
-    "chest_of_drawers": {"bedroom": 0.85, "living_room": 0.06, "laundry_room": 0.05, "bathroom": 0.02, "kitchen": 0.01},
+    "chest_of_drawers": {"bedroom": 0.85, "storage_room": 0.18, "living_room": 0.06, "laundry_room": 0.05, "bathroom": 0.02, "kitchen": 0.01},
     "drawer": {"bedroom": 0.85, "living_room": 0.06, "laundry_room": 0.05, "bathroom": 0.02, "kitchen": 0.01},
-    "plant": {"living_room": 0.4, "lounge": 0.35, "office_room": 0.25, "dining_room": 0.18, "kitchen": 0.12, "bedroom": 0.1, "bathroom": 0.04},
+    "plant": {"living_room": 0.4, "lounge": 0.35, "office_room": 0.25, "hallway": 0.25, "dining_room": 0.18, "kitchen": 0.12, "bedroom": 0.1, "bathroom": 0.04},
     "sink": {"bathroom": 0.55, "kitchen": 0.4, "laundry_room": 0.25, "bedroom": 0.02, "living_room": 0.01},
     "toilet": {"bathroom": 0.9, "bedroom": 0.02, "kitchen": 0.02, "living_room": 0.01, "laundry_room": 0.01},
     "stool": {"kitchen": 0.42, "dining_room": 0.34, "living_room": 0.12, "lounge": 0.1, "bedroom": 0.04, "bathroom": 0.01},
-    "towel": {"bathroom": 0.75, "laundry_room": 0.35, "bedroom": 0.18, "kitchen": 0.08, "living_room": 0.02},
+    "towel": {"bathroom": 0.75, "laundry_room": 0.35, "storage_room": 0.2, "bedroom": 0.18, "kitchen": 0.08, "living_room": 0.02},
     "tv_monitor": {"living_room": 0.65, "lounge": 0.45, "bedroom": 0.2, "kitchen": 0.04, "bathroom": 0.01},
     "tv": {"living_room": 0.65, "lounge": 0.45, "bedroom": 0.2, "kitchen": 0.04, "bathroom": 0.01},
     "shower": {"bathroom": 0.9, "laundry_room": 0.04, "bedroom": 0.03, "kitchen": 0.02, "living_room": 0.01},
@@ -476,8 +475,8 @@ TARGET_ROOM_PRIOR = {
     "counter": {"kitchen": 0.65, "bathroom": 0.2, "laundry_room": 0.15, "dining_room": 0.1, "living_room": 0.04, "bedroom": 0.01},
     "fireplace": {"living_room": 0.75, "lounge": 0.35, "bedroom": 0.1, "dining_room": 0.06, "kitchen": 0.01},
     "gym_equipment": {"gym": 0.85, "lounge": 0.08, "living_room": 0.05, "bedroom": 0.03},
-    "seating": {"living_room": 0.6, "lounge": 0.55, "dining_room": 0.22, "office_room": 0.15, "bedroom": 0.06, "kitchen": 0.02},
-    "clothes": {"bedroom": 0.75, "laundry_room": 0.45, "bathroom": 0.08, "living_room": 0.03, "lounge": 0.02},
+    "seating": {"living_room": 0.6, "lounge": 0.55, "dining_room": 0.22, "office_room": 0.15, "hallway": 0.08, "bedroom": 0.06, "kitchen": 0.02},
+    "clothes": {"bedroom": 0.75, "laundry_room": 0.45, "storage_room": 0.28, "bathroom": 0.08, "hallway": 0.08, "living_room": 0.03, "lounge": 0.02},
 }
 
 
@@ -534,7 +533,14 @@ def _infer_room_from_object_stats(object_stats):
     }
 
 
-def enrich_frontiers(full_map_pred, frontier_points, frontier_areas, goal_name, categories, radius=30):
+def enrich_frontiers(
+    full_map_pred,
+    frontier_points,
+    frontier_areas,
+    goal_name,
+    semantic_categories,
+    radius=60,
+):
     """For each frontier, find nearby objects and infer room type + target prior.
 
     Args:
@@ -560,7 +566,7 @@ def enrich_frontiers(full_map_pred, frontier_points, frontier_areas, goal_name, 
         nearby_objects = []
         nearby_object_scores = {}
         nearby_object_stats = {}
-        for cat_idx in range(len(categories)):
+        for cat_idx, cat_name in enumerate(semantic_categories):
             if cat_idx >= patch.shape[0]:
                 continue
             cat_patch = patch[cat_idx]
@@ -568,11 +574,10 @@ def enrich_frontiers(full_map_pred, frontier_points, frontier_areas, goal_name, 
             if mass <= 2:
                 continue
             score = float(cat_patch.max().item()) if hasattr(cat_patch, "max") else float(cat_patch.max())
-            category = categories[cat_idx]
             presence = _object_presence(mass, score)
-            nearby_objects.append(category)
-            nearby_object_scores[category] = round(_clamp01(score), 3)
-            nearby_object_stats[category] = {
+            nearby_objects.append(cat_name)
+            nearby_object_scores[cat_name] = round(_clamp01(score), 3)
+            nearby_object_stats[cat_name] = {
                 "mass": round(mass, 3),
                 "score": round(_clamp01(score), 3),
                 "presence": round(presence, 3),
@@ -585,7 +590,7 @@ def enrich_frontiers(full_map_pred, frontier_points, frontier_areas, goal_name, 
 
         # Target prior based on room type
         target_priors = TARGET_ROOM_PRIOR.get(goal_name, {})
-        target_prior = target_priors.get(best_room, 0.1) if best_room != "unknown" else 0.1
+        target_prior = target_priors.get(best_room, 0.05) if best_room != "unknown" else 0.1
 
         # Boost prior using object co-occurrence (even if room is "unknown")
         cooccurrence = OBJECT_COOCCURRENCE.get(goal_name, {})
@@ -600,13 +605,15 @@ def enrich_frontiers(full_map_pred, frontier_points, frontier_areas, goal_name, 
             bx_min, bx_max = max(0, fx - big_radius), min(W, fx + big_radius)
             big_patch = semantic_map[:, by_min:by_max, bx_min:bx_max]
             big_object_stats = {}
-            for ci in range(min(len(categories), big_patch.shape[0])):
+            for ci, cat_name in enumerate(semantic_categories):
+                if ci >= big_patch.shape[0]:
+                    continue
                 cat_patch = big_patch[ci]
                 mass = float(cat_patch.sum().item()) if hasattr(cat_patch, "sum") else float(cat_patch.sum())
                 if mass <= 5:
                     continue
                 score = float(cat_patch.max().item()) if hasattr(cat_patch, "max") else float(cat_patch.max())
-                big_object_stats[categories[ci]] = {
+                big_object_stats[cat_name] = {
                     "mass": mass,
                     "score": _clamp01(score),
                     "presence": _object_presence(mass, score),
@@ -645,7 +652,7 @@ def enrich_frontiers(full_map_pred, frontier_points, frontier_areas, goal_name, 
     return enriched
 
 
-def Objects_Extract(full_map_pred, categories):
+def Objects_Extract(full_map_pred, semantic_categories):
 
     semantic_map = full_map_pred[4:]
 
@@ -653,7 +660,7 @@ def Objects_Extract(full_map_pred, categories):
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(7, 7))
 
     Object_list = {}
-    for i in range(len(semantic_map)):
+    for i in range(min(len(semantic_map), len(semantic_categories))):
         if semantic_map[i, :, :].sum() != 0:
             Single_object_list = []
             se_object_map = semantic_map[i, :, :].cpu().numpy()
@@ -667,8 +674,8 @@ def Objects_Extract(full_map_pred, categories):
                     approx = cv2.approxPolyDP(cnt, epsilon, True)
                     Single_object_list.append(approx)
                     cv2.polylines(dst, [approx], True, 1)
-            if len(Single_object_list) > 0 and i < len(categories):
-                Object_list[categories[i]] = Single_object_list
+            if len(Single_object_list) > 0:
+                Object_list[semantic_categories[i]] = Single_object_list
 
     return Object_list
 
@@ -868,7 +875,163 @@ def request_brain_response(args, messages, max_tokens=100):
     return response["choices"][0]["message"]["content"].strip(), args.llm_path or gpt_name[min(args.gpt_type, len(gpt_name) - 1)]
 
 
-def write_episode_jsonl(args, episode_idx, metrics):
+def json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if isinstance(value, torch.Tensor):
+        return json_safe(value.detach().cpu().tolist())
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
+def write_jsonl(path, record):
+    if not path:
+        return
+    with open(path, "a") as fh:
+        fh.write(json.dumps(json_safe(record), ensure_ascii=False) + "\n")
+
+
+def derived_jsonl_path(base_path, suffix):
+    root, ext = os.path.splitext(base_path)
+    if not ext:
+        ext = ".jsonl"
+    return root + suffix + ext
+
+
+def init_analysis_jsonls(args):
+    if args.jsonl_log:
+        if not args.decision_jsonl:
+            args.decision_jsonl = derived_jsonl_path(args.jsonl_log, ".decisions")
+        if not args.stop_diag_jsonl:
+            args.stop_diag_jsonl = derived_jsonl_path(args.jsonl_log, ".stop_diag")
+
+    for attr in ("jsonl_log", "decision_jsonl", "stop_diag_jsonl"):
+        path = getattr(args, attr, None)
+        if not path:
+            continue
+        path_dir = os.path.dirname(path)
+        if path_dir:
+            os.makedirs(path_dir, exist_ok=True)
+        if attr == "jsonl_log" and args.append_jsonl and os.path.exists(path):
+            with open(path) as fh:
+                args.jsonl_episode_offset = sum(1 for line in fh if line.strip())
+        elif args.append_jsonl and os.path.exists(path):
+            pass
+        else:
+            open(path, "w").close()
+            if attr == "jsonl_log":
+                args.jsonl_episode_offset = int(args.start_episode_index or 0)
+
+
+def get_episode_metadata(env):
+    episode = getattr(env, "current_episode", None)
+    if episode is None:
+        episode = getattr(getattr(env, "habitat_env", None), "current_episode", None)
+    return {
+        "episode_id": getattr(episode, "episode_id", None),
+        "scene_id": getattr(episode, "scene_id", None),
+    }
+
+
+def summarize_frontiers_for_log(frontiers):
+    out = []
+    for ef in frontiers:
+        out.append({
+            "idx": int(ef.get("idx", -1)),
+            "centroid": list(ef.get("centroid", [])),
+            "area": float(ef.get("area", 0.0)),
+            "room_type": ef.get("room_type", "unknown"),
+            "room_confidence": float(ef.get("room_confidence", 0.0)),
+            "target_prior": float(ef.get("target_prior", 0.0)),
+            "nearby_objects": list(ef.get("nearby_objects", [])),
+        })
+    return out
+
+
+def robot_poses_for_log(pose_pred):
+    return [
+        {"x": float(p[0]), "y": float(p[1]), "theta": float(p[2])}
+        for p in pose_pred
+    ]
+
+
+def target_channel_stats(map_tensor, target_name, args):
+    empty = {
+        "target_channel_mass": 0.0,
+        "target_channel_max_score": 0.0,
+        "target_largest_cc_area": 0,
+        "target_num_components": 0,
+        "target_centroid": None,
+    }
+    if map_tensor is None or not target_name:
+        return empty
+    ch = args.category_to_channel.get(target_name)
+    if ch is None or ch + 4 >= map_tensor.shape[0]:
+        return empty
+    arr = map_tensor[ch + 4].detach().float().cpu().numpy()
+    mask = arr > float(getattr(args, "target_map_score_thr", 0.1))
+    if not np.any(mask):
+        return {
+            "target_channel_mass": float(arr.sum()),
+            "target_channel_max_score": float(arr.max()) if arr.size else 0.0,
+            "target_largest_cc_area": 0,
+            "target_num_components": 0,
+            "target_centroid": None,
+        }
+    labels, num = measure.label(mask.astype(np.uint8), connectivity=2, return_num=True)
+    areas = np.bincount(labels.ravel())[1:] if num > 0 else np.array([])
+    largest_area = int(areas.max()) if areas.size else 0
+    ys, xs = np.where(mask)
+    return {
+        "target_channel_mass": float(arr.sum()),
+        "target_channel_max_score": float(arr.max()) if arr.size else 0.0,
+        "target_largest_cc_area": largest_area,
+        "target_num_components": int(num),
+        "target_centroid": [float(ys.mean()), float(xs.mean())],
+    }
+
+
+def agent_target_diagnostics(agent, args):
+    out = {
+        "target_stop_mode": getattr(args, "target_stop_mode", "enforce"),
+        "found_goal_reason": getattr(agent, "last_found_goal_reason", None),
+    }
+    out.update(dict(getattr(agent, "last_target_map_evidence", {}) or {}))
+    out.update(dict(getattr(agent, "last_fresh_target_evidence", {}) or {}))
+    out.update(dict(getattr(agent, "last_target_confirmation", {}) or {}))
+    return out
+
+
+def classify_end_reason(metrics, final_action, steps, args):
+    success = float(metrics.get("success", 0.0)) >= 0.5
+    stop_called = any(int(a) == 0 for a in (final_action or []))
+    if success:
+        return "success_stop" if stop_called else "success"
+    if stop_called:
+        return "false_stop"
+    if steps >= int(args.max_episode_length):
+        return "timeout"
+    return "episode_over"
+
+
+def write_decision_jsonl(args, record):
+    write_jsonl(args.decision_jsonl, record)
+
+
+def write_stop_diag_jsonl(args, record):
+    write_jsonl(args.stop_diag_jsonl, record)
+
+
+def write_episode_jsonl(args, episode_idx, metrics, extra=None):
     if not args.jsonl_log:
         return
     episode_offset = int(getattr(args, "jsonl_episode_offset", 0))
@@ -878,8 +1041,9 @@ def write_episode_jsonl(args, episode_idx, metrics):
         "success": float(metrics.get("success", 0.0)),
         "spl": float(metrics.get("spl", metrics.get("SPL", 0.0))),
     }
-    with open(args.jsonl_log, "a") as fh:
-        fh.write(json.dumps(record) + "\n")
+    if extra:
+        record.update(extra)
+    write_jsonl(args.jsonl_log, record)
 
 
 AGENT_STATE_DEFAULTS = {
@@ -1244,6 +1408,10 @@ def main():
     config_env.DATASET.SPLIT = args.split
     config_env.DATASET.DATA_PATH = config_env.DATASET.DATA_PATH.replace("{split}", args.split)
     try:
+        config_env.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = args.sim_gpu_id
+    except Exception:
+        pass
+    try:
         config_env.ENVIRONMENT.MAX_EPISODE_STEPS = args.max_episode_length
     except Exception:
         pass
@@ -1260,12 +1428,15 @@ def main():
     config_env.freeze()
 
 
-    env = Multi_Agent_Env(config_env=config_env)
+    env_cls = GTMultiAgentEnv if args.use_gtsem else PredMultiAgentEnv
+    if args.use_gtsem:
+        print("Using Habitat GT semantic observations")
+    env = env_cls(config_env=config_env)
 
     skipped_episodes = 0
     if args.start_episode_index and args.start_episode_index > 0:
         for _ in range(min(args.start_episode_index, env.number_of_episodes)):
-            next(env.episode_iterator)
+            env.current_episode = next(env.episode_iterator)
             skipped_episodes += 1
         print(f"Skipped {skipped_episodes} Habitat iterator episodes before evaluation")
 
@@ -1330,16 +1501,7 @@ def main():
         os.makedirs(log_dir)
     if not os.path.exists(dump_dir):
         os.makedirs(dump_dir)
-    if args.jsonl_log:
-        jsonl_dir = os.path.dirname(args.jsonl_log)
-        if jsonl_dir:
-            os.makedirs(jsonl_dir, exist_ok=True)
-        if args.append_jsonl and os.path.exists(args.jsonl_log):
-            with open(args.jsonl_log) as fh:
-                args.jsonl_episode_offset = sum(1 for line in fh if line.strip())
-        else:
-            open(args.jsonl_log, "w").close()
-            args.jsonl_episode_offset = 0
+    init_analysis_jsonls(args)
 
     logging.basicConfig(
         filename=log_dir + 'output.log',
@@ -1363,6 +1525,8 @@ def main():
 
     while count_episodes < num_episodes:
         observations = env.reset()
+        episode_number = int(args.start_episode_index or 0) + count_episodes + 1
+        episode_meta = get_episode_metadata(env)
         for i in range(num_agents):
             agent[i].reset()
         kg.reset()
@@ -1370,9 +1534,15 @@ def main():
         last_decision.clear()
         goal_points.clear()
         agent_run_states = init_agent_run_states(num_agents)
+        prev_found_goal = [False for _ in range(num_agents)]
+        target_seen_ever = False
+        first_target_seen_step = None
+        min_distance_to_goal = float("inf")
+        final_action = None
+        last_full_target_stats = None
 
         while not env.episode_over:
-            action = [0, 0]
+            action = [0 for _ in range(num_agents)]
             full_map = []
             visited_vis = []
             pose_pred = []
@@ -1395,7 +1565,7 @@ def main():
                 )
                 pose_pred.append(pos)
                 
-            full_map2 = torch.cat((full_map[0].unsqueeze(0), full_map[1].unsqueeze(0)), 0)
+            full_map2 = torch.stack(full_map, 0)
 
             full_map_pred, _ = torch.max(full_map2, 0)
             for i in range(num_agents):
@@ -1416,8 +1586,7 @@ def main():
                 Wall_list, Frontier_list, target_edge_map, target_point_map = Frontiers(full_map_pred)
 
                 if len(target_point_map) > 0:
-                    categories = semantic_categories(args)
-                    object_list = Objects_Extract(full_map_pred, categories)
+                    object_list = Objects_Extract(full_map_pred, args.semantic_categories)
 
                     # Enrich frontiers with room-type + nearby objects + target prior
                     enriched = enrich_frontiers(
@@ -1425,7 +1594,7 @@ def main():
                         target_point_map,
                         Frontier_list,
                         agent[0].goal_name,
-                        categories,
+                        args.semantic_categories,
                         radius=frontier_enrichment_radius,
                     )
 
@@ -1446,7 +1615,10 @@ def main():
                                     Wall_list,
                                     full_map_pred,
                                     agent[0].goal_name,
+                                    semantic_categories=args.semantic_categories,
                                 )
+
+                            brain_trace = {}
                             if args.mindnav_mode == "kg":
                                 goal_frontiers, tools_called, method_name = kg_brain.decide(
                                     kg,
@@ -1457,6 +1629,7 @@ def main():
                                     args.max_episode_length,
                                     decision_history,
                                 )
+                                brain_trace = dict(getattr(kg_brain, "last_trace", {}) or {})
                                 print(f"MindNav KG brain: {method_name}; tools={tools_called}")
                             elif args.mindnav_mode == "heuristic":
                                 goal_frontiers, tools_called, method_name = heuristic_brain.decide(
@@ -1468,6 +1641,7 @@ def main():
                                     args.max_episode_length,
                                     decision_history,
                                 )
+                                brain_trace = {"mode": "heuristic", "goal_frontiers": dict(goal_frontiers)}
                                 print(f"MindNav heuristic brain: {method_name}; tools={tools_called}")
                             else:
                                 User_prompt, _ = form_prompt_for_chatgpt(
@@ -1490,6 +1664,13 @@ def main():
                                 goal_frontiers = parse_answer(response_message)
                                 tools_called = ["semantic_prompt"]
                                 method_name = "mindnav_semantic_prompt"
+                                brain_trace = {
+                                    "mode": "semantic_prompt",
+                                    "decision_prompt": User_prompt,
+                                    "decision_raw": response_message,
+                                    "goal_frontiers": dict(goal_frontiers),
+                                }
+                            brain_goal_frontiers = dict(goal_frontiers)
 
                             # Verify we got assignments for all robots
                             for i in range(num_agents):
@@ -1538,9 +1719,31 @@ def main():
                                 "tools": tools_called,
                                 "method": method_name,
                             })
+                            write_decision_jsonl(args, {
+                                "method": args.method_name or "mindnav",
+                                "episode": episode_number,
+                                "step": agent[0].l_step,
+                                "goal_name": agent[0].goal_name,
+                                "robot_poses": robot_poses_for_log(pose_pred),
+                                "frontiers": summarize_frontiers_for_log(enriched),
+                                "query_prompt": brain_trace.get("query_prompt", ""),
+                                "query_raw": brain_trace.get("query_raw", ""),
+                                "query_tool_calls": brain_trace.get("query_tool_calls", []),
+                                "query_results": brain_trace.get("query_results", []),
+                                "decision_prompt": brain_trace.get("decision_prompt", ""),
+                                "decision_raw": brain_trace.get("decision_raw", ""),
+                                "decision_tool_calls": brain_trace.get("decision_tool_calls", []),
+                                "decision_results": brain_trace.get("decision_results", []),
+                                "llm_probabilities": brain_trace.get("llm_probabilities", {}),
+                                "brain_assignments": brain_goal_frontiers,
+                                "raw_assignments": raw_goal_frontiers,
+                                "final_assignments": dict(goal_frontiers),
+                                "tools_called": tools_called,
+                                "decision_method": method_name,
+                            })
                             if kg_trace_logger is not None and args.mindnav_mode in ("kg", "heuristic"):
                                 kg_trace_logger.log_step(
-                                    episode_idx=count_episodes + 1,
+                                    episode_idx=episode_number,
                                     step_idx=agent[0].l_step,
                                     goal_name=agent[0].goal_name,
                                     kg=kg,
@@ -1604,15 +1807,85 @@ def main():
             # act_end = time.time()
             # act_time = act_end - start_act
             # print('act_time: %.3f秒'%act_time)
+            local_target_stats = [
+                target_channel_stats(agent[i].local_map, agent[0].goal_name, args)
+                for i in range(num_agents)
+            ]
+            last_full_target_stats = target_channel_stats(full_map_pred, agent[0].goal_name, args)
+            for i in range(num_agents):
+                found_goal_now = bool(getattr(agent[i], "last_found_goal", False))
+                if found_goal_now and not prev_found_goal[i]:
+                    if first_target_seen_step is None:
+                        first_target_seen_step = agent[0].l_step
+                    target_seen_ever = True
+                    write_stop_diag_jsonl(args, {
+                        "method": args.method_name or "mindnav",
+                        "episode": episode_number,
+                        "step": agent[0].l_step,
+                        "goal_name": agent[0].goal_name,
+                        "agent_id": i,
+                        "event": "target_first_seen",
+                        "found_goal": found_goal_now,
+                        "planner_stop": bool(getattr(agent[i], "last_planner_stop", False)),
+                        "action": int(action[i]),
+                        "distance_to_goal": None,
+                        "success": None,
+                        **local_target_stats[i],
+                        **agent_target_diagnostics(agent[i], args),
+                    })
+                prev_found_goal[i] = found_goal_now
 
             action = sanitize_navigation_actions(args, action)
+            final_action = list(action)
 
             observations = env.step(action)
+            try:
+                step_metrics = env.get_metrics()
+            except Exception:
+                step_metrics = {}
+            if "distance_to_goal" in step_metrics:
+                min_distance_to_goal = min(
+                    min_distance_to_goal,
+                    float(step_metrics.get("distance_to_goal", float("inf"))),
+                )
+            stop_agent_ids = [i for i, act in enumerate(action) if int(act) == 0]
+            for i in stop_agent_ids:
+                write_stop_diag_jsonl(args, {
+                    "method": args.method_name or "mindnav",
+                    "episode": episode_number,
+                    "step": agent[0].l_step,
+                    "goal_name": agent[0].goal_name,
+                    "agent_id": i,
+                    "event": "stop_action",
+                    "found_goal": bool(getattr(agent[i], "last_found_goal", False)),
+                    "planner_stop": bool(getattr(agent[i], "last_planner_stop", False)),
+                    "action": int(action[i]),
+                    "distance_to_goal": float(step_metrics.get("distance_to_goal", -1.0)),
+                    "success": float(step_metrics.get("success", 0.0)),
+                    **local_target_stats[i],
+                    **agent_target_diagnostics(agent[i], args),
+                })
             if env.episode_over:
                 try:
                     end_metrics = env.get_metrics()
                 except Exception:
                     end_metrics = {}
+                diag_agent_id = stop_agent_ids[0] if stop_agent_ids else 0
+                write_stop_diag_jsonl(args, {
+                    "method": args.method_name or "mindnav",
+                    "episode": episode_number,
+                    "step": agent[0].l_step,
+                    "goal_name": agent[0].goal_name,
+                    "agent_id": stop_agent_ids[0] if stop_agent_ids else -1,
+                    "event": "episode_end",
+                    "found_goal": any(bool(getattr(a, "last_found_goal", False)) for a in agent),
+                    "planner_stop": any(bool(getattr(a, "last_planner_stop", False)) for a in agent),
+                    "action": list(action),
+                    "distance_to_goal": float(end_metrics.get("distance_to_goal", -1.0)),
+                    "success": float(end_metrics.get("success", 0.0)),
+                    **(last_full_target_stats or {}),
+                    **agent_target_diagnostics(agent[diag_agent_id], args),
+                })
                 print(
                     "[EPISODE_END] step={} action={} distance_to_goal={:.3f} success={:.3f} spl={:.3f}".format(
                         agent[0].l_step,
@@ -1648,10 +1921,37 @@ def main():
         ]) + '\n'
 
         metrics = env.get_metrics()
-        write_episode_jsonl(args, count_episodes, metrics)
+        final_target_stats = last_full_target_stats or target_channel_stats(full_map_pred, agent[0].goal_name, args)
+        final_diag_agent_id = 0
+        if final_action:
+            stopped_agents = [idx for idx, act in enumerate(final_action) if int(act) == 0]
+            if stopped_agents:
+                final_diag_agent_id = stopped_agents[0]
+        final_agent_diag = agent_target_diagnostics(agent[final_diag_agent_id], args)
+        episode_extra = {
+            **episode_meta,
+            "dataset": args.dataset,
+            "split": args.split,
+            "task_config": args.task_config,
+            "use_gtsem": int(args.use_gtsem),
+            "semantic_boost_backend": args.semantic_boost_backend,
+            "goal_id": int(agent[0].goal_id) if agent[0].goal_id is not None else None,
+            "goal_name": agent[0].goal_name,
+            "steps": int(agent[0].l_step),
+            "distance_to_goal": float(metrics.get("distance_to_goal", -1.0)),
+            "end_reason": classify_end_reason(metrics, final_action, agent[0].l_step, args),
+            "final_action": final_action,
+            "target_seen_ever": bool(target_seen_ever),
+            "first_target_seen_step": first_target_seen_step,
+            "min_distance_to_goal": None if min_distance_to_goal == float("inf") else float(min_distance_to_goal),
+            "target_stop_mode": getattr(args, "target_stop_mode", "enforce"),
+            **final_target_stats,
+            **final_agent_diag,
+        }
+        write_episode_jsonl(args, count_episodes, metrics, extra=episode_extra)
         if kg_trace_logger is not None and args.mindnav_mode in ("kg", "heuristic"):
             kg_trace_logger.log_final(
-                episode_idx=count_episodes,
+                episode_idx=episode_number,
                 goal_name=agent[0].goal_name,
                 kg=kg,
                 metrics=metrics,

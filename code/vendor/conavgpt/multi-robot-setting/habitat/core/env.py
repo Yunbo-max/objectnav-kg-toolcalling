@@ -91,9 +91,10 @@ class Env:
             self._setup_episode_iterator()
             self.current_episode = next(self.episode_iterator)
             self._config.defrost()
-            self._config.SIMULATOR.SCENE_DATASET = (
-                self.current_episode.scene_dataset_config
-            )
+            if self.current_episode.scene_dataset_config != "default":
+                self._config.SIMULATOR.SCENE_DATASET = (
+                    self.current_episode.scene_dataset_config
+                )
             self._config.SIMULATOR.SCENE = self.current_episode.scene_id
             self._config.SIMULATOR.ADDITIONAL_OBJECT_PATHS = (
                 self.current_episode.additional_obj_config_paths

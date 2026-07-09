@@ -9,6 +9,13 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Set
 
+try:
+    from constants import mp3d_context_category
+except ImportError:
+    mp3d_context_category = []
+
+CONTEXT_ONLY_CATEGORIES = set(mp3d_context_category)
+
 
 @dataclass
 class KGNode:
@@ -203,25 +210,43 @@ class KnowledgeGraph:
 # ═══════════════════════════════════════
 
 ROOM_HINTS = {
-    "toilet": "bathroom", "sink": "bathroom", "bathtub": "bathroom",
-    "shower": "bathroom", "towel": "bathroom",
-    "bed": "bedroom", "chest_of_drawers": "bedroom",
-    "sofa": "living_room", "tv_monitor": "living_room", "fireplace": "living_room",
-    "table": "kitchen", "chair": "living_room", "plant": "living_room",
+    "toilet": "bathroom",
+    "sink": "bathroom",
+    "bathtub": "bathroom",
+    "shower": "bathroom",
+    "towel": "bathroom",
+    "bed": "bedroom",
+    "chest_of_drawers": "bedroom",
+    "clothes": "bedroom",
+    "cushion": "bedroom",
+    "sofa": "living_room",
+    "tv_monitor": "living_room",
+    "fireplace": "living_room",
+    "picture": "living_room",
+    "seating": "living_room",
+    "table": "kitchen_or_dining",
+    "chair": "dining_or_living",
+    "counter": "kitchen",
+    "cabinet": "kitchen",
+    "refrigerator": "kitchen",
+    "appliances": "kitchen",
+    "plant": "living_room",
     "stairs": "hallway",
+    "stool": "kitchen_or_bar",
+    "gym_equipment": "gym",
 }
 
 MERGE_DISTANCE = 30  # pixels — same object if within this distance
 
 
-def _semantic_categories_for_map(full_map_pred):
+def _semantic_categories_for_map(full_map_pred, semantic_categories=None):
+    if semantic_categories is not None:
+        return list(semantic_categories)
     try:
-        from constants import hm3d_category, category_to_id_mp3d
+        from constants import HM3D_SEMANTIC_CATEGORIES
     except ImportError:
         return []
-    if full_map_pred is not None and full_map_pred[4:].shape[0] > len(hm3d_category):
-        return category_to_id_mp3d
-    return hm3d_category
+    return HM3D_SEMANTIC_CATEGORIES
 
 
 class KGUpdater:
@@ -291,7 +316,13 @@ class KGUpdater:
             confidence = default
         return max(0.0, min(confidence, self.certainty_cap))
 
-    def _object_contour_position_confidence(self, obj_name, contour, full_map_pred):
+    def _object_contour_position_confidence(
+        self,
+        obj_name,
+        contour,
+        full_map_pred,
+        semantic_categories=None,
+    ):
         pts = np.asarray(contour).reshape(-1, 2)
         if pts.size == 0:
             return (0, 0), 0.0
@@ -303,7 +334,7 @@ class KGUpdater:
         if full_map_pred is None:
             return obj_pos, self._clamp_confidence(0.9)
 
-        categories = _semantic_categories_for_map(full_map_pred)
+        categories = _semantic_categories_for_map(full_map_pred, semantic_categories)
         try:
             cat_idx = categories.index(obj_name)
         except ValueError:
@@ -341,6 +372,8 @@ class KGUpdater:
                 old_cert = node.certainty
                 node.certainty = 1.0 - (1.0 - old_cert) * (1.0 - confidence)
                 node.certainty = min(node.certainty, self.certainty_cap)
+                if category in CONTEXT_ONLY_CATEGORIES:
+                    node.properties["context_only"] = True
                 # Running average position
                 node.position = (
                     0.7 * node.position[0] + 0.3 * pos[0],
@@ -360,10 +393,14 @@ class KGUpdater:
                 counter += 1
             obj_id = f"{obj_id}_{counter}"
 
+        properties = {"category": category, "detection_count": 1}
+        if category in CONTEXT_ONLY_CATEGORIES:
+            properties["context_only"] = True
+
         self.kg.add_node(KGNode(
             id=obj_id, node_type="object", name=category,
             certainty=confidence, position=pos,
-            properties={"category": category, "detection_count": 1}
+            properties=properties
         ))
         return obj_id, True  # new node
 
@@ -548,8 +585,16 @@ class KGUpdater:
             or (room_b, room_a, "separated_by_wall") in self.kg._edge_set
         )
 
-    def update(self, enriched_frontiers, object_list, pose_pred,
-               wall_list, full_map_pred, target_name):
+    def update(
+        self,
+        enriched_frontiers,
+        object_list,
+        pose_pred,
+        wall_list,
+        full_map_pred,
+        target_name,
+        semantic_categories=None,
+    ):
         """Update KG from current map state."""
 
         # Frontier indices are step-local. Clear them before marking the current
@@ -640,6 +685,7 @@ class KGUpdater:
                             obj_name,
                             pos_data,
                             full_map_pred,
+                            semantic_categories,
                         )
                     except Exception:
                         continue
@@ -718,7 +764,7 @@ class KGUpdater:
         if target_name and full_map_pred is not None:
             import torch
             sem = full_map_pred[4:]
-            for i, cat in enumerate(_semantic_categories_for_map(full_map_pred)):
+            for i, cat in enumerate(_semantic_categories_for_map(full_map_pred, semantic_categories)):
                 if cat == target_name and i < sem.shape[0]:
                     count = (sem[i] > 0.1).sum().item()
                     if count > 5:

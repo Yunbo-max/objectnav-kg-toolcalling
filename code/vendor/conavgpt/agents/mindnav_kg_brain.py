@@ -32,6 +32,7 @@ class KGToolCallingBrain:
         self.num_agents = num_agents
         self.max_tokens = max_tokens
         self.target_tau = target_tau
+        self.last_trace = {}
 
     def decide(
         self,
@@ -45,13 +46,32 @@ class KGToolCallingBrain:
     ) -> Tuple[Dict[str, int], List[str], str]:
         """Return robot->frontier assignments from a two-stage KG tool flow."""
 
+        self.last_trace = {
+            "mode": "kg_tool_calling",
+            "target": target_name,
+            "step": int(step),
+            "target_shortcut": False,
+        }
         target_goal = self._priority_target_goal(kg, target_name, enriched_frontiers, pose_pred)
         if target_goal:
+            self.last_trace.update({
+                "target_shortcut": True,
+                "goal_frontiers": target_goal,
+                "tools_called": ["check_target"],
+                "method": "mindnav_kg_target_found",
+            })
             return target_goal, ["check_target"], "mindnav_kg_target_found"
 
         rooms = self._active_frontier_rooms(kg)
         if not rooms:
-            return self._fallback_from_frontiers(enriched_frontiers), ["no_active_frontiers"], "mindnav_kg_no_rooms"
+            fallback = self._fallback_from_frontiers(enriched_frontiers)
+            self.last_trace.update({
+                "rooms": [],
+                "goal_frontiers": fallback,
+                "tools_called": ["no_active_frontiers"],
+                "method": "mindnav_kg_no_rooms",
+            })
+            return fallback, ["no_active_frontiers"], "mindnav_kg_no_rooms"
 
         room_to_frontier = {
             room.id: int(room.properties["frontier_idx"])
@@ -143,6 +163,23 @@ class KGToolCallingBrain:
 
         tools_called = [call.get("tool", "unknown") for call in executed] or ["kg_prompt"]
         prob_str = self._format_probs(probabilities)
+        self.last_trace.update({
+            "rooms": list(room_to_frontier.keys()),
+            "room_to_frontier": dict(room_to_frontier),
+            "query_prompt": query_messages[-1]["content"] if query_messages else "",
+            "query_raw": query_raw,
+            "query_tool_calls": query_calls,
+            "query_results": executed_queries,
+            "decision_prompt": decision_messages[-1]["content"] if decision_messages else "",
+            "decision_raw": decision_raw,
+            "decision_tool_calls": decision_calls,
+            "decision_results": executed_decisions,
+            "llm_probabilities": dict(probabilities),
+            "assigned_rooms": dict(assigned_rooms),
+            "goal_frontiers": dict(goal_frontiers),
+            "tools_called": tools_called,
+            "method": f"mindnav_kg(P={prob_str})",
+        })
         return goal_frontiers, tools_called, f"mindnav_kg(P={prob_str})"
 
     def _build_query_messages(self, kg, target_name, rooms, step, max_steps, decision_history):

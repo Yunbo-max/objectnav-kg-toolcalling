@@ -38,16 +38,9 @@ from utils.semantic_prediction import SemanticPredMaskRCNN
 import utils.visualization as vu
 from arguments import get_args
 
-from constants import (
-    coco_categories,
-    color_palette,
-    category_to_id,
-    category_to_id_mp3d,
-    hm3d_category,
-)
+from constants import color_palette, REDNET_MP3D40_TO_CATEGORY
 
 from RedNet.RedNet_model import load_rednet
-from constants import mp_categories_mapping, mp_categories_mapping21
 from agents.semantic_boost import get_semantic_booster
 
 
@@ -68,15 +61,21 @@ class LLM_Agent(Agent):
         # ------------------------------------------------------------------
         ##### Semantic detecttion init
         # ------------------------------------------------------------------
-        self.sem_pred = SemanticPredMaskRCNN(args)
-        self.red_sem_pred = load_rednet(
-            self.device, ckpt='RedNet/model/rednet_semmap_mp3d_40.pth', 
-            resize=True, # since we train on half-vision
-        )
-        self.red_sem_pred.eval()
-        self.red_sem_pred.to(self.device)
-        semantic_boost_device = getattr(args, "semantic_boost_device", None) or self.device
-        self.semantic_booster = get_semantic_booster(args, semantic_boost_device)
+        if args.use_gtsem:
+            self.sem_pred = None
+            self.red_sem_pred = None
+            self.semantic_booster = None
+            print("Using GT semantic map; RedNet/MaskRCNN semantic prediction disabled")
+        else:
+            self.sem_pred = SemanticPredMaskRCNN(args)
+            self.red_sem_pred = load_rednet(
+                self.device, ckpt='RedNet/model/rednet_semmap_mp3d_40.pth',
+                resize=True, # since we train on half-vision
+            )
+            self.red_sem_pred.eval()
+            self.red_sem_pred.to(self.device)
+            semantic_boost_device = getattr(args, "semantic_boost_device", None) or self.device
+            self.semantic_booster = get_semantic_booster(args, semantic_boost_device)
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
@@ -136,6 +135,7 @@ class LLM_Agent(Agent):
         self.full_map = torch.zeros(nc, self.full_w, self.full_h).float().to(self.device)
         self.local_map = torch.zeros(nc, self.local_w,
                                 self.local_h).float().to(self.device)
+        assert self.full_map.shape[0] == args.num_sem_categories + 4
 
         self.local_ob_map = np.zeros((self.local_w,
                                 self.local_h))
@@ -179,6 +179,7 @@ class LLM_Agent(Agent):
         # ------------------------------------------------------------------
         self.sem_map_module = Semantic_Mapping(args).to(self.device)
         self.sem_map_module.eval()
+        self._reset_target_evidence()
 
 
 
@@ -204,6 +205,9 @@ class LLM_Agent(Agent):
 
         self.goal_name = None
         self.goal_id = None
+        self.last_found_goal = False
+        self.last_planner_stop = False
+        self._reset_target_evidence()
 
         self.curr_loc = [self.args.map_size_cm / 100.0 / 2.0,
                          self.args.map_size_cm / 100.0 / 2.0, 0.]
@@ -236,17 +240,19 @@ class LLM_Agent(Agent):
             self.global_goals = [min(global_goals[0], int(self.local_w - 1)),
                              min(global_goals[1], int(self.local_h - 1))] 
 
-            if 'objectnav_mp3d' in self.args.task_config:
-                self.goal_name = category_to_id_mp3d[observations['objectgoal'][0]]
-            else:
-                self.goal_name = category_to_id[observations['objectgoal'][0]]
-            self.goal_id = observations['objectgoal'][0]
+            self.goal_id = int(observations["objectgoal"][0])
+            if self.goal_id < 0 or self.goal_id >= len(self.args.goal_id_to_name):
+                raise ValueError(
+                    f"Invalid objectgoal id {self.goal_id} for dataset={self.args.dataset}; "
+                    f"goal_id_to_name={self.args.goal_id_to_name}"
+                )
+            self.goal_name = self.args.goal_id_to_name[self.goal_id]
 
             if self.args.visualize or self.args.print_images:
                 self.vis_image = vu.init_vis_image(self.goal_name, 0)
             # print("objectgoal: ", observations['objectgoal'])
 
-            if observations['objectgoal'][0] == 3:
+            if 'objectnav_mp3d' not in self.args.task_config and observations['objectgoal'][0] == 3:
                 return 0
         # ------------------------------------------------------------------
 
@@ -256,9 +262,13 @@ class LLM_Agent(Agent):
         # ------------------------------------------------------------------
         rgb = observations['rgb'].astype(np.uint8)
         depth = observations['depth']
-        state = np.concatenate((rgb, depth), axis=2).transpose(2, 0, 1)
-
-        obs = self._preprocess_obs(state) 
+        if self.args.use_gtsem:
+            semantic = observations["semantic"]
+            state = np.concatenate((rgb, depth, semantic), axis=2).transpose(2, 0, 1)
+            obs = self._preprocess_obs(state, use_seg=False)
+        else:
+            state = np.concatenate((rgb, depth), axis=2).transpose(2, 0, 1)
+            obs = self._preprocess_obs(state)
 
         obs = torch.from_numpy(obs).float().to(self.device)
         # ------------------------------------------------------------------
@@ -270,6 +280,7 @@ class LLM_Agent(Agent):
         
         points, self.local_map, self.local_map_stair, self.local_pose = \
             self.sem_map_module(obs.unsqueeze(0), poses.unsqueeze(0), self.local_map.unsqueeze(0), self.local_pose.unsqueeze(0), self.eve_angle)
+        self._store_current_target_projection(points)
 
 
         locs = self.local_pose.cpu().numpy()
@@ -285,12 +296,18 @@ class LLM_Agent(Agent):
         # ------------------------------------------------------------------
         ##### Outlines for stucking
         # ------------------------------------------------------------------
-        if self.replan_count > self.args.num_local_steps-5 and torch.any(self.local_map[18, :, :]>0):
+        stairs_ch = self.args.category_to_channel.get("stairs")
+
+        if (
+            stairs_ch is not None
+            and self.replan_count > self.args.num_local_steps - 5
+            and torch.any(self.local_map[stairs_ch + 4, :, :] > 0)
+        ):
             self.replan_flag = 1
 
         # clear the obstacle during the stairs
-        # if (torch.any(self.local_map[18, loc_r-10:loc_r+10, loc_c-10:loc_c+10] > 0) and self.replan_flag) or self.local_map[18, loc_r, loc_c] > 0:
-        # if  self.replan_flag or self.local_map[18, loc_r-1, loc_c-1] > 0.5:
+        # if (stair_channel is not None and torch.any(self.local_map[stair_channel, loc_r-10:loc_r+10, loc_c-10:loc_c+10] > 0) and self.replan_flag) or self.local_map[stair_channel, loc_r, loc_c] > 0:
+        # if  self.replan_flag or self.local_map[stair_channel, loc_r-1, loc_c-1] > 0.5:
         #     self.stair_flag = 1
         # # else:
         # #     self.stair_flag = 0
@@ -298,9 +315,9 @@ class LLM_Agent(Agent):
         # if self.stair_flag:
         #     self.local_map[0, :, :] = self.local_map_stair[0, :, :]
 
-        if self.replan_flag:
+        if self.replan_flag and stairs_ch is not None:
         #     # must > 0
-            self.local_map[0, :, :][self.local_map[18, :, :] > 0] = 0
+            self.local_map[0, :, :][self.local_map[stairs_ch + 4, :, :] > 0] = 0
         # ------------------------------------------------------------------
 
         
@@ -358,6 +375,277 @@ class LLM_Agent(Agent):
         # ------------------------------------------------------------------
         
 
+    def _empty_target_map_evidence(self, reason):
+        return {
+            "target_map_valid": False,
+            "target_map_reason": reason,
+            "target_map_mass": 0.0,
+            "target_map_component_mass": 0.0,
+            "target_map_max_score": 0.0,
+            "target_map_largest_cc_area": 0,
+            "target_map_num_components": 0,
+            "target_map_centroid": None,
+        }
+
+    def _empty_fresh_target_evidence(self, reason):
+        return {
+            "fresh_target_valid": False,
+            "fresh_target_reason": reason,
+            "fresh_target_area": 0,
+            "fresh_target_mass": 0.0,
+            "fresh_target_max_score": 0.0,
+            "fresh_target_num_components": 0,
+            "fresh_target_centroid": None,
+            "fresh_target_overlap": 0,
+            "fresh_target_centroid_dist": None,
+        }
+
+    def _empty_target_confirmation(self):
+        return {
+            "candidate_target": False,
+            "confirmed_target": False,
+            "target_confirm_hits": 0,
+            "target_confirm_required": int(getattr(self.args, "target_confirm_hits", 2)),
+            "target_confirm_window": int(getattr(self.args, "target_confirm_window", 10)),
+            "target_confirm_stale_steps": int(getattr(self.args, "target_confirm_stale_steps", 15)),
+            "target_last_fresh_step": None,
+            "target_fresh_age": None,
+        }
+
+    def _reset_target_evidence(self):
+        self.last_target_map_evidence = self._empty_target_map_evidence("reset")
+        self.last_fresh_target_evidence = self._empty_fresh_target_evidence("reset")
+        self.last_target_confirmation = self._empty_target_confirmation()
+        self.last_found_goal_reason = "reset"
+        self.last_candidate_target = False
+        self.last_confirmed_target = False
+        self.target_confirm_steps = []
+        self.target_last_fresh_step = None
+        self.target_confirm_goal_name = None
+        self.last_current_target_projection = None
+        self.last_current_target_projection_step = None
+
+    def _target_channel(self):
+        if not self.goal_name:
+            return None
+        ch = self.args.category_to_channel.get(self.goal_name)
+        if ch is None:
+            return None
+        return ch
+
+    def _ensure_target_confirmation_goal(self):
+        if self.target_confirm_goal_name != self.goal_name:
+            self.last_fresh_target_evidence = self._empty_fresh_target_evidence("goal_changed")
+            self.last_target_confirmation = self._empty_target_confirmation()
+            self.last_candidate_target = False
+            self.last_confirmed_target = False
+            self.target_confirm_steps = []
+            self.target_last_fresh_step = None
+            self.target_confirm_goal_name = self.goal_name
+            self.last_current_target_projection = None
+            self.last_current_target_projection_step = None
+
+    def _store_current_target_projection(self, projected_map):
+        self._ensure_target_confirmation_goal()
+        ch = self._target_channel()
+        if ch is None or projected_map is None or ch + 4 >= projected_map.shape[0]:
+            self.last_current_target_projection = None
+            self.last_current_target_projection_step = self.l_step
+            return
+        self.last_current_target_projection = (
+            projected_map[ch + 4, :, :].detach().float().cpu().numpy()
+        )
+        self.last_current_target_projection_step = self.l_step
+
+    def _target_map_evidence_and_goal(self):
+        goal_map = np.zeros((self.local_w, self.local_h))
+        ch = self._target_channel()
+        if ch is None:
+            evidence = self._empty_target_map_evidence("no_target_channel")
+            return evidence, goal_map
+        cn = ch + 4
+        if cn >= self.local_map.shape[0]:
+            evidence = self._empty_target_map_evidence("target_channel_out_of_range")
+            return evidence, goal_map
+
+        args = self.args
+        score_thr = float(getattr(args, "target_map_score_thr", 0.1))
+        min_area = int(getattr(args, "target_map_min_area", 3))
+        min_mass = float(getattr(args, "target_map_min_mass", 0.5))
+
+        arr = self.local_map[cn, :, :].detach().float().cpu().numpy()
+        total_mass = float(arr.sum())
+        max_score = float(arr.max()) if arr.size else 0.0
+        mask = arr > score_thr
+        if self.goal_name in ("tv_monitor", "tv"):
+            mask = cv2.dilate(mask.astype(np.uint8), self.tv_kernel).astype(bool)
+
+        if not np.any(mask):
+            evidence = self._empty_target_map_evidence("no_component")
+            evidence["target_map_mass"] = total_mass
+            evidence["target_map_max_score"] = max_score
+            return evidence, goal_map
+
+        labels, num = measure.label(mask.astype(np.uint8), connectivity=2, return_num=True)
+        areas = np.bincount(labels.ravel())[1:] if num > 0 else np.array([])
+        if areas.size == 0:
+            evidence = self._empty_target_map_evidence("no_component")
+            evidence["target_map_mass"] = total_mass
+            evidence["target_map_max_score"] = max_score
+            return evidence, goal_map
+
+        largest_label = int(areas.argmax() + 1)
+        component = labels == largest_label
+        largest_area = int(areas.max())
+        component_mass = float(arr[component].sum())
+        ys, xs = np.where(component)
+        centroid = [float(ys.mean()), float(xs.mean())] if ys.size > 0 else None
+        valid = largest_area >= min_area and component_mass >= min_mass
+        if valid:
+            goal_map = component.astype(np.uint8)
+            reason = "valid"
+        elif largest_area < min_area:
+            reason = "area_below_threshold"
+        else:
+            reason = "mass_below_threshold"
+
+        evidence = {
+            "target_map_valid": bool(valid),
+            "target_map_reason": reason,
+            "target_map_mass": total_mass,
+            "target_map_component_mass": component_mass,
+            "target_map_max_score": max_score,
+            "target_map_largest_cc_area": largest_area,
+            "target_map_num_components": int(num),
+            "target_map_centroid": centroid,
+        }
+        return evidence, goal_map
+
+    def _fresh_target_evidence(self, candidate_goal_map):
+        arr = self.last_current_target_projection
+        if arr is None or self.last_current_target_projection_step != self.l_step:
+            return self._empty_fresh_target_evidence("no_current_projection")
+
+        args = self.args
+        score_thr = float(getattr(args, "target_map_score_thr", 0.1))
+        min_area = int(getattr(args, "target_fresh_min_area", 1))
+        min_mass = float(getattr(args, "target_fresh_min_mass", 0.1))
+        min_overlap = int(getattr(args, "target_fresh_min_overlap", 1))
+        max_centroid_dist = float(getattr(args, "target_fresh_max_centroid_dist", 20.0))
+
+        total_mass = float(arr.sum())
+        max_score = float(arr.max()) if arr.size else 0.0
+        mask = arr > score_thr
+        if self.goal_name in ("tv_monitor", "tv"):
+            mask = cv2.dilate(mask.astype(np.uint8), self.tv_kernel).astype(bool)
+
+        if not np.any(mask):
+            evidence = self._empty_fresh_target_evidence("no_component")
+            evidence["fresh_target_mass"] = total_mass
+            evidence["fresh_target_max_score"] = max_score
+            return evidence
+
+        labels, num = measure.label(mask.astype(np.uint8), connectivity=2, return_num=True)
+        areas = np.bincount(labels.ravel())[1:] if num > 0 else np.array([])
+        if areas.size == 0:
+            evidence = self._empty_fresh_target_evidence("no_component")
+            evidence["fresh_target_mass"] = total_mass
+            evidence["fresh_target_max_score"] = max_score
+            return evidence
+
+        candidate_mask = np.asarray(candidate_goal_map > 0, dtype=bool)
+        if np.any(candidate_mask):
+            overlaps = np.array([
+                int(np.logical_and(labels == label_id, candidate_mask).sum())
+                for label_id in range(1, num + 1)
+            ])
+            if overlaps.max() > 0:
+                chosen_label = int(overlaps.argmax() + 1)
+            else:
+                chosen_label = int(areas.argmax() + 1)
+        else:
+            overlaps = np.zeros(num, dtype=np.int64)
+            chosen_label = int(areas.argmax() + 1)
+
+        component = labels == chosen_label
+        area = int(component.sum())
+        component_mass = float(arr[component].sum())
+        ys, xs = np.where(component)
+        centroid = [float(ys.mean()), float(xs.mean())] if ys.size > 0 else None
+        overlap = int(np.logical_and(component, candidate_mask).sum()) if np.any(candidate_mask) else 0
+
+        centroid_dist = None
+        if centroid is not None and np.any(candidate_mask):
+            cys, cxs = np.where(candidate_mask)
+            candidate_centroid = np.array([float(cys.mean()), float(cxs.mean())])
+            centroid_dist = float(np.linalg.norm(np.array(centroid) - candidate_centroid))
+
+        close_enough = centroid_dist is not None and centroid_dist <= max_centroid_dist
+        valid = (
+            area >= min_area
+            and component_mass >= min_mass
+            and (overlap >= min_overlap or close_enough)
+        )
+        if valid:
+            reason = "valid"
+        elif area < min_area:
+            reason = "area_below_threshold"
+        elif component_mass < min_mass:
+            reason = "mass_below_threshold"
+        else:
+            reason = "no_candidate_overlap"
+
+        return {
+            "fresh_target_valid": bool(valid),
+            "fresh_target_reason": reason,
+            "fresh_target_area": area,
+            "fresh_target_mass": component_mass,
+            "fresh_target_max_score": max_score,
+            "fresh_target_num_components": int(num),
+            "fresh_target_centroid": centroid,
+            "fresh_target_overlap": overlap,
+            "fresh_target_centroid_dist": centroid_dist,
+        }
+
+    def _update_target_confirmation(self, candidate_target, fresh_evidence):
+        args = self.args
+        required_hits = max(1, int(getattr(args, "target_confirm_hits", 2)))
+        window = max(1, int(getattr(args, "target_confirm_window", 10)))
+        stale_steps = max(0, int(getattr(args, "target_confirm_stale_steps", 15)))
+
+        if candidate_target and fresh_evidence.get("fresh_target_valid"):
+            if not self.target_confirm_steps or self.target_confirm_steps[-1] != self.l_step:
+                self.target_confirm_steps.append(self.l_step)
+            self.target_last_fresh_step = self.l_step
+
+        self.target_confirm_steps = [
+            step for step in self.target_confirm_steps
+            if self.l_step - step <= window
+        ]
+        fresh_age = (
+            None if self.target_last_fresh_step is None
+            else int(self.l_step - self.target_last_fresh_step)
+        )
+        confirmed = (
+            bool(candidate_target)
+            and len(self.target_confirm_steps) >= required_hits
+            and fresh_age is not None
+            and fresh_age <= stale_steps
+        )
+        self.last_candidate_target = bool(candidate_target)
+        self.last_confirmed_target = bool(confirmed)
+        self.last_target_confirmation = {
+            "candidate_target": bool(candidate_target),
+            "confirmed_target": bool(confirmed),
+            "target_confirm_hits": int(len(self.target_confirm_steps)),
+            "target_confirm_required": int(required_hits),
+            "target_confirm_window": int(window),
+            "target_confirm_stale_steps": int(stale_steps),
+            "target_last_fresh_step": self.target_last_fresh_step,
+            "target_fresh_age": fresh_age,
+        }
+        return confirmed
+
     
     def act(self, goal_points: list)-> Dict[str, int]:
         # ------------------------------------------------------------------
@@ -371,18 +659,50 @@ class LLM_Agent(Agent):
         local_goal_maps[goal_points[0], goal_points[1]] = 1
             # print("Don't Find the edge")
 
-        if 'objectnav_mp3d' in self.args.task_config:
-            cn = self.goal_id + 4
+        ch = self._target_channel()
+        self._ensure_target_confirmation_goal()
+        target_stop_mode = getattr(self.args, "target_stop_mode", "enforce")
+        if target_stop_mode == "legacy":
+            cn = ch + 4 if ch is not None else None
+            if cn is not None and self.local_map[cn, :, :].sum() != 0.:
+                cat_semantic_map = self.local_map[cn, :, :].cpu().numpy()
+                cat_semantic_scores = cat_semantic_map
+                cat_semantic_scores[cat_semantic_scores > 0] = 1.
+                if self.goal_name in ("tv_monitor", "tv"):
+                    cat_semantic_scores = cv2.dilate(cat_semantic_scores, self.tv_kernel)
+                local_goal_maps = self.find_big_connect(cat_semantic_scores)
+                found_goal = 1
+                self.last_found_goal_reason = "legacy_nonzero_target_map"
+            else:
+                self.last_found_goal_reason = "legacy_no_target_map"
+            self.last_target_map_evidence, _ = self._target_map_evidence_and_goal()
+            self.last_fresh_target_evidence = self._empty_fresh_target_evidence("legacy_mode")
+            self.last_candidate_target = bool(found_goal)
+            self.last_confirmed_target = bool(found_goal)
+            self.last_target_confirmation = self._empty_target_confirmation()
+            self.last_target_confirmation.update({
+                "candidate_target": bool(found_goal),
+                "confirmed_target": bool(found_goal),
+            })
         else:
-            cn = coco_categories[self.goal_id] + 4
-        if self.local_map[cn, :, :].sum() != 0.:
-            cat_semantic_map = self.local_map[cn, :, :].cpu().numpy()
-            cat_semantic_scores = cat_semantic_map
-            cat_semantic_scores[cat_semantic_scores > 0] = 1.
-            if cn == 9:
-                cat_semantic_scores = cv2.dilate(cat_semantic_scores, self.tv_kernel)
-            local_goal_maps = self.find_big_connect(cat_semantic_scores)
-            found_goal = 1
+            map_evidence, target_goal_map = self._target_map_evidence_and_goal()
+            self.last_target_map_evidence = map_evidence
+            candidate_target = bool(map_evidence["target_map_valid"])
+            fresh_evidence = self._fresh_target_evidence(target_goal_map)
+            self.last_fresh_target_evidence = fresh_evidence
+            confirmed_target = self._update_target_confirmation(candidate_target, fresh_evidence)
+            if confirmed_target:
+                local_goal_maps = target_goal_map
+                found_goal = 1
+                self.last_found_goal_reason = "target_confirmed"
+            elif candidate_target and fresh_evidence.get("fresh_target_valid"):
+                local_goal_maps = target_goal_map
+                self.last_found_goal_reason = "target_candidate_fresh_unconfirmed"
+            elif candidate_target:
+                self.last_found_goal_reason = "target_candidate_stale_unconfirmed"
+            else:
+                self.last_found_goal_reason = "target_evidence_below_threshold"
+        self.last_found_goal = bool(found_goal)
      
         # ------------------------------------------------------------------
 
@@ -400,9 +720,11 @@ class LLM_Agent(Agent):
         planner_inputs['found_goal'] = found_goal
         if self.args.visualize or self.args.print_images:
             planner_inputs['map_edge'] = self.target_edge_map
-            self.local_map[-1, :, :] = 1e-5
-            planner_inputs['sem_map_pred'] = self.local_map[4:, :,
-                                            :].argmax(0).cpu().numpy()
+            sem_scores = self.local_map[4:, :, :]
+            planner_inputs['sem_map_pred'] = sem_scores.argmax(0).cpu().numpy()
+            planner_inputs['sem_no_cat_mask'] = (
+                torch.max(sem_scores, dim=0)[0] <= 0
+            ).cpu().numpy()
         
         action = self._plan(planner_inputs)
         # print("self.l_step: ", self.l_step)
@@ -509,6 +831,7 @@ class LLM_Agent(Agent):
         # start_stg = time.time()
         stg, stop = self._get_stg(map_pred, start, np.copy(goal),
                                   planning_window)
+        self.last_planner_stop = bool(stop)
         # stg_end = time.time()
         # stg_time = stg_end - start_stg
         # print('act_time: %.3f秒'%stg_time)
@@ -614,40 +937,38 @@ class LLM_Agent(Agent):
         rgb = obs[:, :, :3]
         depth = obs[:, :, 3:4]
 
-        red_semantic_pred, semantic_pred = self._get_sem_pred(
-            rgb.astype(np.uint8), depth, use_seg=use_seg)
-
-        if 'objectnav_mp3d' in args.task_config:
-            sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], args.num_sem_categories))
-            for i in range(min(args.num_sem_categories, len(mp_categories_mapping21))):
-                sem_seg_pred[:, :, i][red_semantic_pred == mp_categories_mapping21[i]] = 1
-
-            # MaskRCNN predicts a small COCO subset; write those into the
-            # matching MP3D channels instead of the HM3D channel order.
-            coco_to_mp3d = {0: 0, 1: 5, 2: 8, 3: 6, 4: 10, 5: 13}
-            for coco_idx, mp3d_idx in coco_to_mp3d.items():
-                if coco_idx < semantic_pred.shape[2] and mp3d_idx < sem_seg_pred.shape[2]:
-                    sem_seg_pred[:, :, mp3d_idx] = np.maximum(
-                        sem_seg_pred[:, :, mp3d_idx],
-                        semantic_pred[:, :, coco_idx],
-                    )
+        if args.use_gtsem:
+            if obs.shape[2] < 5:
+                raise RuntimeError("GT semantic mode requires observations['semantic']")
+            gt_semantic = obs[:, :, 4].astype(np.int32)
+            sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], args.num_sem_categories), dtype=np.float32)
+            for cat_idx in range(args.num_sem_categories):
+                sem_seg_pred[:, :, cat_idx][gt_semantic == cat_idx] = 1.0
+            self.rgb_vis = rgb[:, :, ::-1]
         else:
-            sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], 15 + 1))   
-            for i in range(0, 15):
-                # print(mp_categories_mapping[i])
-                sem_seg_pred[:,:,i][red_semantic_pred == mp_categories_mapping[i]] = 1
+            red_semantic_pred, semantic_pred = self._get_sem_pred(
+                rgb.astype(np.uint8), depth, use_seg=use_seg)
 
-            sem_seg_pred[:,:,0][semantic_pred[:,:,0] == 0] = 0
-            sem_seg_pred[:,:,1][semantic_pred[:,:,1] == 0] = 0
-            sem_seg_pred[:,:,2][semantic_pred[:,:,2] == 1] = 1
-            sem_seg_pred[:,:,3][semantic_pred[:,:,3] == 0] = 0
-            sem_seg_pred[:,:,4][semantic_pred[:,:,4] == 1] = 1
-            sem_seg_pred[:,:,5][semantic_pred[:,:,5] == 1] = 1
+            sem_seg_pred = np.zeros(
+                (rgb.shape[0], rgb.shape[1], args.num_sem_categories),
+                dtype=np.float32,
+            )
 
-        if getattr(self.semantic_booster, "enabled", False):
+            # RedNet-MP3D40 is the dense semantic source.
+            for rednet_id, cat_name in REDNET_MP3D40_TO_CATEGORY.items():
+                if cat_name not in args.category_to_channel:
+                    continue
+                ch = args.category_to_channel[cat_name]
+                sem_seg_pred[:, :, ch][red_semantic_pred == rednet_id] = 0.65
+
+            # Mask R-CNN is high-confidence instance evidence for COCO-overlap classes.
+            if semantic_pred is not None:
+                sem_seg_pred = np.maximum(sem_seg_pred, semantic_pred.astype(np.float32))
+
+        if not args.use_gtsem and getattr(self.semantic_booster, "enabled", False):
             interval = max(1, int(getattr(args, "semantic_boost_interval", 1)))
             if self.l_step % interval == 0:
-                categories = category_to_id_mp3d if 'objectnav_mp3d' in args.task_config else hm3d_category
+                categories = args.semantic_categories
                 try:
                     semantic_boost = self.semantic_booster.predict(rgb.astype(np.uint8), categories)
                     if semantic_boost is not None:
@@ -673,6 +994,7 @@ class LLM_Agent(Agent):
                         )
                 except Exception as exc:
                     print("[semantic_boost] frame skipped: {}".format(exc))
+
         # sem_seg_pred = self._get_sem_pred(
         #     rgb.astype(np.uint8), depth, use_seg=use_seg)
 
@@ -683,6 +1005,11 @@ class LLM_Agent(Agent):
             rgb = np.asarray(self.res(rgb.astype(np.uint8)))
             depth = depth[ds // 2::ds, ds // 2::ds]
             sem_seg_pred = sem_seg_pred[ds // 2::ds, ds // 2::ds]
+
+        assert sem_seg_pred.shape[2] == args.num_sem_categories, (
+            sem_seg_pred.shape,
+            args.num_sem_categories,
+        )
 
         depth = np.expand_dims(depth, axis=2)
         state = np.concatenate((rgb, depth, sem_seg_pred),
@@ -717,7 +1044,10 @@ class LLM_Agent(Agent):
             semantic_pred, self.rgb_vis = self.sem_pred.get_prediction(rgb)
             semantic_pred = semantic_pred.astype(np.float32)
         else:
-            semantic_pred = np.zeros((rgb.shape[0], rgb.shape[1], 16))
+            semantic_pred = np.zeros(
+                (rgb.shape[0], rgb.shape[1], self.args.num_sem_categories),
+                dtype=np.float32,
+            )
             self.rgb_vis = rgb[:, :, ::-1]
         return red_semantic_pred, semantic_pred
 
@@ -892,13 +1222,14 @@ class LLM_Agent(Agent):
         start_x, start_y, start_o, gx1, gx2, gy1, gy2 = inputs['pose_pred']
 
         goal = inputs['goal']
-        sem_map = inputs['sem_map_pred']
+        sem_map = inputs['sem_map_pred'].copy()
+        no_cat_mask = inputs.get('sem_no_cat_mask')
+        if no_cat_mask is None:
+            no_cat_mask = sem_map == self.args.num_sem_categories - 1
 
         gx1, gx2, gy1, gy2 = int(gx1), int(gx2), int(gy1), int(gy2)
 
         sem_map += 5
-
-        no_cat_mask = sem_map == self.args.num_sem_categories + 4
         map_mask = np.rint(map_pred) == 1
         exp_mask = np.rint(exp_pred) == 1
         vis_mask = self.visited_vis[gx1:gx2, gy1:gy2] == 1

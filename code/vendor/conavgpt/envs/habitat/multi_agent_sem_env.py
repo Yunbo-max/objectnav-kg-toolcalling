@@ -8,10 +8,32 @@ import quaternion
 import skimage.morphology
 import habitat
 
-from constants import category_to_id, mp3d_category_id
+from constants import DATASET_SEMANTIC_CATEGORIES
 import utils.pose as pu
 
-coco_categories = [0, 3, 2, 4, 5, 1]
+MP3D_CATEGORY_INDEX = {
+    name: idx for idx, name in enumerate(DATASET_SEMANTIC_CATEGORIES["mp3d"])
+}
+HM3D_CATEGORY_INDEX = {
+    name: idx for idx, name in enumerate(DATASET_SEMANTIC_CATEGORIES["hm3d"])
+}
+MP3D_CATEGORY_ALIASES = {
+    "couch": "sofa",
+    "tv": "tv_monitor",
+    "television": "tv_monitor",
+    "gym equipment": "gym_equipment",
+    "chest of drawers": "chest_of_drawers",
+    "chest-of-drawers": "chest_of_drawers",
+    "dining table": "table",
+    "dining-table": "table",
+    "potted plant": "plant",
+}
+
+
+def _canonical_category_name(name):
+    name = str(name or "").strip().lower()
+    name = MP3D_CATEGORY_ALIASES.get(name, name)
+    return name.replace(" ", "_").replace("-", "_")
 
 class Multi_Agent_Env(habitat.Env):
     """The Object Goal Navigation environment class. The class is responsible
@@ -25,6 +47,11 @@ class Multi_Agent_Env(habitat.Env):
 
         # Initializations
         self.episode_no = 0
+        dataset_cfg = getattr(config_env, "DATASET", None)
+        data_path = str(getattr(dataset_cfg, "DATA_PATH", "") or "").lower()
+        episodes_dir = str(getattr(dataset_cfg, "EPISODES_DIR", "") or "").lower()
+        self.is_mp3d_task = "mp3d" in data_path or "mp3d" in episodes_dir
+        self.semantic_lookup = None
    
         fileName = 'data/matterport_category_mappings.tsv'
 
@@ -56,6 +83,7 @@ class Multi_Agent_Env(habitat.Env):
 
         obs = super().reset()
         self.scene = self.sim.semantic_annotations()
+        self.semantic_lookup = self._build_semantic_lookup()
   
         for i in range(len(obs)):
             obs[i]['semantic'] = self._preprocess_semantic(obs[i]["semantic"])
@@ -86,30 +114,32 @@ class Multi_Agent_Env(habitat.Env):
 
         return obs
 
-    def _preprocess_semantic(self, semantic):
-        # print("*********semantic type: ", type(semantic))
-        se = list(set(semantic.ravel()))
-        # print(se) # []
-        for i in range(len(se)):
-            if se[i] >= len(self.scene.objects):
-                hm3d_category_name = "Unknown"
-            elif self.scene.objects[se[i]].category.name() in self.hm3d_semantic_mapping:
-                hm3d_category_name = self.hm3d_semantic_mapping[self.scene.objects[se[i]].category.name()]
-            else:
-                hm3d_category_name = self.scene.objects[se[i]].category.name()
+    def _category_id_for_name(self, raw_name):
+        mapped_name = self.hm3d_semantic_mapping.get(raw_name, raw_name)
+        category_name = _canonical_category_name(mapped_name)
+        category_index = MP3D_CATEGORY_INDEX if self.is_mp3d_task else HM3D_CATEGORY_INDEX
+        if category_name in category_index:
+            return category_index[category_name]
+        return 255
 
-            if hm3d_category_name in mp3d_category_id:
-                # print("sum: ", np.sum(sem_output[sem_output==se[i]])/se[i])
-                semantic[semantic==se[i]] = mp3d_category_id[hm3d_category_name]-1
-            else :
-                semantic[
-                    semantic==se[i]
-                    ] = 0
-    
-        # se = list(set(semantic.ravel()))
-        # print("semantic: ", se) # []
-        semantic = np.expand_dims(semantic.astype(np.uint8), 2)
-        return semantic
+    def _build_semantic_lookup(self):
+        lookup = np.full(len(self.scene.objects), 255, dtype=np.uint8)
+        for raw_id, obj in enumerate(self.scene.objects):
+            if obj is None or obj.category is None:
+                continue
+            lookup[raw_id] = self._category_id_for_name(obj.category.name())
+        return lookup
+
+    def _preprocess_semantic(self, semantic):
+        raw_semantic = semantic.astype(np.int64, copy=False)
+        semantic_out = np.full(raw_semantic.shape, 255, dtype=np.uint8)
+        lookup = self.semantic_lookup
+        if lookup is None:
+            lookup = self._build_semantic_lookup()
+            self.semantic_lookup = lookup
+        valid = np.logical_and(raw_semantic >= 0, raw_semantic < len(lookup))
+        semantic_out[valid] = lookup[raw_semantic[valid]]
+        return np.expand_dims(semantic_out, 2)
 
     def get_sim_location(self):
         """Returns x, y, o pose of the agent in the Habitat simulator."""

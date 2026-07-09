@@ -233,7 +233,7 @@ class HelicaseV2Brain:
         self.belief_map = BayesianBeliefMap(target_name)
 
     def decide(self, target_name, enriched_frontiers, pose_pred,
-               full_map_pred, target_point_map):
+               full_map_pred, target_point_map, semantic_categories=None):
         """Bayesian belief + brain decision.
 
         1. Code computes belief scores (hard reasoning)
@@ -246,11 +246,15 @@ class HelicaseV2Brain:
 
         # Check if target found on map
         if full_map_pred is not None:
-            from constants import hm3d_category
+            if semantic_categories is None:
+                from constants import HM3D_SEMANTIC_CATEGORIES
+                semantic_categories = HM3D_SEMANTIC_CATEGORIES
             import torch
             sem = full_map_pred[4:]
-            for i, cat in enumerate(hm3d_category):
-                if cat == target_name and i < sem.shape[0]:
+            for i, cat in enumerate(semantic_categories):
+                if i >= sem.shape[0]:
+                    continue
+                if cat == target_name:
                     count = (sem[i] > 0.1).sum().item()
                     if count > 5:
                         ys, xs = torch.where(sem[i] > 0.1)

@@ -334,10 +334,11 @@ class EmbodiedTask:
                     )
                 ) for i in range(len(self._sim.habitat_config.AGENTS))]
                 
-            self._is_episode_active = self._check_episode_is_active(
-                observations=obs[0], action=action, episode=episode
-            ) and self._check_episode_is_active(
-                observations=obs[1], action=action, episode=episode
+            self._is_episode_active = all(
+                self._check_episode_is_active(
+                    observations=agent_obs, action=action, episode=episode
+                )
+                for agent_obs in obs
             )
             return obs
         else:

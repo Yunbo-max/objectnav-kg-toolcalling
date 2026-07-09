@@ -197,13 +197,30 @@ class KGUpdater:
     """Updates KG from semantic map and tool results."""
 
     ROOM_HINTS = {
-        "toilet": "bathroom", "sink": "bathroom", "bathtub": "bathroom",
-        "shower": "bathroom", "towel": "bathroom",
-        "bed": "bedroom", "chest_of_drawers": "bedroom",
-        "sofa": "living_room", "tv_monitor": "living_room",
+        "toilet": "bathroom",
+        "sink": "bathroom",
+        "bathtub": "bathroom",
+        "shower": "bathroom",
+        "towel": "bathroom",
+        "bed": "bedroom",
+        "chest_of_drawers": "bedroom",
+        "clothes": "bedroom",
+        "cushion": "bedroom",
+        "sofa": "living_room",
+        "tv_monitor": "living_room",
         "fireplace": "living_room",
-        "table": "kitchen", "chair": "living_room",
+        "picture": "living_room",
+        "seating": "living_room",
+        "table": "kitchen_or_dining",
+        "chair": "dining_or_living",
+        "counter": "kitchen",
+        "cabinet": "kitchen",
+        "refrigerator": "kitchen",
+        "appliances": "kitchen",
         "plant": "living_room",
+        "stairs": "hallway",
+        "stool": "kitchen_or_bar",
+        "gym_equipment": "gym",
     }
 
     def __init__(self, kg: KnowledgeGraph):
@@ -230,8 +247,16 @@ class KGUpdater:
             return "likely_kitchen", 0.5
         return "unknown", 0.1
 
-    def update_from_map(self, enriched_frontiers, object_list, pose_pred,
-                        wall_list, full_map_pred, target_name):
+    def update_from_map(
+        self,
+        enriched_frontiers,
+        object_list,
+        pose_pred,
+        wall_list,
+        full_map_pred,
+        target_name,
+        semantic_categories=None,
+    ):
         """Update KG from current map state."""
 
         # ── Update robot positions ──
@@ -364,10 +389,14 @@ class KGUpdater:
 
         # ── Check if target is on map ──
         if target_name and full_map_pred is not None:
-            from constants import hm3d_category
+            if semantic_categories is None:
+                from constants import HM3D_SEMANTIC_CATEGORIES
+                semantic_categories = HM3D_SEMANTIC_CATEGORIES
             sem = full_map_pred[4:]
-            for i, cat in enumerate(hm3d_category):
-                if cat == target_name and i < sem.shape[0]:
+            for i, cat in enumerate(semantic_categories):
+                if i >= sem.shape[0]:
+                    continue
+                if cat == target_name:
                     count = (sem[i] > 0.1).sum().item()
                     if count > 5:
                         import torch

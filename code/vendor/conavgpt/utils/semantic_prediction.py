@@ -16,7 +16,7 @@ from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.utils.visualizer import ColorMode, Visualizer
 import detectron2.data.transforms as T
 
-from constants import coco_categories_mapping
+from constants import COCO80_TO_CATEGORY
 
 
 class SemanticPredMaskRCNN():
@@ -36,21 +36,30 @@ class SemanticPredMaskRCNN():
         if args.visualize == 2:
             img = vis_output.get_image()
 
-        semantic_input = np.zeros((img.shape[0], img.shape[1], 15 + 1))
+        semantic_input = np.zeros(
+            (img.shape[0], img.shape[1], args.num_sem_categories),
+            dtype=np.float32,
+        )
 
-        instances = seg_predictions[0]['instances']
-        pred_classes = instances.pred_classes.cpu().numpy()
-        if hasattr(instances, "scores"):
-            scores = instances.scores.cpu().numpy()
+        instances = seg_predictions[0]["instances"].to("cpu")
+        classes = instances.pred_classes.numpy()
+        masks = instances.pred_masks.numpy()
+        if instances.has("scores"):
+            scores = instances.scores.numpy()
         else:
-            scores = np.ones(len(pred_classes), dtype=np.float32)
+            scores = np.ones(len(classes), dtype=np.float32)
 
-        for j, class_idx in enumerate(pred_classes):
-            if class_idx in list(coco_categories_mapping.keys()):
-                idx = coco_categories_mapping[class_idx]
-                obj_mask = seg_predictions[0]['instances'].pred_masks[j] * 1.
-                scored_mask = obj_mask.cpu().numpy() * float(scores[j])
-                semantic_input[:, :, idx] = np.maximum(semantic_input[:, :, idx], scored_mask)
+        for j, class_idx in enumerate(classes):
+            cat_name = COCO80_TO_CATEGORY.get(int(class_idx))
+            if cat_name is None:
+                continue
+            if cat_name not in args.category_to_channel:
+                continue
+            ch = args.category_to_channel[cat_name]
+            semantic_input[:, :, ch] = np.maximum(
+                semantic_input[:, :, ch],
+                masks[j].astype(np.float32) * float(scores[j]),
+            )
 
         return semantic_input, img
 

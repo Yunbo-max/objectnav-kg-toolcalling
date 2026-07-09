@@ -2,6 +2,8 @@ import argparse
 import os
 import torch
 
+from constants import attach_category_config
+
 
 def get_args():
     parser = argparse.ArgumentParser(
@@ -62,6 +64,9 @@ def get_args():
     parser.add_argument("--task_config", type=str,
                         default="tasks/multi_objectnav_hm3d.yaml",
                         help="path to config yaml containing task information")
+    parser.add_argument('--dataset', type=str, default=None,
+                        choices=("hm3d", "mp3d"),
+                        help="semantic category config; inferred from task_config if omitted")
     parser.add_argument("--split", type=str, default="train",
                         help="dataset split (train | val | val_mini) ")
     parser.add_argument('--camera_height', type=float, default=0.88,
@@ -90,7 +95,7 @@ def get_args():
     parser.add_argument('--num_local_steps', type=int, default=25,
                         help="""Number of steps the local policy
                                 between each global step""")
-    parser.add_argument('--num_sem_categories', type=int, default=16)
+    parser.add_argument('--num_sem_categories', type=int, default=-1)
     parser.add_argument('--sem_pred_prob_thr', type=float, default=0.9,
                         help="Semantic prediction confidence threshold")
 
@@ -104,9 +109,34 @@ def get_args():
     parser.add_argument('--map_pred_threshold', type=float, default=1.0)
     parser.add_argument('--exp_pred_threshold', type=float, default=1.0)
     parser.add_argument('--collision_threshold', type=float, default=0.10)
+    parser.add_argument('--target_stop_mode', type=str,
+                        choices=("legacy", "enforce"),
+                        default=os.environ.get("TARGET_STOP_MODE", "enforce"),
+                        help='legacy preserves old nonzero target-map found_goal; enforce uses target evidence. STOP remains FMM stop + found_goal')
+    parser.add_argument('--target_map_score_thr', type=float,
+                        default=float(os.environ.get("TARGET_MAP_SCORE_THR", "0.10")))
+    parser.add_argument('--target_map_min_area', type=int,
+                        default=int(os.environ.get("TARGET_MAP_MIN_AREA", "5")))
+    parser.add_argument('--target_map_min_mass', type=float,
+                        default=float(os.environ.get("TARGET_MAP_MIN_MASS", "0.5")))
+    parser.add_argument('--target_confirm_hits', type=int,
+                        default=int(os.environ.get("TARGET_CONFIRM_HITS", "2")))
+    parser.add_argument('--target_confirm_window', type=int,
+                        default=int(os.environ.get("TARGET_CONFIRM_WINDOW", "10")))
+    parser.add_argument('--target_confirm_stale_steps', type=int,
+                        default=int(os.environ.get("TARGET_CONFIRM_STALE_STEPS", "15")))
+    parser.add_argument('--target_fresh_min_area', type=int,
+                        default=int(os.environ.get("TARGET_FRESH_MIN_AREA", "1")))
+    parser.add_argument('--target_fresh_min_mass', type=float,
+                        default=float(os.environ.get("TARGET_FRESH_MIN_MASS", "0.1")))
+    parser.add_argument('--target_fresh_min_overlap', type=int,
+                        default=int(os.environ.get("TARGET_FRESH_MIN_OVERLAP", "1")))
+    parser.add_argument('--target_fresh_max_centroid_dist', type=float,
+                        default=float(os.environ.get("TARGET_FRESH_MAX_CENTROID_DIST", "20.0")))
 
     # train_se_frontier
     parser.add_argument('--use_gtsem', type=int, default=0)
+    parser.add_argument('--mp3d_context_semantics', type=int, default=0)
     parser.add_argument('--num_agents', type=int, default=2)
     parser.add_argument('--gpt_type', type=int, default=1,
                         help="""0: text-davinci-003
@@ -146,6 +176,12 @@ def get_args():
                         help='certainty threshold for direct target pursuit')
     parser.add_argument('--jsonl_log', type=str, default=None,
                         help='optional per-episode JSONL metrics path')
+    parser.add_argument('--decision_jsonl', type=str,
+                        default=os.environ.get("DECISION_JSONL", None),
+                        help='optional global-decision JSONL path; defaults next to --jsonl_log')
+    parser.add_argument('--stop_diag_jsonl', type=str,
+                        default=os.environ.get("STOP_DIAG_JSONL", None),
+                        help='optional target/STOP diagnostic JSONL path; defaults next to --jsonl_log')
     parser.add_argument('--append_jsonl', type=int,
                         default=int(os.environ.get("APPEND_JSONL", "0")),
                         help='1: append to existing JSONL metrics instead of truncating')
@@ -244,9 +280,8 @@ def get_args():
                             0 to not reload (default: 0)""")
     # parse arguments
     args = parser.parse_args()
+    args = attach_category_config(args)
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
-    if "objectnav_mp3d" in args.task_config and args.num_sem_categories == 16:
-        args.num_sem_categories = 21
 
     return args

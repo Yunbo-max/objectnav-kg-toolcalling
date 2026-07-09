@@ -106,17 +106,62 @@ fi
 if [[ -n "${MAX_EPISODE_LENGTH:-}" ]]; then
     EXTRA_ARGS+=(--max_episode_length "$MAX_EPISODE_LENGTH")
 fi
+if [[ -n "${USE_GTSEM:-}" ]]; then
+    EXTRA_ARGS+=(--use_gtsem "$USE_GTSEM")
+fi
+if [[ -n "${MP3D_CONTEXT_SEMANTICS:-}" ]]; then
+    EXTRA_ARGS+=(--mp3d_context_semantics "$MP3D_CONTEXT_SEMANTICS")
+fi
 if [[ -n "${BRAIN_MAX_TOKENS:-}" ]]; then
     EXTRA_ARGS+=(--brain_max_tokens "$BRAIN_MAX_TOKENS")
 fi
 if [[ -n "${MINDNAV_TARGET_TAU:-}" ]]; then
     EXTRA_ARGS+=(--mindnav_target_tau "$MINDNAV_TARGET_TAU")
 fi
+if [[ -n "${TARGET_STOP_MODE:-}" ]]; then
+    EXTRA_ARGS+=(--target_stop_mode "$TARGET_STOP_MODE")
+fi
+if [[ -n "${TARGET_MAP_SCORE_THR:-}" ]]; then
+    EXTRA_ARGS+=(--target_map_score_thr "$TARGET_MAP_SCORE_THR")
+fi
+if [[ -n "${TARGET_MAP_MIN_AREA:-}" ]]; then
+    EXTRA_ARGS+=(--target_map_min_area "$TARGET_MAP_MIN_AREA")
+fi
+if [[ -n "${TARGET_MAP_MIN_MASS:-}" ]]; then
+    EXTRA_ARGS+=(--target_map_min_mass "$TARGET_MAP_MIN_MASS")
+fi
+if [[ -n "${TARGET_CONFIRM_HITS:-}" ]]; then
+    EXTRA_ARGS+=(--target_confirm_hits "$TARGET_CONFIRM_HITS")
+fi
+if [[ -n "${TARGET_CONFIRM_WINDOW:-}" ]]; then
+    EXTRA_ARGS+=(--target_confirm_window "$TARGET_CONFIRM_WINDOW")
+fi
+if [[ -n "${TARGET_CONFIRM_STALE_STEPS:-}" ]]; then
+    EXTRA_ARGS+=(--target_confirm_stale_steps "$TARGET_CONFIRM_STALE_STEPS")
+fi
+if [[ -n "${TARGET_FRESH_MIN_AREA:-}" ]]; then
+    EXTRA_ARGS+=(--target_fresh_min_area "$TARGET_FRESH_MIN_AREA")
+fi
+if [[ -n "${TARGET_FRESH_MIN_MASS:-}" ]]; then
+    EXTRA_ARGS+=(--target_fresh_min_mass "$TARGET_FRESH_MIN_MASS")
+fi
+if [[ -n "${TARGET_FRESH_MIN_OVERLAP:-}" ]]; then
+    EXTRA_ARGS+=(--target_fresh_min_overlap "$TARGET_FRESH_MIN_OVERLAP")
+fi
+if [[ -n "${TARGET_FRESH_MAX_CENTROID_DIST:-}" ]]; then
+    EXTRA_ARGS+=(--target_fresh_max_centroid_dist "$TARGET_FRESH_MAX_CENTROID_DIST")
+fi
 if [[ -n "${KG_TRACE_DIR:-}" ]]; then
     EXTRA_ARGS+=(--kg_trace_dir "$KG_TRACE_DIR")
 fi
 if [[ -n "${KG_TRACE_PLOTS:-}" ]]; then
     EXTRA_ARGS+=(--kg_trace_plots "$KG_TRACE_PLOTS")
+fi
+if [[ -n "${DECISION_JSONL:-}" ]]; then
+    EXTRA_ARGS+=(--decision_jsonl "$(abspath_from_root "$DECISION_JSONL")")
+fi
+if [[ -n "${STOP_DIAG_JSONL:-}" ]]; then
+    EXTRA_ARGS+=(--stop_diag_jsonl "$(abspath_from_root "$STOP_DIAG_JSONL")")
 fi
 if [[ -n "${SEMANTIC_BOOST_BACKEND:-}" ]]; then
     EXTRA_ARGS+=(--semantic_boost_backend "$SEMANTIC_BOOST_BACKEND")
