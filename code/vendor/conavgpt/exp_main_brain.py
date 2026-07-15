@@ -625,12 +625,34 @@ class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
 def main():
     args = get_args()
 
-    # Keep model placement separate from simulation and semantic perception.
-    model_path = args.llm_path or LOCAL_MODEL_PATHS[args.gpt_type]
-    model_type = "vl" if "VL" in model_path else "text"
-    llm_gpu_id = args.llm_gpu_id if args.llm_gpu_id >= 0 else args.sem_gpu_id
-    vlm_device = f"cuda:{llm_gpu_id}"
-    load_model(model_path, device=vlm_device, model_type=model_type)
+    brain_backend = os.environ.get("BRAIN_BACKEND", "siliconflow").strip().lower()
+    if brain_backend == "vllm":
+        brain_base_url = os.environ.get("BRAIN_BASE_URL", "http://127.0.0.1:8000/v1")
+        brain_api_key = os.environ.get("BRAIN_API_KEY", "local-vllm")
+        brain_model = os.environ.get("BRAIN_MODEL", "qwen2.5-3b")
+        if brain_base_url.startswith(("http://127.0.0.1", "http://localhost")):
+            for proxy_bypass_var in ("NO_PROXY", "no_proxy"):
+                bypass_hosts = os.environ.get(proxy_bypass_var, "").split(",")
+                bypass_hosts = [host for host in bypass_hosts if host]
+                for host in ("127.0.0.1", "localhost"):
+                    if host not in bypass_hosts:
+                        bypass_hosts.append(host)
+                os.environ[proxy_bypass_var] = ",".join(bypass_hosts)
+        print(f"Using vLLM brain service: {brain_base_url} ({brain_model})")
+        print("Skipping in-process Qwen loading; vLLM owns the model instance.")
+    else:
+        brain_base_url = os.environ.get("BRAIN_BASE_URL", "https://api.siliconflow.cn/v1")
+        brain_api_key = os.environ.get(
+            "BRAIN_API_KEY", os.environ.get("SILICONFLOW_API_KEY", "")
+        )
+        brain_model = os.environ.get("BRAIN_MODEL", "Pro/MiniMaxAI/MiniMax-M2.5")
+
+        # Preserve the original local-model initialization outside vLLM mode.
+        model_path = args.llm_path or LOCAL_MODEL_PATHS[args.gpt_type]
+        model_type = "vl" if "VL" in model_path else "text"
+        llm_gpu_id = args.llm_gpu_id if args.llm_gpu_id >= 0 else args.sem_gpu_id
+        vlm_device = f"cuda:{llm_gpu_id}"
+        load_model(model_path, device=vlm_device, model_type=model_type)
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -776,10 +798,9 @@ def main():
                     # ═══════════════════════════════════════════
                     import openai as _oai
                     _brain_client = _oai.OpenAI(
-                        api_key=os.environ.get("SILICONFLOW_API_KEY", ""),
-                        base_url="https://api.siliconflow.cn/v1"
+                        api_key=brain_api_key,
+                        base_url=brain_base_url,
                     )
-                    _brain_model = os.environ.get("BRAIN_MODEL", "Pro/MiniMaxAI/MiniMax-M2.5")
 
                     # Give brain the SAME info as local LLM gets
                     brain_system = system_prompt
@@ -790,7 +811,7 @@ def main():
                     while retries > 0:
                         try:
                             _resp = _brain_client.chat.completions.create(
-                                model=_brain_model,
+                                model=brain_model,
                                 messages=[
                                     {"role": "system", "content": brain_system},
                                     {"role": "user", "content": brain_user},
@@ -800,7 +821,7 @@ def main():
                             )
                             response_message = _resp.choices[0].message.content.strip()
                             usage = 0
-                            print(f"Brain ({_brain_model}) response:")
+                            print(f"Brain ({brain_model}) response:")
                             print(response_message)
                             total_usage.append(usage)
                             goal_frontiers = parse_answer(response_message)
