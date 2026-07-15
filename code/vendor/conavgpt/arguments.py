@@ -17,6 +17,8 @@ def get_args():
                         help="gpu id on which scenes are loaded")
     parser.add_argument("--sem_gpu_id", type=int, default=0,
                         help="""gpu id for semantic model,""")
+    parser.add_argument("--llm_gpu_id", type=int, default=-1,
+                        help="gpu id for local LLM; defaults to semantic GPU")
 
     # Logging, loading models, visualization
     parser.add_argument('--log_interval', type=int, default=10,
@@ -50,6 +52,8 @@ def get_args():
                         help='Frame height (default:120)')
     parser.add_argument('-el', '--max_episode_length', type=int, default=500,
                         help="""Maximum episode length""")
+    parser.add_argument('--max_episodes', type=int, default=0,
+                        help='maximum episodes to run; 0 means the whole split')
     parser.add_argument("--task_config", type=str,
                         default="tasks/multi_objectnav_hm3d.yaml",
                         help="path to config yaml containing task information")
@@ -104,6 +108,10 @@ def get_args():
                                 1: gpt-3.5-turbo
                                 2: gpt-4
                                 (default: 1)""")
+    parser.add_argument('--brain', type=str, default='helicase',
+                        help='navigation brain name kept for launcher compatibility')
+    parser.add_argument('--llm_path', type=str, default=None,
+                        help='local text LLM path')
                                 
     # for sem exp
     parser.add_argument('--lr', type=float, default=2.5e-5,

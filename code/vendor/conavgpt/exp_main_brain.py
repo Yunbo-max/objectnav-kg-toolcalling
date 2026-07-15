@@ -33,6 +33,7 @@ from habitat.sims.habitat_simulator.actions import (
     HabitatSimActions,
     HabitatSimV1ActionSpaceConfiguration,
 )
+from habitat.tasks.nav.nav import SimulatorTaskAction
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.functional")
@@ -96,9 +97,10 @@ robot_1: frontier_0
 Please give the output based on the following input:\n"""
 
 # Local LLM model paths (text-only, matching Co-NavGPT's text-only usage)
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 LOCAL_MODEL_PATHS = [
-    '/tf/notebooks/models/Qwen2.5-3B-Instruct',       # type 0: 3B
-    '/tf/notebooks/models/Qwen2.5-7B-Instruct',       # type 1: 7B
+    os.path.join(PROJECT_ROOT, 'models', 'Qwen2.5-3B-Instruct'),
+    os.path.join(PROJECT_ROOT, 'models', 'Qwen2.5-7B-Instruct'),
 ]
 gpt_name = ['Qwen2.5-3B', 'Qwen2.5-7B']
 
@@ -591,6 +593,19 @@ def parse_answer(response_message):
 
     return parsed_dict_num
 
+
+@habitat.registry.register_task_action
+class TurnLeftAction_S(SimulatorTaskAction):
+    def step(self, *args, **kwargs):
+        return self._sim.step(HabitatSimActions.TURN_LEFT_S)
+
+
+@habitat.registry.register_task_action
+class TurnRightAction_S(SimulatorTaskAction):
+    def step(self, *args, **kwargs):
+        return self._sim.step(HabitatSimActions.TURN_RIGHT_S)
+
+
 @habitat.registry.register_action_space_configuration
 class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
     def get(self):
@@ -610,10 +625,11 @@ class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
 def main():
     args = get_args()
 
-    # Load local LLM on sem_gpu_id (separate from sim_gpu_id for large models)
-    model_path = LOCAL_MODEL_PATHS[args.gpt_type]
+    # Keep model placement separate from simulation and semantic perception.
+    model_path = args.llm_path or LOCAL_MODEL_PATHS[args.gpt_type]
     model_type = "vl" if "VL" in model_path else "text"
-    vlm_device = f"cuda:{args.sem_gpu_id}"
+    llm_gpu_id = args.llm_gpu_id if args.llm_gpu_id >= 0 else args.sem_gpu_id
+    vlm_device = f"cuda:{llm_gpu_id}"
     load_model(model_path, device=vlm_device, model_type=model_type)
 
     np.random.seed(args.seed)
@@ -629,6 +645,8 @@ def main():
     # Apply --split argument to dataset config
     config_env.DATASET.SPLIT = args.split
     config_env.DATASET.DATA_PATH = config_env.DATASET.DATA_PATH.replace("{split}", args.split)
+    config_env.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = args.sim_gpu_id
+    config_env.ENVIRONMENT.MAX_EPISODE_STEPS = args.max_episode_length
 
     config_env.TASK.POSSIBLE_ACTIONS = config_env.TASK.POSSIBLE_ACTIONS + [
         "TURN_LEFT_S",
@@ -645,6 +663,9 @@ def main():
     env = Multi_Agent_Env(config_env=config_env)
 
     num_episodes = env.number_of_episodes
+
+    if args.max_episodes > 0:
+        num_episodes = min(num_episodes, args.max_episodes)
 
     assert num_episodes > 0, "num_episodes should be greater than 0"
 

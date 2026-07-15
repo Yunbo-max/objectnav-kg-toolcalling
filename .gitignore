@@ -4,6 +4,9 @@ __pycache__/
 *.egg-info/
 .venv/
 .env
+/models/
+code/vendor/conavgpt/data/
+code/vendor/conavgpt/RedNet/model/
 *.log
 *.aux
 *.bbl
