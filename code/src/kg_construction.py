@@ -249,8 +249,7 @@ class KGUpdater:
         ))
         return obj_id, True  # new node
 
-    def update(self, enriched_frontiers, object_list, pose_pred,
-               wall_list, full_map_pred, target_name):
+    def update(self, enriched_frontiers, object_list, pose_pred, wall_list):
         """Update KG from current map state."""
 
         # ── Robots ──
@@ -381,21 +380,3 @@ class KGUpdater:
                             self.kg.add_edge(KGEdge(side_a, side_b, "separated_by_wall"))
                 except:
                     pass
-
-        # ── Check target on map ──
-        if target_name and full_map_pred is not None:
-            from constants import hm3d_category
-            import torch
-            sem = full_map_pred[4:]
-            for i, cat in enumerate(hm3d_category):
-                if cat == target_name and i < sem.shape[0]:
-                    count = (sem[i] > 0.1).sum().item()
-                    if count > 5:
-                        ys, xs = torch.where(sem[i] > 0.1)
-                        target_pos = (int(ys.float().mean()), int(xs.float().mean()))
-                        self.kg.add_node(KGNode(
-                            id=f"TARGET_{target_name}",
-                            node_type="object", name=f"TARGET:{target_name}",
-                            certainty=0.95, position=target_pos,
-                            properties={"category": target_name, "is_target": True}
-                        ))

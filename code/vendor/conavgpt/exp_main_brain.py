@@ -2,9 +2,11 @@ from collections import deque, defaultdict
 from typing import Dict
 from itertools import count
 import os
+import sys
 import logging
 import time
 import json
+import re
 import gym
 import torch.nn as nn
 import torch
@@ -18,6 +20,14 @@ from envs.habitat.multi_agent_env import Multi_Agent_Env
 from constants import color_palette, coco_categories, hm3d_category, category_to_id
 import utils.visualization as vu
 from arguments import get_args
+
+# MindNav core lives in code/src. Keep it canonical instead of importing the
+# duplicated agents/helicase*.py copies under the vendored runtime.
+CODE_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+if CODE_SRC not in sys.path:
+    sys.path.insert(0, CODE_SRC)
+from brain import HelicaseBrain
+from kg_construction import KnowledgeGraph, KGUpdater
 
 from skimage import measure
 import skimage.morphology
@@ -103,6 +113,195 @@ LOCAL_MODEL_PATHS = [
     os.path.join(PROJECT_ROOT, 'models', 'Qwen2.5-7B-Instruct'),
 ]
 gpt_name = ['Qwen2.5-3B', 'Qwen2.5-7B']
+
+
+class OpenAICompatibleBrainAdapter:
+    """Expose the ``brain.call`` interface expected by HelicaseBrain."""
+
+    def __init__(self, base_url, api_key, model, usage_sink):
+        import openai
+
+        self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        self.model = model
+        self.usage_sink = usage_sink
+        self.last_prompt = ""
+        self.last_response = ""
+
+    def call(self, prompt, max_tokens=300):
+        self.last_prompt = prompt
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are the MindNav Helicase KG reasoning brain. Follow the requested output format exactly.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=0,
+        )
+        content = response.choices[0].message.content.strip()
+        self.last_response = content
+        self.usage_sink.append(0)
+        print(f"MindNav core brain ({self.model}) response:")
+        print(content)
+        return content
+
+
+def build_room_frontier_audit(
+        episode_index, episode_id, step, goal_name, enriched_frontiers,
+        kg, kg_updater, llm_response, final_goal_frontiers,
+        decision_method, tools_called):
+    """Build a read-only audit of dynamic frontier to persistent room mapping."""
+    active_frontiers = []
+    active_by_idx = {}
+    current_room_groups = defaultdict(list)
+
+    for ef in enriched_frontiers:
+        frontier_idx = int(ef["idx"])
+        cy, cx = float(ef["centroid"][0]), float(ef["centroid"][1])
+        room_id = kg_updater._pos_to_room_id(cy, cx)
+        record = {
+            "frontier_idx": frontier_idx,
+            "room_id": room_id,
+            "centroid": [cy, cx],
+            "area": int(ef["area"]),
+            "room_type": ef.get("room_type", "unknown"),
+            "room_confidence": float(ef.get("room_confidence", 0.0)),
+            "python_prior": float(ef.get("target_prior", 0.0)),
+        }
+        active_frontiers.append(record)
+        active_by_idx[frontier_idx] = record
+        current_room_groups[room_id].append(frontier_idx)
+
+    group_records = []
+    for room_id, frontier_indices in sorted(current_room_groups.items()):
+        node = kg.nodes.get(room_id)
+        stored_idx = None
+        if node is not None and "frontier_idx" in node.properties:
+            stored_idx = int(node.properties["frontier_idx"])
+        group_records.append({
+            "room_id": room_id,
+            "active_frontier_indices": frontier_indices,
+            "kg_stored_frontier_idx": stored_idx,
+            "collision": len(frontier_indices) > 1,
+            "overwritten_frontier_indices": [
+                idx for idx in frontier_indices if idx != stored_idx
+            ],
+        })
+
+    current_room_ids = set(current_room_groups)
+    kg_candidates = []
+    stale_candidate_rooms = []
+    misbound_candidate_rooms = []
+    for node in kg.get_nodes_by_type("room"):
+        if node.properties.get("explored") or "frontier_idx" not in node.properties:
+            continue
+        stored_idx = int(node.properties["frontier_idx"])
+        active_at_idx = active_by_idx.get(stored_idx)
+        is_current = node.id in current_room_ids
+        index_matches_room = bool(
+            active_at_idx is not None and active_at_idx["room_id"] == node.id
+        )
+        candidate_record = {
+            "room_id": node.id,
+            "kg_stored_frontier_idx": stored_idx,
+            "position": [float(node.position[0]), float(node.position[1])],
+            "is_current_room": is_current,
+            "stored_index_matches_current_room": index_matches_room,
+        }
+        kg_candidates.append(candidate_record)
+        if not is_current:
+            stale_candidate_rooms.append(node.id)
+        if not index_matches_room:
+            misbound_candidate_rooms.append(node.id)
+
+    llm_probabilities = {}
+    for match in re.finditer(
+            r'P\([^|]+\|(room_\d+_\d+)\)\s*=\s*([\d.]+)', llm_response):
+        llm_probabilities[match.group(1)] = float(match.group(2))
+
+    llm_room_assignments = {}
+    for match in re.finditer(
+            r'robot_(\d+)\s*:\s*(room_\d+_\d+)', llm_response):
+        llm_room_assignments[f"robot_{match.group(1)}"] = match.group(2)
+
+    candidate_room_ids = {entry["room_id"] for entry in kg_candidates}
+    current_candidate_room_ids = candidate_room_ids & current_room_ids
+    scored_room_ids = set(llm_probabilities)
+    assigned_room_ids = set(llm_room_assignments.values())
+
+    assignment_mapping = {}
+    for robot_id, room_id in llm_room_assignments.items():
+        node = kg.nodes.get(room_id)
+        stored_idx = None
+        if node is not None and "frontier_idx" in node.properties:
+            stored_idx = int(node.properties["frontier_idx"])
+        active_at_idx = active_by_idx.get(stored_idx)
+        assignment_mapping[robot_id] = {
+            "room_id": room_id,
+            "kg_stored_frontier_idx": stored_idx,
+            "room_is_current": room_id in current_room_ids,
+            "stored_index_matches_current_room": bool(
+                active_at_idx is not None and active_at_idx["room_id"] == room_id
+            ),
+            "final_frontier_idx": int(final_goal_frontiers.get(robot_id, -1)),
+        }
+
+    collision_groups = [entry for entry in group_records if entry["collision"]]
+    overwritten_count = sum(
+        len(entry["overwritten_frontier_indices"]) for entry in collision_groups
+    )
+
+    return {
+        "episode_index": int(episode_index),
+        "episode": int(episode_index) + 1,
+        "episode_id": str(episode_id),
+        "step": int(step),
+        "goal": goal_name,
+        "decision_method": decision_method,
+        "tools": list(tools_called),
+        "active_frontiers": active_frontiers,
+        "current_room_groups": group_records,
+        "kg_candidate_rooms": kg_candidates,
+        "llm_probabilities": llm_probabilities,
+        "llm_room_assignments": llm_room_assignments,
+        "assignment_mapping": assignment_mapping,
+        "final_frontier_assignments": {
+            key: int(value) for key, value in final_goal_frontiers.items()
+        },
+        "issues": {
+            "collision_room_ids": [entry["room_id"] for entry in collision_groups],
+            "overwritten_active_frontier_count": overwritten_count,
+            "stale_candidate_room_ids": stale_candidate_rooms,
+            "misbound_candidate_room_ids": misbound_candidate_rooms,
+            "llm_scored_noncurrent_room_ids": sorted(scored_room_ids - current_room_ids),
+            "llm_omitted_current_candidate_room_ids": sorted(
+                current_candidate_room_ids - scored_room_ids
+            ),
+            "llm_assigned_noncurrent_room_ids": sorted(
+                assigned_room_ids - current_room_ids
+            ),
+        },
+        "counts": {
+            "active_frontiers": len(active_frontiers),
+            "unique_current_rooms": len(current_room_ids),
+            "collision_rooms": len(collision_groups),
+            "overwritten_active_frontiers": overwritten_count,
+            "kg_candidate_rooms": len(candidate_room_ids),
+            "stale_candidate_rooms": len(stale_candidate_rooms),
+            "misbound_candidate_rooms": len(misbound_candidate_rooms),
+            "llm_scored_rooms": len(scored_room_ids),
+            "llm_scored_noncurrent_rooms": len(scored_room_ids - current_room_ids),
+            "llm_omitted_current_candidate_rooms": len(
+                current_candidate_room_ids - scored_room_ids
+            ),
+            "llm_assigned_noncurrent_rooms": len(
+                assigned_room_ids - current_room_ids
+            ),
+        },
+    }
 
 def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visited_vis, map_edge, goal_points):
     dump_dir = "{}/dump/{}/".format(args.dump_location,
@@ -689,7 +888,17 @@ def main():
 
     env = Multi_Agent_Env(config_env=config_env)
 
-    num_episodes = env.number_of_episodes
+    total_episodes = env.number_of_episodes
+    if args.start_episode_index < 0 or args.start_episode_index >= total_episodes:
+        raise ValueError(
+            f"start_episode_index must be in [0, {total_episodes - 1}], "
+            f"got {args.start_episode_index}"
+        )
+
+    for _ in range(args.start_episode_index):
+        env.reset()
+
+    num_episodes = total_episodes - args.start_episode_index
 
     if args.max_episodes > 0:
         num_episodes = min(num_episodes, args.max_episodes)
@@ -719,6 +928,15 @@ def main():
     print("Dumping at {}".format(log_dir))
     # print(args)
     logging.info(args)
+    mapping_jsonl_log = None
+    if args.jsonl_log:
+        jsonl_dir = os.path.dirname(os.path.abspath(args.jsonl_log))
+        os.makedirs(jsonl_dir, exist_ok=True)
+        open(args.jsonl_log, "w").close()
+        mapping_jsonl_log = os.path.splitext(args.jsonl_log)[0] + ".mapping.jsonl"
+        open(mapping_jsonl_log, "w").close()
+        print(f"Writing per-episode JSONL to {args.jsonl_log}")
+        print(f"Writing room/frontier mapping audit to {mapping_jsonl_log}")
     # ------------------------------------------------------------------
 
 
@@ -732,16 +950,32 @@ def main():
     log_start = time.time()
     last_decision = []
     total_usage = []
+    decision_history = []
+
+    brain_adapter = OpenAICompatibleBrainAdapter(
+        base_url=brain_base_url,
+        api_key=brain_api_key,
+        model=brain_model,
+        usage_sink=total_usage,
+    )
+    kg = KnowledgeGraph()
+    kg_updater = KGUpdater(kg)
+    mindnav_brain = HelicaseBrain(brain_adapter, num_agents=num_agents)
+    print(f"Using MindNav core: {CODE_SRC}/brain.py + {CODE_SRC}/kg_construction.py")
 
     while count_episodes < num_episodes:
         observations = env.reset()
         current_episode = env.current_episode
         print(
-            f"[EPISODE_START] index={count_episodes} "
+            f"[EPISODE_START] index={args.start_episode_index + count_episodes} "
             f"episode_id={current_episode.episode_id} "
             f"scene={os.path.basename(current_episode.scene_id)} "
             f"target={getattr(current_episode, 'object_category', 'unknown')}"
         )
+        kg.reset()
+        decision_history.clear()
+        last_decision.clear()
+        goal_points.clear()
         for i in range(num_agents):
             agent[i].reset()
 
@@ -795,52 +1029,51 @@ def main():
                                        "prior": e["target_prior"], "area": e["area"]} for e in enriched],
                     }
 
-                    User_prompt, Frontiers_dict = form_prompt_for_chatgpt(agent[0].goal_name,
-                                                            pose_pred,
-                                                            object_list,
-                                                            Wall_list,
-                                                            Frontier_list,
-                                                            last_decision,
-                                                            target_point_map,
-                                                            enriched_frontiers=enriched)
+                    Frontiers_dict = {
+                        "frontier_" + str(i): (
+                            f"<centroid: {target_point_map[i][0], target_point_map[i][1]}, "
+                            f"number: {Frontier_list[i]}>"
+                        )
+                        for i in range(len(target_point_map))
+                    }
 
-                    # ═══════════════════════════════════════════
-                    # BRAIN: API brain replaces local LLM
-                    # Same frontier info, same format, different decision maker
-                    # ═══════════════════════════════════════════
-                    import openai as _oai
-                    _brain_client = _oai.OpenAI(
-                        api_key=brain_api_key,
-                        base_url=brain_base_url,
+                    # Build/update the canonical MindNav KG once, then let the
+                    # code/src Helicase brain estimate room probabilities and
+                    # assign both robots in one LLM call.
+                    kg_updater.update(
+                        enriched,
+                        object_list,
+                        pose_pred,
+                        Wall_list,
                     )
-
-                    # Give brain the SAME info as local LLM gets
-                    brain_system = system_prompt
-                    brain_user = User_prompt
 
                     retries = 3
                     vlm_success = False
                     while retries > 0:
                         try:
-                            _resp = _brain_client.chat.completions.create(
-                                model=brain_model,
-                                messages=[
-                                    {"role": "system", "content": brain_system},
-                                    {"role": "user", "content": brain_user},
-                                ],
-                                max_tokens=100,
-                                temperature=0,
+                            goal_frontiers, tools_called, decision_method = mindnav_brain.decide(
+                                kg,
+                                agent[0].goal_name,
+                                enriched,
+                                pose_pred,
+                                agent[0].l_step,
+                                args.max_episode_length,
+                                decision_history,
                             )
-                            response_message = _resp.choices[0].message.content.strip()
-                            usage = 0
-                            print(f"Brain ({brain_model}) response:")
-                            print(response_message)
-                            total_usage.append(usage)
-                            goal_frontiers = parse_answer(response_message)
+                            print(
+                                f"MindNav decision: {decision_method}; tools={tools_called}; "
+                                f"kg_nodes={len(kg.nodes)}, kg_edges={len(kg.edges)}"
+                            )
 
                             # Verify we got assignments for all robots
                             for i in range(num_agents):
-                                _ = goal_frontiers["robot_"+ str(i)]
+                                robot_key = "robot_" + str(i)
+                                if robot_key not in goal_frontiers:
+                                    raise ValueError(f"Missing frontier assignment for {robot_key}")
+                                goal_frontiers[robot_key] = max(
+                                    0,
+                                    min(int(goal_frontiers[robot_key]), len(target_point_map) - 1),
+                                )
 
                             # Fix Gap 2: prevent both robots going to same frontier
                             if num_agents >= 2 and len(target_point_map) >= 2:
@@ -860,9 +1093,15 @@ def main():
                             last_decision.clear()
                             for i in range(num_agents):
                                 fi = goal_frontiers["robot_"+ str(i)]
-                                fi = min(fi, len(target_point_map) - 1)
                                 goal_points.append(target_point_map[fi])
                                 last_decision.append(Frontiers_dict.get("frontier_"+str(fi), ""))
+
+                            decision_history.append({
+                                "step": int(agent[0].l_step),
+                                "r0": int(goal_frontiers.get("robot_0", 0)),
+                                "r1": int(goal_frontiers.get("robot_1", 0)),
+                                "objects_found": ",".join(sorted(object_list.keys())),
+                            })
 
                             # ── 025 Probe: log decision ──
                             chosen_0 = goal_frontiers.get("robot_0", 0)
@@ -875,10 +1114,40 @@ def main():
                                   f"rooms={[e['room_type'] for e in enriched]}, "
                                   f"priors={[e['target_prior'] for e in enriched]}")
 
+                            if mapping_jsonl_log:
+                                try:
+                                    mapping_audit = build_room_frontier_audit(
+                                        args.start_episode_index + count_episodes,
+                                        current_episode.episode_id,
+                                        agent[0].l_step,
+                                        agent[0].goal_name,
+                                        enriched,
+                                        kg,
+                                        kg_updater,
+                                        brain_adapter.last_response,
+                                        goal_frontiers,
+                                        decision_method,
+                                        tools_called,
+                                    )
+                                    with open(mapping_jsonl_log, "a") as mapping_file:
+                                        json.dump(mapping_audit, mapping_file, ensure_ascii=False)
+                                        mapping_file.write("\n")
+                                    audit_counts = mapping_audit["counts"]
+                                    print(
+                                        "  [MAPPING] "
+                                        f"active={audit_counts['active_frontiers']}, "
+                                        f"rooms={audit_counts['unique_current_rooms']}, "
+                                        f"collisions={audit_counts['collision_rooms']}, "
+                                        f"stale_candidates={audit_counts['stale_candidate_rooms']}, "
+                                        f"misbound={audit_counts['misbound_candidate_rooms']}"
+                                    )
+                                except Exception as audit_error:
+                                    print(f"  [MAPPING] audit logging failed: {audit_error}")
+
                             vlm_success = True
                             break
                         except Exception as e:
-                            print(f"Local VLM error: {e}")
+                            print(f"MindNav core brain error: {e}")
                             print('Retrying...')
                             retries -= 1
                             time.sleep(1)
@@ -933,6 +1202,19 @@ def main():
         ]) + '\n'
 
         metrics = env.get_metrics()
+        if args.jsonl_log:
+            episode_record = {
+                "method": args.method_name,
+                "episode": args.start_episode_index + count_episodes,
+                "success": float(metrics.get("success", 0.0)),
+                "spl": float(metrics.get("spl", 0.0)),
+                "goal": agent[0].goal_name,
+                "steps": int(agent[0].l_step),
+                "distance_to_goal": float(metrics.get("distance_to_goal", -1.0)),
+            }
+            with open(args.jsonl_log, "a") as jsonl_file:
+                json.dump(episode_record, jsonl_file, ensure_ascii=False)
+                jsonl_file.write("\n")
         for m, v in metrics.items():
             if isinstance(v, dict):
                 for sub_m, sub_v in v.items():
@@ -942,7 +1224,8 @@ def main():
 
         log += ", ".join(k + ": {:.3f}".format(v / count_episodes) for k, v in agg_metrics.items()) + " ---({:.0f}/{:.0f})".format(count_episodes, num_episodes)
 
-        log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(np.mean(total_usage))
+        average_usage = float(np.mean(total_usage)) if total_usage else 0.0
+        log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(average_usage)
         print(log)
         logging.info(log)
         # ------------------------------------------------------------------

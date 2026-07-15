@@ -398,53 +398,13 @@ class HelicaseBrain:
                decision_history: list) -> Tuple[Dict, List[str], str]:
         """
         Main decision loop:
-        1. Check if target found in KG
-        2. Find uncertain nodes
-        3. Brain reasons which to resolve
-        4. Brain selects tools per uncertain node
-        5. Assign robots
+        1. Find uncertain nodes
+        2. Brain reasons which to resolve
+        3. Brain selects tools per uncertain node
+        4. Assign robots
 
         Returns: (goal_frontiers, tools_called, method_name)
         """
-
-        # ── FIX 1: Priority check — is target already on the semantic map? ──
-        target_node = kg.nodes.get(f"TARGET_{target_name}")
-        if target_node and target_node.certainty > 0.8:
-            target_pos = np.array(target_node.position)
-
-            # Find nearest frontier to target
-            best_frontier = 0
-            min_dist = float('inf')
-            for ef in enriched_frontiers:
-                d = np.sqrt((target_pos[0] - ef['centroid'][0])**2 +
-                           (target_pos[1] - ef['centroid'][1])**2)
-                if d < min_dist:
-                    min_dist = d
-                    best_frontier = ef['idx']
-
-            # Find which robot is closest to target → send that one directly
-            robot_dists = []
-            for i, p in enumerate(pose_pred):
-                d = np.sqrt((p[0] - target_pos[0])**2 + (p[1] - target_pos[1])**2)
-                robot_dists.append((i, d))
-            robot_dists.sort(key=lambda x: x[1])
-
-            closest_robot = robot_dists[0][0]
-            farthest_robot = robot_dists[-1][0]
-
-            # Closest robot → target, farthest robot → explore (in case detection is wrong)
-            goal = {}
-            goal[f"robot_{closest_robot}"] = best_frontier
-            # Other robot → farthest frontier for backup exploration
-            if len(enriched_frontiers) >= 2:
-                farthest_frontier = max(enriched_frontiers,
-                    key=lambda ef: np.sqrt((ef['centroid'][0] - target_pos[0])**2 +
-                                          (ef['centroid'][1] - target_pos[1])**2))['idx']
-                goal[f"robot_{farthest_robot}"] = farthest_frontier
-            else:
-                goal[f"robot_{farthest_robot}"] = best_frontier
-
-            return goal, ["check_target"], "helicase_target_found"
 
         # Get KG state as text
         kg_text = kg.to_text()

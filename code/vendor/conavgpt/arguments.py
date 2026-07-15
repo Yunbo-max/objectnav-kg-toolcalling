@@ -30,6 +30,10 @@ def get_args():
                         help='path to dump models and log (default: ./tmp/)')
     parser.add_argument('--exp_name', type=str, default="exp1",
                         help='experiment name (default: exp1)')
+    parser.add_argument('--jsonl_log', type=str, default=None,
+                        help='optional per-episode JSONL metrics path')
+    parser.add_argument('--method_name', type=str, default='mindnav_main',
+                        help='method label stored in per-episode JSONL')
     parser.add_argument('--save_periodic', type=int, default=500000,
                         help='Model save frequency in number of updates')
     parser.add_argument('-v', '--visualize', type=int, default=0,
@@ -54,6 +58,8 @@ def get_args():
                         help="""Maximum episode length""")
     parser.add_argument('--max_episodes', type=int, default=0,
                         help='maximum episodes to run; 0 means the whole split')
+    parser.add_argument('--start_episode_index', type=int, default=0,
+                        help='zero-based number of episodes to skip before evaluation')
     parser.add_argument("--task_config", type=str,
                         default="tasks/multi_objectnav_hm3d.yaml",
                         help="path to config yaml containing task information")

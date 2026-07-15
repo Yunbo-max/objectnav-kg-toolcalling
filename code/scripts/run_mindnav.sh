@@ -29,10 +29,13 @@ SIM_GPU_ID=${SIM_GPU_ID:-0}
 SEM_GPU_ID=${SEM_GPU_ID:-1}
 LLM_GPU_ID=${LLM_GPU_ID:-2}
 MAX_EPISODES=${MAX_EPISODES:-0}
+START_EPISODE_INDEX=${START_EPISODE_INDEX:-0}
 MAX_EPISODE_LENGTH=${MAX_EPISODE_LENGTH:-500}
 DUMP_LOCATION=${DUMP_LOCATION:-"$REPO_ROOT/results/dump"}
 EXP_NAME=${EXP_NAME:-mindnav_${SPLIT}}
 LOG=${LOG:-"$REPO_ROOT/results/runs/mindnav_${SPLIT}.log"}
+JSONL_LOG=${JSONL_LOG:-"${LOG%.log}.jsonl"}
+METHOD_NAME=${METHOD_NAME:-mindnav_main}
 
 abspath_from_root() {
     case "$1" in
@@ -44,8 +47,10 @@ abspath_from_root() {
 MODEL_PATH="$(abspath_from_root "$MODEL_PATH")"
 DUMP_LOCATION="$(abspath_from_root "$DUMP_LOCATION")"
 LOG="$(abspath_from_root "$LOG")"
+JSONL_LOG="$(abspath_from_root "$JSONL_LOG")"
 
 mkdir -p "$(dirname "$LOG")"
+mkdir -p "$(dirname "$JSONL_LOG")"
 mkdir -p "$DUMP_LOCATION"
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 export PYTHONPATH="$REPO/multi-robot-setting:${PYTHONPATH:-}"
@@ -59,8 +64,11 @@ cd "$REPO"
     --sem_gpu_id "$SEM_GPU_ID" \
     --llm_gpu_id "$LLM_GPU_ID" \
     --max_episodes "$MAX_EPISODES" \
+    --start_episode_index "$START_EPISODE_INDEX" \
     --max_episode_length "$MAX_EPISODE_LENGTH" \
     --dump_location "$DUMP_LOCATION" \
     --exp_name "$EXP_NAME" \
+    --jsonl_log "$JSONL_LOG" \
+    --method_name "$METHOD_NAME" \
     "$@" \
     2>&1 | tee "$LOG"
