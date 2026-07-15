@@ -669,6 +669,11 @@ def main():
     config_env.DATASET.DATA_PATH = config_env.DATASET.DATA_PATH.replace("{split}", args.split)
     config_env.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = args.sim_gpu_id
     config_env.ENVIRONMENT.MAX_EPISODE_STEPS = args.max_episode_length
+    episode_shuffle = os.environ.get("EPISODE_SHUFFLE")
+    if episode_shuffle is not None:
+        config_env.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = episode_shuffle.lower() in {
+            "1", "true", "yes", "on"
+        }
 
     config_env.TASK.POSSIBLE_ACTIONS = config_env.TASK.POSSIBLE_ACTIONS + [
         "TURN_LEFT_S",
@@ -730,6 +735,13 @@ def main():
 
     while count_episodes < num_episodes:
         observations = env.reset()
+        current_episode = env.current_episode
+        print(
+            f"[EPISODE_START] index={count_episodes} "
+            f"episode_id={current_episode.episode_id} "
+            f"scene={os.path.basename(current_episode.scene_id)} "
+            f"target={getattr(current_episode, 'object_category', 'unknown')}"
+        )
         for i in range(num_agents):
             agent[i].reset()
 
