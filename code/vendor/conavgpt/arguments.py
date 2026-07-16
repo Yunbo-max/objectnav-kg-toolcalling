@@ -9,6 +9,8 @@ def get_args():
     # General Arguments
     parser.add_argument('--seed', type=int, default=1,
                         help='random seed (default: 1)')
+    parser.add_argument('--reset_seed_each_episode', action='store_true',
+                        help='reset simulator/Python/NumPy/Torch RNGs to --seed before every episode')
     parser.add_argument('--auto_gpu_config', type=int, default=0)
     parser.add_argument('--total_num_scenes', type=str, default="auto")
     parser.add_argument('--no_cuda', action='store_true', default=False,
@@ -32,6 +34,8 @@ def get_args():
                         help='experiment name (default: exp1)')
     parser.add_argument('--jsonl_log', type=str, default=None,
                         help='optional per-episode JSONL metrics path')
+    parser.add_argument('--stop_diag_jsonl', type=str, default=None,
+                        help='optional per-step target/STOP diagnostic JSONL path')
     parser.add_argument('--method_name', type=str, default='mindnav_main',
                         help='method label stored in per-episode JSONL')
     parser.add_argument('--save_periodic', type=int, default=500000,

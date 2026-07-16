@@ -1,557 +1,1309 @@
+"""MindNav KG reasoning brain with room-first frontier allocation.
+
+Each planning decision has three logical operations but only two LLM calls:
+
+1. Python executes ``query_room_objects`` for every current room.
+2. The LLM reads the full serialized KG and estimates room probabilities.
+3. The LLM reads a current-only decision packet and assigns rooms/frontiers.
+
+Python validates the feasible action space and provides explicit fallbacks.
+It does not compute a target prior or replace a valid LLM assignment.
 """
-Helicase: Knowledge Graph-Driven Tool Calling for Embodied Navigation.
 
-Like the enzyme that unwinds DNA to read unknown sequences, Helicase
-unwinds the unknown environment by maintaining a Knowledge Graph (KG)
-and using LLM tool calling to resolve uncertain nodes.
-
-KG Structure:
-    Nodes: Area (room/frontier), Object, Robot
-    Edges: connected_to, contains, suggests_room, explored_by, adjacent_to
-    Each node has: certainty ∈ [0,1], position (x,y)
-
-Brain Loop:
-    1. Update KG from map tools
-    2. Find uncertain nodes (certainty < threshold)
-    3. Brain reasons: which uncertainty matters most for finding target?
-    4. Brain selects: which tools resolve that uncertainty?
-    5. Execute tools → update KG
-    6. Assign robots to most promising uncertain nodes
-"""
+import copy
+import itertools
+import json
+import math
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set
-import json
 
-# KG with object merging + spatial edges (local module)
-from kg_construction import KnowledgeGraph, KGNode, KGEdge, KGUpdater
+from kg_construction import (
+    CurrentFrontierView,
+    KGEdge,
+    KGNode,
+    KGUpdater,
+    KnowledgeGraph,
+)
 
-
-# ═══════════════════════════════════════════════════════
-# LEGACY KNOWLEDGE GRAPH (kept for reference, new one in helicase_kg.py)
-# ═══════════════════════════════════════════════════════
-
-@dataclass
-class KGNode:
-    id: str
-    node_type: str          # "area", "object", "robot"
-    name: str               # "kitchen", "sink", "robot_0"
-    certainty: float        # 0.0 = unknown, 1.0 = certain
-    position: Tuple[float, float] = (0, 0)
-    properties: Dict = field(default_factory=dict)
-    # For areas: {"explored": bool, "frontier_idx": int}
-    # For objects: {"category": str}
-
-@dataclass
-class KGEdge:
-    source: str             # node id
-    target: str             # node id
-    relation: str           # "connected_to", "contains", "suggests_room", "explored_by"
-    certainty: float = 1.0
-    distance: float = 0.0   # distance in map pixels (for connected_to edges)
-
-
-class KnowledgeGraph:
-    """Navigation Knowledge Graph — the agent's world model."""
-
-    def __init__(self):
-        self.nodes: Dict[str, KGNode] = {}
-        self.edges: List[KGEdge] = []
-        self._edge_set: Set[Tuple[str, str, str]] = set()
-
-    def reset(self):
-        self.nodes.clear()
-        self.edges.clear()
-        self._edge_set.clear()
-
-    def add_node(self, node: KGNode):
-        if node.id in self.nodes:
-            # Update existing — increase certainty, update position
-            existing = self.nodes[node.id]
-            existing.certainty = max(existing.certainty, node.certainty)
-            if node.position != (0, 0):
-                existing.position = node.position
-            existing.properties.update(node.properties)
-        else:
-            self.nodes[node.id] = node
-
-    def add_edge(self, edge: KGEdge):
-        key = (edge.source, edge.target, edge.relation)
-        if key not in self._edge_set:
-            self.edges.append(edge)
-            self._edge_set.add(key)
-
-    def get_uncertain_nodes(self, threshold=0.5) -> List[KGNode]:
-        """Find nodes with certainty below threshold."""
-        uncertain = [n for n in self.nodes.values() if n.certainty < threshold]
-        # Sort by certainty ascending (most uncertain first)
-        uncertain.sort(key=lambda n: n.certainty)
-        return uncertain
-
-    def get_area_nodes(self) -> List[KGNode]:
-        return [n for n in self.nodes.values() if n.node_type == "area"]
-
-    def get_object_nodes(self) -> List[KGNode]:
-        return [n for n in self.nodes.values() if n.node_type == "object"]
-
-    def get_neighbors(self, node_id: str) -> List[Tuple[str, str]]:
-        """Get (neighbor_id, relation) pairs for a node."""
-        neighbors = []
-        for e in self.edges:
-            if e.source == node_id:
-                neighbors.append((e.target, e.relation))
-            elif e.target == node_id:
-                neighbors.append((e.source, e.relation))
-        return neighbors
-
-    def get_objects_in_area(self, area_id: str) -> List[KGNode]:
-        """Get all objects contained in an area."""
-        objects = []
-        for e in self.edges:
-            if e.source == area_id and e.relation == "contains":
-                if e.target in self.nodes:
-                    objects.append(self.nodes[e.target])
-        return objects
-
-    def to_text(self, max_nodes=12) -> str:
-        """Convert KG to graph text — nodes with edges inline."""
-        lines = []
-
-        # Robots first — with path distances to unexplored areas
-        robots = [n for n in self.nodes.values() if n.node_type == "robot"]
-        for r in robots:
-            in_area = None
-            paths = []
-            explored_areas = []
-            for e in self.edges:
-                if e.source == r.id:
-                    if e.relation == "in":
-                        in_area = e.target
-                    elif e.relation == "path_to":
-                        target_node = self.nodes.get(e.target)
-                        if target_node and not target_node.properties.get("explored"):
-                            paths.append((e.target, e.distance))
-                    elif e.relation == "explored":
-                        explored_areas.append(e.target)
-            paths.sort(key=lambda x: x[1])
-            path_str = ", ".join([f"{pid}({pd:.0f}px)" for pid, pd in paths[:5]])
-            lines.append(f"{r.id}: in={in_area}, explored=[{','.join(explored_areas[:4])}]")
-            if paths:
-                lines.append(f"  paths_to_unexplored: {path_str}")
-
-        lines.append("")
-
-        # Areas — unexplored first, with connections
-        areas = self.get_area_nodes()
-        unexplored = [a for a in areas if not a.properties.get("explored")]
-        explored = [a for a in areas if a.properties.get("explored")]
-
-        if unexplored:
-            lines.append(f"UNEXPLORED AREAS ({len(unexplored)}):")
-            for a in unexplored[:max_nodes]:
-                objs = self.get_objects_in_area(a.id)
-                obj_names = [o.name for o in objs]
-                # Get connected areas with distances
-                connections = []
-                for e in self.edges:
-                    if e.relation == "connected_to":
-                        if e.source == a.id:
-                            connections.append(f"{e.target}({e.distance:.0f}px)")
-                        elif e.target == a.id:
-                            connections.append(f"{e.source}({e.distance:.0f}px)")
-                # Get wall separations
-                walls = []
-                for e in self.edges:
-                    if e.relation == "separated_by_wall":
-                        if e.source == a.id:
-                            walls.append(e.target)
-                        elif e.target == a.id:
-                            walls.append(e.source)
-
-                finfo = f", frontier_idx={a.properties.get('frontier_idx','?')}" if 'frontier_idx' in a.properties else ""
-                line = f"  {a.id}: type={a.name}, certainty={a.certainty:.1f}{finfo}"
-                if obj_names:
-                    line += f", objects=[{','.join(obj_names)}]"
-                if connections:
-                    line += f"\n    ──connected_to──> {', '.join(connections[:4])}"
-                if walls:
-                    line += f"\n    ──wall──> {', '.join(walls[:3])}"
-                lines.append(line)
-
-        if explored:
-            lines.append(f"\nEXPLORED AREAS ({len(explored)}):")
-            for a in explored[:6]:
-                objs = self.get_objects_in_area(a.id)
-                obj_names = [o.name for o in objs]
-                lines.append(f"  {a.id}: type={a.name}, objects=[{','.join(obj_names)}]")
-
-        return "\n".join(lines)
-
-
-# ═══════════════════════════════════════════════════════
-# KG UPDATER — builds KG from map tools
-# ═══════════════════════════════════════════════════════
-
-class KGUpdater:
-    """Updates KG from semantic map and tool results."""
-
-    ROOM_HINTS = {
-        "toilet": "bathroom", "sink": "bathroom", "bathtub": "bathroom",
-        "shower": "bathroom", "towel": "bathroom",
-        "bed": "bedroom", "chest_of_drawers": "bedroom",
-        "sofa": "living_room", "tv_monitor": "living_room",
-        "fireplace": "living_room",
-        "table": "kitchen", "chair": "living_room",
-        "plant": "living_room",
-    }
-
-    def __init__(self, kg: KnowledgeGraph):
-        self.kg = kg
-        self._explored_areas = set()
-        self._area_grid_size = 50  # pixels — areas within this distance merge
-
-    def _pos_to_area_id(self, y, x):
-        """Position-based area ID — stable across steps."""
-        gy = int(y // self._area_grid_size)
-        gx = int(x // self._area_grid_size)
-        return f"area_{gy}_{gx}"
-
-    def _infer_room_type(self, obj_names):
-        """Infer room type from nearby objects."""
-        obj_set = set(obj_names)
-        if obj_set & {"toilet", "bathtub", "shower", "sink", "towel"}:
-            return "likely_bathroom", 0.5
-        elif obj_set & {"bed", "chest_of_drawers"}:
-            return "likely_bedroom", 0.5
-        elif obj_set & {"sofa", "tv_monitor", "fireplace"}:
-            return "likely_living_room", 0.5
-        elif obj_set & {"table", "appliances"}:
-            return "likely_kitchen", 0.5
-        return "unknown", 0.1
-
-    def update_from_map(self, enriched_frontiers, object_list, pose_pred,
-                        wall_list, full_map_pred, target_name):
-        """Update KG from current map state."""
-
-        # ── Update robot positions ──
-        for i, pos in enumerate(pose_pred):
-            robot_id = f"robot_{i}"
-            self.kg.add_node(KGNode(
-                id=robot_id, node_type="robot", name=robot_id,
-                certainty=1.0, position=(pos[0], pos[1])
-            ))
-            # Mark robot's area as explored
-            robot_area_id = self._pos_to_area_id(pos[0], pos[1])
-            self.kg.add_node(KGNode(
-                id=robot_area_id, node_type="area", name="explored",
-                certainty=0.8, position=(pos[0], pos[1]),
-                properties={"explored": True}
-            ))
-            self.kg.add_edge(KGEdge(robot_id, robot_area_id, "in", distance=0))
-            self.kg.add_edge(KGEdge(robot_id, robot_area_id, "explored"))
-            self._explored_areas.add(robot_area_id)
-
-            # Add path distances from robot to all unexplored areas
-            for area in self.kg.get_area_nodes():
-                if area.properties.get("explored"):
-                    continue
-                d = np.sqrt((pos[0] - area.position[0])**2 + (pos[1] - area.position[1])**2)
-                if d < 300:
-                    self.kg.add_edge(KGEdge(robot_id, area.id, "path_to", distance=d))
-
-        # ── Update areas from frontiers (uncertain = unexplored) ──
-        for ef in enriched_frontiers:
-            cy, cx = ef['centroid'][0], ef['centroid'][1]
-            area_id = self._pos_to_area_id(cy, cx)
-            objs_nearby = ef.get('nearby_objects', [])
-            area_name, cert = self._infer_room_type(objs_nearby)
-
-            # If area was already explored, increase certainty
-            if area_id in self._explored_areas:
-                cert = max(cert, 0.8)
-
-            self.kg.add_node(KGNode(
-                id=area_id, node_type="area", name=area_name,
-                certainty=cert,
-                position=(cy, cx),
-                properties={"frontier_idx": ef['idx'], "size": ef['area'],
-                           "explored": area_id in self._explored_areas}
-            ))
-
-            # Add nearby objects as nodes + edges
-            for obj_name in objs_nearby:
-                obj_id = f"obj_{obj_name}_{area_id}"
-                self.kg.add_node(KGNode(
-                    id=obj_id, node_type="object", name=obj_name,
-                    certainty=0.7, position=(cy, cx),
-                    properties={"category": obj_name}
-                ))
-                self.kg.add_edge(KGEdge(area_id, obj_id, "contains"))
-
-                # Semantic: object suggests room type
-                if obj_name in self.ROOM_HINTS:
-                    room_type = self.ROOM_HINTS[obj_name]
-                    self.kg.add_edge(KGEdge(obj_id, f"roomtype_{room_type}", "suggests_room"))
-
-        # ── Walls → "blocked_by" edges between areas ──
-        if wall_list is not None and len(wall_list) > 0:
-            for i, wall in enumerate(wall_list):
-                try:
-                    coords = wall[0]  # (y1, x1, y2, x2)
-                    wall_mid_y = (coords[0] + coords[2]) / 2
-                    wall_mid_x = (coords[1] + coords[3]) / 2
-                    wall_id = f"wall_{i}"
-                    self.kg.add_node(KGNode(
-                        id=wall_id, node_type="wall", name="wall",
-                        certainty=0.9, position=(wall_mid_y, wall_mid_x)
-                    ))
-
-                    # Find areas on both sides of wall
-                    wall_len = np.sqrt((coords[2]-coords[0])**2 + (coords[3]-coords[1])**2)
-                    if wall_len > 10:
-                        # Normal to wall direction
-                        dy = coords[2] - coords[0]
-                        dx = coords[3] - coords[1]
-                        norm_y, norm_x = -dx / wall_len * 30, dy / wall_len * 30
-
-                        side_a = self._pos_to_area_id(wall_mid_y + norm_y, wall_mid_x + norm_x)
-                        side_b = self._pos_to_area_id(wall_mid_y - norm_y, wall_mid_x - norm_x)
-
-                        if side_a != side_b:
-                            self.kg.add_edge(KGEdge(side_a, side_b, "separated_by_wall"))
-                except:
-                    pass
-
-        # ── Connect nearby areas with distance ──
-        areas = self.kg.get_area_nodes()
-        for i, a1 in enumerate(areas):
-            for j, a2 in enumerate(areas):
-                if i >= j:
-                    continue
-                dist = np.sqrt((a1.position[0] - a2.position[0])**2 +
-                              (a1.position[1] - a2.position[1])**2)
-                if dist < 150:
-                    key = (a1.id, a2.id, "separated_by_wall")
-                    if key not in self.kg._edge_set:
-                        self.kg.add_edge(KGEdge(a1.id, a2.id, "connected_to", distance=dist))
-
-        # ── Objects from full semantic map (Detectron2) ──
-        if object_list:
-            for obj_name, positions in object_list.items():
-                for idx, pos_data in enumerate(positions[:3]):
-                    try:
-                        coords = pos_data[0][0] if len(pos_data) > 0 else (0, 0)
-                        obj_pos = (float(coords[0]), float(coords[1]))
-                    except:
-                        obj_pos = (0, 0)
-
-                    if obj_pos == (0, 0):
-                        continue
-
-                    obj_area_id = self._pos_to_area_id(obj_pos[0], obj_pos[1])
-                    obj_id = f"obj_{obj_name}_{obj_area_id}"
-
-                    self.kg.add_node(KGNode(
-                        id=obj_id, node_type="object", name=obj_name,
-                        certainty=0.9, position=obj_pos,
-                        properties={"category": obj_name}
-                    ))
-                    self.kg.add_edge(KGEdge(obj_area_id, obj_id, "contains"))
-
-                    if obj_name in self.ROOM_HINTS:
-                        self.kg.add_edge(KGEdge(obj_id, f"roomtype_{self.ROOM_HINTS[obj_name]}", "suggests_room"))
-
-        # ── Check if target is on map ──
-        if target_name and full_map_pred is not None:
-            from constants import hm3d_category
-            sem = full_map_pred[4:]
-            for i, cat in enumerate(hm3d_category):
-                if cat == target_name and i < sem.shape[0]:
-                    count = (sem[i] > 0.1).sum().item()
-                    if count > 5:
-                        import torch
-                        ys, xs = torch.where(sem[i] > 0.1)
-                        target_pos = (int(ys.float().mean()), int(xs.float().mean()))
-                        self.kg.add_node(KGNode(
-                            id=f"TARGET_{target_name}",
-                            node_type="object", name=target_name,
-                            certainty=0.95, position=target_pos,
-                            properties={"category": target_name, "is_target": True}
-                        ))
-
-
-# ═══════════════════════════════════════════════════════
-# HELICASE BRAIN — reasons over KG to select tools & assign robots
-# ═══════════════════════════════════════════════════════
 
 class HelicaseBrain:
-    """LLM brain that reasons over KG to decide tool calls and robot assignments."""
+    """Central LLM that reasons over the KG and assigns current frontiers."""
 
     def __init__(self, brain, num_agents=2):
-        self.brain = brain  # APIBrain or LocalBrain
-        self.num_agents = num_agents
-        self.reflexion_memory = []
+        self.brain = brain
+        self.num_agents = int(num_agents)
+        self.reflexion_memory: List[str] = []
+        self.last_decision_audit: Dict = {}
+        self._recent_assignment_history: List[Dict] = []
+        self._history_snapshot: Optional[Dict] = None
+        self._history_last_step: Optional[int] = None
+        self._history_kg_generation: Optional[int] = None
+
+    @staticmethod
+    def _reject_json_constant(value):
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    @classmethod
+    def _load_json(cls, response, expected_tool_name=None):
+        try:
+            response_text = response.strip()
+        except AttributeError as error:
+            raise ValueError(f"invalid_json: {error}") from error
+
+        # Accept one exact enclosing Markdown JSON fence.  Do not search
+        # explanatory prose for an embedded object.
+        response_lines = response_text.splitlines()
+        if (len(response_lines) >= 3
+                and response_lines[0].strip().lower() in {"```", "```json"}
+                and response_lines[-1].strip() == "```"):
+            response_text = "\n".join(response_lines[1:-1]).strip()
+        try:
+            payload = json.loads(
+                response_text,
+                parse_constant=cls._reject_json_constant,
+            )
+        except (AttributeError, json.JSONDecodeError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid_json: {error}") from error
+        # Qwen commonly emits the semantically equivalent compact form
+        # ``[{"tool_call": name, ...arguments...}]``.  Canonicalize only this
+        # syntax; all tool names, argument fields, values, and coverage remain
+        # subject to the strict stage validators below.
+        if (isinstance(payload, list)
+                and len(payload) == 1
+                and isinstance(payload[0], dict)
+                and set(payload[0]) == {"tool_calls"}
+                and isinstance(payload[0]["tool_calls"], list)):
+            payload = payload[0]
+        if isinstance(payload, list):
+            canonical_calls = []
+            for compact_call in payload:
+                if not isinstance(compact_call, dict):
+                    raise ValueError(
+                        "schema_error: compact tool call must be an object"
+                    )
+                tool_call = compact_call.get("tool_call")
+                if isinstance(tool_call, str):
+                    canonical_calls.append({
+                        "name": tool_call,
+                        "arguments": {
+                            key: value for key, value in compact_call.items()
+                            if key != "tool_call"
+                        },
+                    })
+                elif (isinstance(compact_call.get("name"), str)
+                      and "arguments" not in compact_call
+                      and "args" not in compact_call
+                      and "tool_call" not in compact_call):
+                    canonical_calls.append({
+                        "name": compact_call["name"],
+                        "arguments": {
+                            key: value for key, value in compact_call.items()
+                            if key != "name"
+                        },
+                    })
+                elif (isinstance(tool_call, dict)
+                      and isinstance(expected_tool_name, str)
+                      and set(compact_call) == {"tool_call"}):
+                    nested_name = tool_call.get(
+                        "name", expected_tool_name
+                    )
+                    if "arguments" in tool_call:
+                        if set(tool_call) != {"name", "arguments"}:
+                            raise ValueError(
+                                "schema_error: nested tool_call with arguments "
+                                "must contain only name and arguments"
+                            )
+                        nested_arguments = tool_call["arguments"]
+                    else:
+                        nested_arguments = {
+                            key: value for key, value in tool_call.items()
+                            if key != "name"
+                        }
+                    canonical_calls.append({
+                        "name": nested_name,
+                        "arguments": nested_arguments,
+                    })
+                else:
+                    raise ValueError(
+                        "schema_error: compact tool call must name the tool "
+                        "or contain stage-local arguments"
+                    )
+            payload = {"tool_calls": canonical_calls}
+        elif (isinstance(payload, dict)
+              and isinstance(payload.get("tool_call"), str)):
+            payload = {
+                "tool_calls": [{
+                    "name": payload["tool_call"],
+                    "arguments": {
+                        key: value for key, value in payload.items()
+                        if key != "tool_call"
+                    },
+                }]
+            }
+        elif (isinstance(payload, dict)
+              and isinstance(payload.get("tool_call"), dict)
+              and isinstance(expected_tool_name, str)
+              and set(payload) == {"tool_call"}):
+            nested_tool_call = payload["tool_call"]
+            nested_name = nested_tool_call.get(
+                "name", expected_tool_name
+            )
+            if "arguments" in nested_tool_call:
+                if set(nested_tool_call) != {"name", "arguments"}:
+                    raise ValueError(
+                        "schema_error: nested tool_call with arguments must "
+                        "contain only name and arguments"
+                    )
+                nested_arguments = nested_tool_call["arguments"]
+            else:
+                nested_arguments = {
+                    key: value for key, value in nested_tool_call.items()
+                    if key != "name"
+                }
+            payload = {
+                "tool_calls": [{
+                    "name": nested_name,
+                    "arguments": nested_arguments,
+                }]
+            }
+        if not isinstance(payload, dict):
+            raise ValueError("schema_error: top level must be an object")
+        # Qwen may place the stage name beside an empty ``tool_calls`` list,
+        # while keeping the complete stage arguments under that name.  This
+        # exact, unambiguous wrapper is safe to canonicalize: the strict stage
+        # validator below still checks every field, value, and required item.
+        if (isinstance(expected_tool_name, str)
+                and set(payload) == {"tool_calls", expected_tool_name}
+                and payload["tool_calls"] == []
+                and isinstance(payload[expected_tool_name], dict)):
+            payload = {
+                "tool_calls": [{
+                    "name": expected_tool_name,
+                    "arguments": payload[expected_tool_name],
+                }]
+            }
+        calls = payload.get("tool_calls")
+        if isinstance(calls, list):
+            normalized_calls = []
+            for call in calls:
+                if (isinstance(call, dict)
+                        and set(call) == {"name", "args"}):
+                    normalized_calls.append({
+                        "name": call["name"],
+                        "arguments": call["args"],
+                    })
+                elif (isinstance(call, dict)
+                      and isinstance(call.get("name"), str)
+                      and "arguments" not in call
+                      and "args" not in call
+                      and "tool_call" not in call):
+                    # Equivalent Qwen form inside an explicit tool_calls list:
+                    # {"name": tool, ...flat stage arguments...}.
+                    normalized_calls.append({
+                        "name": call["name"],
+                        "arguments": {
+                            key: value for key, value in call.items()
+                            if key != "name"
+                        },
+                    })
+                elif (isinstance(call, dict)
+                      and isinstance(expected_tool_name, str)
+                      and not ({"name", "arguments", "args", "tool_call"}
+                               & set(call))):
+                    # A stage-local call may omit both wrappers, e.g.
+                    # {"tool_calls": [{"assignments": ..., "diversity":
+                    # true}]}.  The active stage supplies only the tool name;
+                    # its validator still enforces the exact argument schema.
+                    normalized_calls.append({
+                        "name": expected_tool_name,
+                        "arguments": call,
+                    })
+                else:
+                    normalized_calls.append(call)
+            payload = dict(payload)
+            payload["tool_calls"] = normalized_calls
+        return payload
+
+    def _call_json_stage(self, stage_name, prompt, validator, max_tokens):
+        """Call one tool stage, allowing exactly one schema repair."""
+        errors = []
+        responses = []
+
+        response = self.brain.call(prompt, max_tokens=max_tokens)
+        responses.append(response)
+        try:
+            return validator(
+                self._load_json(response, expected_tool_name=stage_name)
+            ), "valid", errors, responses
+        except ValueError as first_error:
+            errors.append(f"{stage_name}: {first_error}")
+
+        repair_prompt = (
+            f"The previous {stage_name} tool call was invalid. Re-run the "
+            "same tool stage from its original stage context and return one "
+            "complete corrected JSON replacement. The replacement must cover "
+            "EVERY required current room or robot from ORIGINAL_TOOL_TASK; it "
+            "must not contain only the missing item(s). Return pure JSON and "
+            "do not explain the repair. For assign_frontiers, copy each "
+            "room_id/frontier_id pair intact from VALID_ROOM_FRONTIER_PAIRS "
+            "in ORIGINAL_TOOL_TASK; never combine values from different "
+            "pairs. For estimate_room_probability, every evidence_id must "
+            "come from that SAME room's allowed_evidence_ids in "
+            "REQUIRED_CALL_IDENTITIES. Delete every ID named as unknown by "
+            "VALIDATION_ERROR; an empty evidence_ids list is valid when no "
+            "grounded ID is needed.\n\n"
+            f"VALIDATION_ERROR:\n{errors[-1]}\n\n"
+            f"INVALID_RESPONSE:\n{response}\n\n"
+            f"ORIGINAL_TOOL_TASK:\n{prompt}"
+        )
+        repaired_response = self.brain.call(
+            repair_prompt,
+            max_tokens=max_tokens,
+        )
+        responses.append(repaired_response)
+        try:
+            result = validator(self._load_json(
+                repaired_response,
+                expected_tool_name=stage_name,
+            ))
+            return result, "repaired", errors, responses
+        except ValueError as repair_error:
+            errors.append(f"{stage_name}: {repair_error}")
+            return None, "invalid_after_repair", errors, responses
+
+    @staticmethod
+    def _frontier_options(current_frontiers, pose_pred, num_agents):
+        robot_positions = {
+            f"robot_{robot_index}": (
+                CurrentFrontierView.robot_pose_to_map_rc(
+                    pose_pred[robot_index]
+                ) if robot_index < len(pose_pred) else None
+            )
+            for robot_index in range(num_agents)
+        }
+        options = []
+        for frontier_id in sorted(current_frontiers.frontiers):
+            frontier = current_frontiers.frontiers[frontier_id]
+            distances = {}
+            for robot_id, position in robot_positions.items():
+                distances[robot_id] = (
+                    round(float(np.hypot(
+                        frontier.centroid[0] - position[0],
+                        frontier.centroid[1] - position[1],
+                    )), 1)
+                    if position is not None else None
+                )
+            options.append({
+                "frontier_id": int(frontier.idx),
+                "room_id": frontier.room_id,
+                "centroid_rc": [
+                    round(float(frontier.centroid[0]), 1),
+                    round(float(frontier.centroid[1]), 1),
+                ],
+                "area_px": round(float(frontier.area), 1),
+                "distance_by_robot_px": distances,
+            })
+        return options
+
+    @staticmethod
+    def _query_room_objects(kg, current_frontiers, room_ids):
+        """Execute query_room_objects against the live persistent KG."""
+        results = []
+        allowed_evidence = {}
+        for room_id in room_ids:
+            room = kg.nodes.get(room_id)
+            objects = sorted(
+                kg.get_objects_in_room(room_id),
+                key=lambda obj: (-float(obj.certainty), obj.id),
+            )
+            object_records = [{
+                "evidence_id": obj.id,
+                "category": obj.name,
+                "certainty": round(float(obj.certainty), 3),
+                "position_rc": [
+                    round(float(obj.position[0]), 1),
+                    round(float(obj.position[1]), 1),
+                ],
+                "observation_count": int(
+                    obj.properties.get("observation_count", 1)
+                ),
+            } for obj in objects]
+
+            evidence_ids = {room_id}
+            evidence_ids.update(obj.id for obj in objects)
+
+            frontier_ids = list(
+                current_frontiers.room_to_frontiers.get(room_id, ())
+            )
+            results.append({
+                "room_id": room_id,
+                "observed_type": (
+                    room.name if room is not None else "unknown"
+                ),
+                "type_certainty": round(
+                    float(room.certainty if room is not None else 0.0), 3
+                ),
+                "explored": bool(
+                    room is not None
+                    and room.properties.get("explored", False)
+                ),
+                "observation_count": int(
+                    room.properties.get("observation_count", 0)
+                    if room is not None else 0
+                ),
+                "objects": object_records,
+                "current_frontier_ids": frontier_ids,
+                "allowed_evidence_ids": sorted(evidence_ids),
+            })
+            allowed_evidence[room_id] = evidence_ids
+        return results, allowed_evidence
+
+    @staticmethod
+    def _kg_history_snapshot(kg):
+        """Capture stable evidence identifiers for progress accounting."""
+        objects_by_room = {}
+        room_observation_counts = {}
+        for room in kg.get_nodes_by_type("room"):
+            objects_by_room[room.id] = {
+                obj.id for obj in kg.get_objects_in_room(room.id)
+            }
+            room_observation_counts[room.id] = int(
+                room.properties.get("observation_count", 0)
+            )
+        return {
+            "objects_by_room": objects_by_room,
+            "room_observation_counts": room_observation_counts,
+        }
+
+    def _prepare_recent_history(self, kg, step):
+        """Finalize prior-decision progress and return JSON-safe history."""
+        step = int(step)
+        kg_generation = int(getattr(kg, "reset_generation", 0))
+        new_episode = (
+            bool(self._recent_assignment_history)
+            and (
+                self._history_kg_generation != kg_generation
+                or (
+                    self._history_last_step is not None
+                    and (step < self._history_last_step or step == 0)
+                )
+            )
+        )
+        if new_episode:
+            self._recent_assignment_history = []
+            self._history_snapshot = None
+            self._history_last_step = None
+
+        self._history_kg_generation = kg_generation
+        current_snapshot = self._kg_history_snapshot(kg)
+        if (self._history_snapshot is not None
+                and self._recent_assignment_history
+                and step != self._recent_assignment_history[-1]["step"]):
+            prior_snapshot = self._history_snapshot
+            prior_record = self._recent_assignment_history[-1]
+            selected_rooms = {
+                assignment["room_id"]
+                for assignment in prior_record["robots"].values()
+            }
+            new_objects = {}
+            observation_deltas = {}
+            evidence_by_room = {}
+            for room_id in sorted(selected_rooms):
+                current_objects = current_snapshot["objects_by_room"].get(
+                    room_id, set()
+                )
+                prior_objects = prior_snapshot["objects_by_room"].get(
+                    room_id, set()
+                )
+                added = sorted(current_objects - prior_objects)
+                if added:
+                    new_objects[room_id] = added
+
+                delta = max(
+                    0,
+                    current_snapshot["room_observation_counts"].get(
+                        room_id, 0
+                    ) - prior_snapshot["room_observation_counts"].get(
+                        room_id, 0
+                    ),
+                )
+                if delta:
+                    observation_deltas[room_id] = int(delta)
+                evidence_by_room[room_id] = bool(added or delta)
+
+            prior_record["new_object_ids_by_room"] = new_objects
+            prior_record["room_observation_count_delta"] = observation_deltas
+            prior_record["new_room_evidence_by_room"] = evidence_by_room
+            prior_record["new_room_evidence"] = any(
+                evidence_by_room.values()
+            )
+            prior_record["progress_evaluated_at_step"] = step
+
+        self._history_snapshot = current_snapshot
+        return copy.deepcopy(self._recent_assignment_history[-4:])
+
+    def _record_assignment_history(self, current_frontiers, assignments,
+                                   step):
+        """Store stable room/centroid assignments, never transient IDs."""
+        robots = {}
+        for robot_id, frontier_id in sorted(assignments.items()):
+            frontier = current_frontiers.frontiers[frontier_id]
+            robots[robot_id] = {
+                "room_id": frontier.room_id,
+                "frontier_centroid_rc": [
+                    round(float(frontier.centroid[0]), 1),
+                    round(float(frontier.centroid[1]), 1),
+                ],
+            }
+        record = {
+            "step": int(step),
+            "robots": robots,
+            "new_object_ids_by_room": {},
+            "room_observation_count_delta": {},
+            "new_room_evidence_by_room": {},
+            "new_room_evidence": None,
+        }
+        if (self._recent_assignment_history
+                and self._recent_assignment_history[-1]["step"] == int(step)):
+            self._recent_assignment_history[-1] = record
+        else:
+            self._recent_assignment_history.append(record)
+        self._recent_assignment_history = self._recent_assignment_history[-4:]
+        self._history_last_step = int(step)
+
+    @staticmethod
+    def _room_history_summary(current_room_ids, recent_history):
+        summaries = {}
+        for room_id in current_room_ids:
+            recent_count = 0
+            last_by_robot = {}
+            for record in recent_history:
+                for robot_id, assignment in record["robots"].items():
+                    if assignment["room_id"] == room_id:
+                        recent_count += 1
+                        last_by_robot[robot_id] = int(record["step"])
+
+            no_evidence_streak = 0
+            for record in reversed(recent_history):
+                assigned_here = any(
+                    assignment["room_id"] == room_id
+                    for assignment in record["robots"].values()
+                )
+                if not assigned_here:
+                    break
+                evidence = record.get(
+                    "new_room_evidence_by_room", {}
+                ).get(room_id)
+                if evidence is False:
+                    no_evidence_streak += 1
+                else:
+                    break
+
+            summaries[room_id] = {
+                "recent_assignment_count": int(recent_count),
+                "consecutive_assignments_without_new_evidence": int(
+                    no_evidence_streak
+                ),
+                "last_assigned_step_by_robot": last_by_robot,
+            }
+        return summaries
+
+    def _build_current_decision_packet(
+            self, query_results, probability_records, frontier_options,
+            pose_pred, current_room_ids, recent_history):
+        """Build the current-only KG projection used for final allocation."""
+        query_by_room = {
+            record["room_id"]: record for record in query_results
+        }
+        frontiers_by_room = {room_id: [] for room_id in current_room_ids}
+        for option in frontier_options:
+            room_id = option["room_id"]
+            frontiers_by_room.setdefault(room_id, []).append({
+                key: value for key, value in option.items()
+                if key != "room_id"
+            })
+
+        history_summary = self._room_history_summary(
+            current_room_ids, recent_history
+        )
+        current_rooms = {}
+        for room_id in current_room_ids:
+            query = query_by_room[room_id]
+            probability = probability_records[room_id]
+            object_ids = {
+                obj["evidence_id"] for obj in query["objects"]
+            }
+            current_rooms[room_id] = {
+                "observed_type": query["observed_type"],
+                "type_certainty": query["type_certainty"],
+                "target_probability": probability["probability"],
+                "probability_confidence": probability["confidence"],
+                "object_evidence_ids": [
+                    evidence_id
+                    for evidence_id in probability["evidence_ids"]
+                    if evidence_id in object_ids
+                ],
+                "probability_reason": probability["reason"],
+                "objects": [{
+                    "id": obj["evidence_id"],
+                    "name": obj["category"],
+                    "certainty": obj["certainty"],
+                    "position_rc": obj["position_rc"],
+                    "observation_count": obj["observation_count"],
+                } for obj in query["objects"]],
+                "explored": query["explored"],
+                "observation_count": query["observation_count"],
+                "recent_history_summary": history_summary[room_id],
+                "frontiers": sorted(
+                    frontiers_by_room.get(room_id, []),
+                    key=lambda option: option["frontier_id"],
+                ),
+            }
+
+        robot_states = {}
+        for robot_index in range(self.num_agents):
+            robot_id = f"robot_{robot_index}"
+            position = (
+                CurrentFrontierView.robot_pose_to_map_rc(
+                    pose_pred[robot_index]
+                ) if robot_index < len(pose_pred) else None
+            )
+            robot_states[robot_id] = {
+                "position_rc": (
+                    [round(float(position[0]), 1),
+                     round(float(position[1]), 1)]
+                    if position is not None else None
+                )
+            }
+
+        return {
+            "robots": robot_states,
+            "current_rooms": current_rooms,
+            "recent_assignments": recent_history,
+            "constraints": {
+                "distinct_rooms_required": (
+                    len(current_room_ids) >= self.num_agents
+                ),
+                "distinct_frontiers_required": (
+                    sum(len(room["frontiers"])
+                        for room in current_rooms.values())
+                    >= self.num_agents
+                ),
+                "valid_room_frontier_pairs": [
+                    {
+                        "room_id": option["room_id"],
+                        "frontier_id": option["frontier_id"],
+                    }
+                    for option in sorted(
+                        frontier_options,
+                        key=lambda item: item["frontier_id"],
+                    )
+                ],
+            },
+        }, history_summary
+
+    @staticmethod
+    def _validate_probability_calls(payload, expected_room_ids, target_name,
+                                    allowed_evidence):
+        if set(payload) != {"tool_calls"}:
+            raise ValueError("top level must contain only tool_calls")
+        calls = payload["tool_calls"]
+        if not isinstance(calls, list):
+            raise ValueError("tool_calls must be a list")
+
+        records = {}
+        required_arguments = {
+            "room_id",
+            "target",
+            "probability",
+            "confidence",
+            "evidence_ids",
+            "reason",
+        }
+        for call in calls:
+            if (not isinstance(call, dict)
+                    or set(call) != {"name", "arguments"}
+                    or call.get("name") != "estimate_room_probability"):
+                raise ValueError(
+                    "every call must be estimate_room_probability"
+                )
+            arguments = call["arguments"]
+            if (not isinstance(arguments, dict)
+                    or set(arguments) != required_arguments):
+                raise ValueError(
+                    "estimate_room_probability arguments have wrong schema"
+                )
+            room_id = arguments["room_id"]
+            if not isinstance(room_id, str):
+                raise ValueError("probability room_id must be a string")
+            if room_id in records:
+                raise ValueError(f"duplicate probability room_id: {room_id}")
+            if arguments["target"] != target_name:
+                raise ValueError(
+                    f"probability target must be exactly {target_name}"
+                )
+
+            for field_name in ("probability", "confidence"):
+                value = arguments[field_name]
+                if (isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or not 0.0 <= float(value) <= 1.0):
+                    raise ValueError(
+                        f"invalid {field_name} for room {room_id}"
+                    )
+            evidence_ids = arguments["evidence_ids"]
+            if (not isinstance(evidence_ids, list)
+                    or any(not isinstance(item, str) for item in evidence_ids)
+                    or len(evidence_ids) != len(set(evidence_ids))):
+                raise ValueError(
+                    f"invalid evidence_ids for room {room_id}"
+                )
+            unknown_evidence = sorted(
+                set(evidence_ids) - set(allowed_evidence.get(room_id, ()))
+            )
+            if unknown_evidence:
+                raise ValueError(
+                    f"unknown evidence for room {room_id}: "
+                    f"{unknown_evidence}; allowed evidence is "
+                    f"{sorted(allowed_evidence.get(room_id, ()))}"
+                )
+            if (not isinstance(arguments["reason"], str)
+                    or not arguments["reason"].strip()):
+                raise ValueError(f"missing reason for room {room_id}")
+
+            records[room_id] = {
+                "probability": float(arguments["probability"]),
+                "confidence": float(arguments["confidence"]),
+                "evidence_ids": list(evidence_ids),
+                "reason": arguments["reason"].strip(),
+            }
+
+        expected = set(expected_room_ids)
+        if set(records) != expected:
+            raise ValueError(
+                "probability coverage mismatch: "
+                f"missing={sorted(expected - set(records))}, "
+                f"extra={sorted(set(records) - expected)}"
+            )
+        return records
+
+    def _validate_assignment_calls(self, payload, current_frontiers):
+        if set(payload) != {"tool_calls"}:
+            raise ValueError("top level must contain only tool_calls")
+        calls = payload["tool_calls"]
+        if not isinstance(calls, list) or len(calls) != 1:
+            raise ValueError("assign_frontiers requires exactly one tool call")
+        call = calls[0]
+        if (not isinstance(call, dict)
+                or set(call) != {"name", "arguments"}
+                or call.get("name") != "assign_frontiers"):
+            raise ValueError("final call must be assign_frontiers")
+        arguments = call["arguments"]
+        if (not isinstance(arguments, dict)
+                or set(arguments) != {"assignments", "diversity"}
+                or arguments.get("diversity") is not True):
+            raise ValueError(
+                "assign_frontiers arguments require assignments and "
+                "diversity=true"
+            )
+        assignments_payload = arguments["assignments"]
+        expected_robots = {
+            f"robot_{robot_index}" for robot_index in range(self.num_agents)
+        }
+        if (not isinstance(assignments_payload, dict)
+                or set(assignments_payload) != expected_robots):
+            raise ValueError(
+                f"assignments must cover exactly {sorted(expected_robots)}"
+            )
+
+        assignments = {}
+        rooms = {}
+        reasons = {}
+        for robot_id, assignment in assignments_payload.items():
+            expected_assignment_fields = {
+                "frontier_id", "room_id", "reason"
+            }
+            if not isinstance(assignment, dict):
+                raise ValueError(
+                    f"assignment for {robot_id} must be an object"
+                )
+            actual_assignment_fields = set(assignment)
+            if actual_assignment_fields != expected_assignment_fields:
+                raise ValueError(
+                    f"invalid assignment schema for {robot_id}: expected "
+                    f"only {sorted(expected_assignment_fields)}, missing="
+                    f"{sorted(expected_assignment_fields - actual_assignment_fields)}, "
+                    f"extra={sorted(actual_assignment_fields - expected_assignment_fields)}"
+                )
+            frontier_id = assignment["frontier_id"]
+            if (isinstance(frontier_id, bool)
+                    or not isinstance(frontier_id, int)
+                    or frontier_id not in current_frontiers.frontiers):
+                raise ValueError(
+                    f"non-current frontier for {robot_id}: {frontier_id}"
+                )
+            expected_room = current_frontiers.frontiers[frontier_id].room_id
+            if assignment["room_id"] != expected_room:
+                raise ValueError(
+                    f"room/frontier mismatch for {robot_id}: expected "
+                    f"{expected_room}, got {assignment['room_id']}"
+                )
+            if (not isinstance(assignment["reason"], str)
+                    or not assignment["reason"].strip()):
+                raise ValueError(f"missing assignment reason for {robot_id}")
+            assignments[robot_id] = frontier_id
+            rooms[robot_id] = expected_room
+            reasons[robot_id] = assignment["reason"].strip()
+
+        if (len(current_frontiers.frontiers) >= self.num_agents
+                and len(set(assignments.values())) != self.num_agents):
+            raise ValueError(
+                "duplicate frontiers despite enough current candidates"
+            )
+        if (len(current_frontiers.room_ids) >= self.num_agents
+                and len(set(rooms.values())) != self.num_agents):
+            raise ValueError(
+                "duplicate rooms despite enough current room choices"
+            )
+        return assignments, rooms, reasons
+
+    def _fallback_assignments(self, current_frontiers, pose_pred,
+                              probability_records=None):
+        """Room-first current-only fallback with lexicographic ranking."""
+        if not current_frontiers.frontiers:
+            return {}
+        probability_records = probability_records or {}
+        use_probabilities = bool(probability_records)
+        frontier_ids = sorted(current_frontiers.frontiers)
+        require_distinct_frontiers = (
+            len(frontier_ids) >= self.num_agents
+        )
+        require_distinct_rooms = (
+            len(current_frontiers.room_ids) >= self.num_agents
+        )
+        robot_positions = []
+        for robot_index in range(self.num_agents):
+            raw_position = (
+                pose_pred[robot_index]
+                if robot_index < len(pose_pred) else None
+            )
+            robot_positions.append(
+                CurrentFrontierView.robot_pose_to_map_rc(raw_position)
+            )
+
+        feasible = []
+        for selected_ids in itertools.product(
+                frontier_ids, repeat=self.num_agents):
+            if (require_distinct_frontiers
+                    and len(set(selected_ids)) != self.num_agents):
+                continue
+            selected_rooms = [
+                current_frontiers.frontiers[frontier_id].room_id
+                for frontier_id in selected_ids
+            ]
+            if (require_distinct_rooms
+                    and len(set(selected_rooms)) != self.num_agents):
+                continue
+
+            probability_sum = sum(
+                float(probability_records.get(room_id, {}).get(
+                    "probability", 0.0
+                ))
+                for room_id in selected_rooms
+            )
+            distance_sum = 0.0
+            area_sum = 0.0
+            for robot_index, frontier_id in enumerate(selected_ids):
+                frontier = current_frontiers.frontiers[frontier_id]
+                position = robot_positions[robot_index]
+                if position is not None:
+                    distance_sum += float(np.hypot(
+                        frontier.centroid[0] - position[0],
+                        frontier.centroid[1] - position[1],
+                    ))
+                area_sum += float(frontier.area)
+            rank = (
+                -probability_sum if use_probabilities else 0.0,
+                distance_sum,
+                -area_sum,
+                tuple(int(frontier_id) for frontier_id in selected_ids),
+            )
+            feasible.append((rank, selected_ids))
+
+        if not feasible:
+            return {}
+        _, selected_ids = min(feasible, key=lambda item: item[0])
+        return {
+            f"robot_{robot_index}": int(frontier_id)
+            for robot_index, frontier_id in enumerate(selected_ids)
+        }
+
+    def _store_audit(self, current_frontiers, assignments,
+                     probability_records, assigned_rooms,
+                     assignment_reasons, selection_source, output_status,
+                     stage_statuses, validation_errors=None,
+                     fallback_reason=None, tool_trace=None,
+                     llm_call_count=0, recent_history=None,
+                     room_history_summary=None):
+        selected_rooms = {
+            robot_id: current_frontiers.frontiers[frontier_id].room_id
+            for robot_id, frontier_id in assignments.items()
+        }
+        probabilities = {
+            room_id: record["probability"]
+            for room_id, record in probability_records.items()
+        }
+        probability_values = list(probabilities.values())
+        probability_spread = (
+            max(probability_values) - min(probability_values)
+            if probability_values else 0.0
+        )
+        fallback = selection_source != "llm_tool_assignment"
+        room_diversity_required = (
+            len(current_frontiers.room_ids) >= self.num_agents
+        )
+        selected_room_values = list(selected_rooms.values())
+
+        frontier_details = {}
+        for frontier_id, frontier in current_frontiers.frontiers.items():
+            record = probability_records.get(frontier.room_id, {})
+            selected_by = sorted(
+                robot_id
+                for robot_id, selected_id in assignments.items()
+                if selected_id == frontier_id
+            )
+            frontier_details[str(frontier_id)] = {
+                "room_id": frontier.room_id,
+                "llm_room_probability": record.get("probability"),
+                "llm_confidence": record.get("confidence"),
+                "selected_by": selected_by,
+            }
+
+        self.last_decision_audit = {
+            "allowed_room_ids": sorted(current_frontiers.room_ids),
+            "allowed_frontier_ids": sorted(current_frontiers.frontiers),
+            "raw_room_probabilities": dict(probabilities),
+            "accepted_room_probabilities": dict(probabilities),
+            "raw_room_assignments": dict(assigned_rooms),
+            "accepted_llm_rooms": (
+                dict(assigned_rooms) if not fallback else {}
+            ),
+            "selected_room_by_robot": selected_rooms,
+            "selection_source_by_robot": {
+                robot_id: selection_source for robot_id in assignments
+            },
+            "rejected_room_ids": [],
+            "fallback_robots": sorted(assignments) if fallback else [],
+            "final_frontier_assignments": dict(assignments),
+            "llm_output_status": output_status,
+            "fallback_reason": fallback_reason,
+            "validation_errors": list(validation_errors or []),
+            "tool_status": dict(stage_statuses),
+            "tool_trace": list(tool_trace or []),
+            "probability_evidence_by_room": {
+                room_id: record.get("evidence_ids", [])
+                for room_id, record in probability_records.items()
+            },
+            "probability_reason_by_room": {
+                room_id: record.get("reason", "")
+                for room_id, record in probability_records.items()
+            },
+            "assignment_reason_by_robot": dict(assignment_reasons),
+            "llm_probability_spread": round(float(probability_spread), 6),
+            "llm_probability_non_degenerate": bool(
+                len(probability_values) <= 1 or probability_spread > 1e-6
+            ),
+            "llm_effective": bool(not fallback and assignments),
+            "frontier_score_details": frontier_details,
+            "llm_call_count": int(llm_call_count),
+            "room_diversity_required": room_diversity_required,
+            "room_diversity_achieved": bool(
+                len(selected_room_values) <= 1
+                or len(set(selected_room_values)) == len(
+                    selected_room_values
+                )
+            ),
+            "recent_assignment_history": list(recent_history or []),
+            "room_history_summary": dict(room_history_summary or {}),
+        }
+
+    def _finish_fallback(self, current_frontiers, pose_pred,
+                         probability_records, stage_statuses,
+                         validation_errors, fallback_reason, tool_trace,
+                         tools_called, step=None, llm_call_count=0,
+                         recent_history=None, room_history_summary=None):
+        assignments = self._fallback_assignments(
+            current_frontiers,
+            pose_pred,
+            probability_records,
+        )
+        source = (
+            "llm_probability_fallback"
+            if probability_records else "geometry_fallback"
+        )
+        selected_rooms = {
+            robot_id: current_frontiers.frontiers[frontier_id].room_id
+            for robot_id, frontier_id in assignments.items()
+        }
+        reasons = {
+            robot_id: fallback_reason for robot_id in assignments
+        }
+        self._store_audit(
+            current_frontiers,
+            assignments,
+            probability_records,
+            selected_rooms,
+            reasons,
+            source,
+            "invalid_after_repair",
+            stage_statuses,
+            validation_errors=validation_errors,
+            fallback_reason=fallback_reason,
+            tool_trace=tool_trace,
+            llm_call_count=llm_call_count,
+            recent_history=recent_history,
+            room_history_summary=room_history_summary,
+        )
+        if step is not None:
+            self._record_assignment_history(
+                current_frontiers, assignments, step
+            )
+        return (
+            assignments,
+            list(tools_called) + ["current_frontier_fallback"],
+            f"helicase_fallback({fallback_reason})",
+        )
 
     def decide(self, kg: KnowledgeGraph, target_name: str,
                enriched_frontiers, pose_pred, step: int, max_steps: int,
-               decision_history: list) -> Tuple[Dict, List[str], str]:
-        """
-        Main decision loop:
-        1. Find uncertain nodes
-        2. Brain reasons which to resolve
-        3. Brain selects tools per uncertain node
-        4. Assign robots
+               decision_history: list,
+               current_frontiers: Optional[CurrentFrontierView] = None
+               ) -> Tuple[Dict, List[str], str]:
+        """Run two LLM stages and return a validated room-first assignment."""
+        _ = decision_history  # Stable history is maintained internally.
+        if current_frontiers is None:
+            current_frontiers = CurrentFrontierView.from_enriched(
+                enriched_frontiers
+            )
+        if not current_frontiers.frontiers:
+            self.last_decision_audit = {
+                "allowed_room_ids": [],
+                "allowed_frontier_ids": [],
+                "raw_room_probabilities": {},
+                "accepted_room_probabilities": {},
+                "raw_room_assignments": {},
+                "accepted_llm_rooms": {},
+                "selected_room_by_robot": {},
+                "selection_source_by_robot": {},
+                "rejected_room_ids": [],
+                "fallback_robots": [],
+                "final_frontier_assignments": {},
+                "llm_output_status": "no_current_frontiers",
+                "tool_status": {},
+                "llm_call_count": 0,
+            }
+            return {}, ["no_current_frontiers"], "helicase_no_frontiers"
 
-        Returns: (goal_frontiers, tools_called, method_name)
-        """
+        kg_text = kg.to_text(current_frontier_view=current_frontiers)
+        current_room_ids = sorted(current_frontiers.room_ids)
+        frontier_options = self._frontier_options(
+            current_frontiers,
+            pose_pred,
+            self.num_agents,
+        )
+        recent_history = self._prepare_recent_history(kg, step)
+        room_history_summary = self._room_history_summary(
+            current_room_ids, recent_history
+        )
+        validation_errors = []
+        stage_statuses = {"query_room_objects": "executed"}
+        tools_called = ["query_room_objects"]
+        llm_call_count = 0
 
-        # Get KG state as text
-        kg_text = kg.to_text()
+        query_results, allowed_evidence = self._query_room_objects(
+            kg,
+            current_frontiers,
+            current_room_ids,
+        )
+        tool_trace = [{
+            "tool": "query_room_objects",
+            "status": "executed",
+            "result": query_results,
+        }]
 
-        # Get uncertain nodes
-        uncertain = kg.get_uncertain_nodes(0.5)
-        uncertain_text = "\n".join([
-            f"  {u.id}: type={u.name}, certainty={u.certainty:.1f}, pos=({u.position[0]:.0f},{u.position[1]:.0f})"
-            for u in uncertain[:8]
-        ])
+        probability_call_identities = [{
+            "name": "estimate_room_probability",
+            "room_id": room_id,
+            "target": target_name,
+            "allowed_evidence_ids": sorted(allowed_evidence[room_id]),
+        } for room_id in current_room_ids]
+        probability_prompt = (
+            "You are the central MindNav KG reasoning LLM. This is LLM CALL "
+            "1/2 for the current planning decision. Read the complete "
+            "serialized KG and deterministic room-object query results. For "
+            "every current room, call estimate_room_probability exactly once. "
+            "Estimate your own P(target|room) using observed room type, object "
+            "identity and certainty, exploration evidence, and your parametric "
+            "world knowledge. probability means target presence likelihood; "
+            "confidence means evidence reliability. Independent room "
+            "probabilities need not sum to one. Do not use a Python target "
+            "prior; none is provided. Return pure JSON with only tool_calls. "
+            "Each call arguments must contain exactly room_id, target, "
+            "probability, confidence, evidence_ids, reason. Copy evidence_ids "
+            "only from that room's allowed list. These citations are stable "
+            "room/object node IDs; never cite relation labels or frontier "
+            "IDs. You may use the complete KG for reasoning even when a fact "
+            "is not cited as an evidence_id.\n\n"
+            f"TARGET: {target_name}\n"
+            f"STEP: {int(step)}/{int(max_steps)}\n"
+            f"CURRENT_ROOM_IDS: {json.dumps(current_room_ids)}\n"
+            "REQUIRED_CALL_IDENTITIES: Output exactly one complete call for "
+            "each entry below, in this order. Preserve its name, room_id and "
+            "target. Choose probability, confidence, evidence_ids and reason "
+            "yourself; evidence_ids must be a subset of that entry's allowed "
+            "list.\n"
+            f"{json.dumps(probability_call_identities, ensure_ascii=False)}\n\n"
+            f"SERIALIZED_KG:\n{kg_text}\n\n"
+            f"QUERY_ROOM_OBJECTS_RESULTS:\n"
+            f"{json.dumps(query_results, ensure_ascii=False)}"
+        )
+        probability_records, probability_status, errors, responses = (
+            self._call_json_stage(
+                "estimate_room_probability",
+                probability_prompt,
+                lambda payload: self._validate_probability_calls(
+                    payload,
+                    current_room_ids,
+                    target_name,
+                    allowed_evidence,
+                ),
+                max_tokens=1200,
+            )
+        )
+        llm_call_count += len(responses)
+        stage_statuses["estimate_room_probability"] = probability_status
+        validation_errors.extend(errors)
+        tool_trace.append({
+            "tool": "estimate_room_probability",
+            "status": probability_status,
+            "raw_response": responses[-1][:6000],
+        })
+        if probability_records is None:
+            return self._finish_fallback(
+                current_frontiers,
+                pose_pred,
+                {},
+                stage_statuses,
+                validation_errors,
+                "invalid_estimate_room_probability",
+                tool_trace,
+                tools_called,
+                step=step,
+                llm_call_count=llm_call_count,
+                recent_history=recent_history,
+                room_history_summary=room_history_summary,
+            )
 
-        # History
-        steps_left = max_steps - step
-        history_text = ""
-        if decision_history:
-            history_text = "PAST DECISIONS:\n" + "\n".join([
-                f"  Step {d['step']}: robot_0→area_f{d['r0']}, robot_1→area_f{d['r1']}. Found: [{d.get('objects_found','')}]"
-                for d in decision_history[-5:]
-            ])
+        tools_called.append("estimate_room_probability")
+        probability_tool_result = [{
+            "room_id": room_id,
+            **probability_records[room_id],
+        } for room_id in current_room_ids]
+        tool_trace[-1]["result"] = probability_tool_result
 
-        # Memory
-        memory_text = ""
-        if self.reflexion_memory:
-            memory_text = "LESSONS: " + "; ".join(self.reflexion_memory[-3:])
+        decision_packet, room_history_summary = (
+            self._build_current_decision_packet(
+                query_results,
+                probability_records,
+                frontier_options,
+                pose_pred,
+                current_room_ids,
+                recent_history,
+            )
+        )
+        distinct_rooms_required = (
+            len(current_room_ids) >= self.num_agents
+        )
+        valid_room_frontier_pairs = decision_packet["constraints"][
+            "valid_room_frontier_pairs"
+        ]
+        assignment_prompt = (
+            "You are the central MindNav allocation LLM. This is LLM CALL "
+            "2/2. Use only the current decision packet below; it is the "
+            "task-relevant projection of the KG. Make the final joint "
+            "assignment yourself—Python will not rerank a valid answer.\n\n"
+            "Follow a strict room-first procedure: (A) compare current rooms "
+            "using target_probability, confidence, objects, exploration state "
+            "and recent progress; (B) choose one room per robot; (C) within "
+            "each chosen room select one of that room's frontier IDs using "
+            "robot distance and frontier area. Avoid repeatedly sending the "
+            "same robot to a room when recent assignments produced no new "
+            "object or room evidence and another current room is available. "
+            "Repetition is allowed when new evidence appeared, the room has "
+            "clearly stronger target likelihood, or no alternative exists.\n\n"
+            f"ROOM_DIVERSITY_REQUIRED: {str(distinct_rooms_required).lower()}. "
+            "When true, assigned room_id values MUST be distinct. When false, "
+            "robots may share the only available room but must use distinct "
+            "frontiers whenever enough frontier choices exist. Frontier IDs "
+            "must always belong to the stated room. The authoritative legal "
+            "pairs are listed in VALID_ROOM_FRONTIER_PAIRS below. Copy each "
+            "selected pair intact; NEVER combine a room_id from one entry "
+            "with a frontier_id from another entry.\n\n"
+            f"VALID_ROOM_FRONTIER_PAIRS: "
+            f"{json.dumps(valid_room_frontier_pairs)}\n\n"
+            "Return pure JSON with only tool_calls and exactly one "
+            "assign_frontiers call. Its arguments must be {assignments, "
+            "diversity}; diversity must be true. assignments must map every "
+            "robot ID to exactly {frontier_id, room_id, reason}. No extra "
+            "fields and no explanation outside JSON. The robot ID is already "
+            "the assignments map key; NEVER repeat robot_id inside its value. "
+            "Copy this exact wrapper "
+            "shape (replace only the argument values): "
+            '{"tool_calls":[{"name":"assign_frontiers","arguments":'
+            '{"assignments":{"robot_0":{"frontier_id":0,"room_id":'
+            '"room_ID","reason":"reason"},"robot_1":{"frontier_id":1,'
+            '"room_id":"room_ID","reason":"reason"}},"diversity":true}}]}'
+            " Do not add a top-level assign_frontiers field.\n\n"
+            f"TARGET: {target_name}\n"
+            f"STEP: {int(step)}/{int(max_steps)}\n"
+            f"CURRENT_DECISION_PACKET:\n"
+            f"{json.dumps(decision_packet, ensure_ascii=False)}"
+        )
+        assignment_result, assignment_status, errors, responses = (
+            self._call_json_stage(
+                "assign_frontiers",
+                assignment_prompt,
+                lambda payload: self._validate_assignment_calls(
+                    payload, current_frontiers
+                ),
+                max_tokens=750,
+            )
+        )
+        llm_call_count += len(responses)
+        stage_statuses["assign_frontiers"] = assignment_status
+        validation_errors.extend(errors)
+        tool_trace.append({
+            "tool": "assign_frontiers",
+            "status": assignment_status,
+            "raw_response": responses[-1][:5000],
+        })
+        if assignment_result is None:
+            return self._finish_fallback(
+                current_frontiers,
+                pose_pred,
+                probability_records,
+                stage_statuses,
+                validation_errors,
+                "invalid_assign_frontiers",
+                tool_trace,
+                tools_called,
+                step=step,
+                llm_call_count=llm_call_count,
+                recent_history=recent_history,
+                room_history_summary=room_history_summary,
+            )
 
-        # ── BRAIN: Estimate P(target|room) from KG, then assign robots ──
-        # Get unexplored rooms with frontier indices
-        unexplored = []
-        for n in kg.get_nodes_by_type("room"):
-            if not n.properties.get("explored") and 'frontier_idx' in n.properties:
-                unexplored.append(n)
-
-        if not unexplored:
-            return {}, ["no_unexplored"], "helicase_no_rooms"
-
-        unexplored_ids = [n.id for n in unexplored]
-
-        # Single brain call: read KG → estimate probabilities → assign robots
-        resp = self.brain.call(
-            f"TASK: Find '{target_name}' using {self.num_agents} robots.\n"
-            f"Step {step}/{max_steps}. Steps left: {steps_left}.\n\n"
-            f"KNOWLEDGE GRAPH:\n{kg_text}\n\n"
-            f"{history_text}\n"
-            f"{memory_text}\n\n"
-            f"For each unexplored room, estimate P({target_name} is there) from 0.0 to 1.0.\n"
-            f"Use the objects and spatial edges to reason:\n"
-            f"- What objects are in/near this room? What room type do they suggest?\n"
-            f"- What rooms are connected to it? (bedroom next to bathroom)\n"
-            f"- object ──next_to──> object means they're in same area\n\n"
-            f"Then assign robots:\n"
-            f"- robot_0 → highest P room\n"
-            f"- robot_1 → distant room with second highest P (maximize coverage)\n\n"
-            f"Output format:\n"
-            f"P({target_name}|<room_id>) = <0.0-1.0>\n"
-            f"...\n"
-            f"robot_0: <room_id>\n"
-            f"robot_1: <room_id>",
-            max_tokens=300
+        assignments, assigned_rooms, assignment_reasons = assignment_result
+        tools_called.append("assign_frontiers")
+        tool_trace[-1]["result"] = {
+            "assignments": assignments,
+            "rooms": assigned_rooms,
+            "diversity": True,
+        }
+        overall_status = (
+            "repaired"
+            if "repaired" in stage_statuses.values() else "valid"
+        )
+        self._store_audit(
+            current_frontiers,
+            assignments,
+            probability_records,
+            assigned_rooms,
+            assignment_reasons,
+            "llm_tool_assignment",
+            overall_status,
+            stage_statuses,
+            validation_errors=validation_errors,
+            tool_trace=tool_trace,
+            llm_call_count=llm_call_count,
+            recent_history=recent_history,
+            room_history_summary=room_history_summary,
+        )
+        self._record_assignment_history(
+            current_frontiers, assignments, step
         )
 
-        # Parse response — extract probabilities and robot assignments
-        import re
-        goal_frontiers = {}
+        probability_text = ",".join(
+            f"{room_id}={probability_records[room_id]['probability']:.2f}"
+            for room_id in sorted(
+                probability_records,
+                key=lambda room_id: (
+                    -probability_records[room_id]["probability"], room_id
+                ),
+            )
+        )
+        assignment_text = ",".join(
+            f"{robot_id}=f{assignments[robot_id]}"
+            for robot_id in sorted(assignments)
+        )
+        return (
+            assignments,
+            tools_called,
+            f"helicase_room_first({overall_status};P={probability_text};"
+            f"{assignment_text})",
+        )
 
-        # Build mapping: room_id → frontier_idx
-        room_to_frontier = {}
-        for n in kg.get_nodes_by_type("room"):
-            if 'frontier_idx' in n.properties:
-                room_to_frontier[n.id] = n.properties['frontier_idx']
-
-        # Extract P(target|room) estimates from brain response
-        probs = {}
-        for match in re.finditer(r'P\([^|]+\|(room_\d+_\d+)\)\s*=\s*([\d.]+)', resp):
-            room_id = match.group(1)
-            prob = float(match.group(2))
-            probs[room_id] = prob
-
-        # Extract robot assignments — try room_Y_X format
-        for match in re.finditer(r'robot_(\d+)\s*:\s*(room_\d+_\d+)', resp):
-            robot_id = f"robot_{match.group(1)}"
-            room_id = match.group(2)
-            if room_id in room_to_frontier:
-                goal_frontiers[robot_id] = room_to_frontier[room_id]
-
-        # Fallback: try area_Y_X format
-        if "robot_0" not in goal_frontiers:
-            for match in re.finditer(r'robot_(\d+)\s*:\s*(area_\d+_\d+)', resp):
-                room_id = match.group(2).replace("area_", "room_")
-                if room_id in room_to_frontier:
-                    goal_frontiers[f"robot_{match.group(1)}"] = room_to_frontier[room_id]
-
-        # Fallback: use brain's probability estimates to pick best rooms
-        if "robot_0" not in goal_frontiers and probs:
-            sorted_rooms = sorted(probs.items(), key=lambda x: -x[1])
-            if sorted_rooms:
-                best_room = sorted_rooms[0][0]
-                if best_room in room_to_frontier:
-                    goal_frontiers["robot_0"] = room_to_frontier[best_room]
-                if len(sorted_rooms) > 1:
-                    # Pick farthest high-prob room for robot_1
-                    best_pos = kg.nodes[best_room].position if best_room in kg.nodes else (0,0)
-                    best_dist = 0
-                    for room_id, prob in sorted_rooms[1:]:
-                        if room_id in kg.nodes and room_id in room_to_frontier:
-                            pos = kg.nodes[room_id].position
-                            d = np.sqrt((pos[0]-best_pos[0])**2 + (pos[1]-best_pos[1])**2)
-                            if d > best_dist:
-                                best_dist = d
-                                goal_frontiers["robot_1"] = room_to_frontier[room_id]
-
-        # Auto-assign robot_1 if missing
-        if "robot_0" in goal_frontiers and "robot_1" not in goal_frontiers:
-            r0_idx = goal_frontiers["robot_0"]
-            r0_pos = np.array(enriched_frontiers[min(r0_idx, len(enriched_frontiers)-1)]['centroid'])
-            best_dist = 0
-            best_idx = enriched_frontiers[0]['idx'] if enriched_frontiers else 0
-            for ef in enriched_frontiers:
-                d = np.linalg.norm(r0_pos - np.array(ef['centroid']))
-                if d > best_dist and ef['idx'] != r0_idx:
-                    best_dist = d
-                    best_idx = ef['idx']
-            goal_frontiers["robot_1"] = best_idx
-
-        # Final fallback: brain completely failed
-        if "robot_0" not in goal_frontiers and enriched_frontiers:
-            goal_frontiers["robot_0"] = enriched_frontiers[0]['idx']
-            if len(enriched_frontiers) > 1:
-                p0 = np.array(enriched_frontiers[0]['centroid'])
-                best = max(enriched_frontiers[1:],
-                          key=lambda ef: np.linalg.norm(np.array(ef['centroid']) - p0))
-                goal_frontiers["robot_1"] = best['idx']
-            else:
-                goal_frontiers["robot_1"] = enriched_frontiers[0]['idx']
-
-        # Log brain's probability estimates
-        prob_str = ", ".join([f"{r}={p:.2f}" for r,p in sorted(probs.items(), key=lambda x:-x[1])[:4]]) if probs else "none"
-        tools_called = ["kg_reason", "kg_assign"]
-        return goal_frontiers, tools_called, f"helicase(P={prob_str})"
+    def deterministic_fallback(self, current_frontiers, pose_pred,
+                               reason="brain_error"):
+        """Transport-level current-only fallback after external retries."""
+        assignments = self._fallback_assignments(
+            current_frontiers,
+            pose_pred,
+        )
+        selected_rooms = {
+            robot_id: current_frontiers.frontiers[frontier_id].room_id
+            for robot_id, frontier_id in assignments.items()
+        }
+        self._store_audit(
+            current_frontiers,
+            assignments,
+            {},
+            selected_rooms,
+            {robot_id: reason for robot_id in assignments},
+            "geometry_fallback",
+            "transport_fallback",
+            {},
+            fallback_reason=reason,
+        )
+        return (
+            assignments,
+            ["current_frontier_fallback"],
+            f"helicase_fallback({reason})",
+        )
 
     def reflect(self, brain, target_name, success, steps, dtg):
-        """Post-episode reflection."""
+        """Store a short post-episode lesson for later LLM decisions."""
         outcome = "SUCCESS" if success else "FAILED"
         lesson = brain.call(
-            f"Episode: {outcome}. Target: {target_name}. Steps: {steps}. Distance: {dtg:.1f}m.\n"
-            f"What one lesson to remember?",
-            max_tokens=50
+            f"Episode: {outcome}. Target: {target_name}. Steps: {steps}. "
+            f"Distance: {dtg:.1f}m. What one lesson should the KG decision "
+            "brain remember?",
+            max_tokens=60,
         )
-        self.reflexion_memory.append(f"[{target_name},{outcome}] {lesson[:80]}")
+        self.reflexion_memory.append(
+            f"[{target_name},{outcome}] {lesson[:120]}"
+        )
         if len(self.reflexion_memory) > 20:
             self.reflexion_memory = self.reflexion_memory[-20:]
+
+
+__all__ = [
+    "CurrentFrontierView",
+    "HelicaseBrain",
+    "KGEdge",
+    "KGNode",
+    "KGUpdater",
+    "KnowledgeGraph",
+]

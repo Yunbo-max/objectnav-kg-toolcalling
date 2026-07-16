@@ -27,7 +27,8 @@ CODE_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "
 if CODE_SRC not in sys.path:
     sys.path.insert(0, CODE_SRC)
 from brain import HelicaseBrain
-from kg_construction import KnowledgeGraph, KGUpdater
+from kg_construction import CurrentFrontierView, KnowledgeGraph, KGUpdater
+from reproducibility import reset_episode_rng
 
 from skimage import measure
 import skimage.morphology
@@ -118,28 +119,34 @@ gpt_name = ['Qwen2.5-3B', 'Qwen2.5-7B']
 class OpenAICompatibleBrainAdapter:
     """Expose the ``brain.call`` interface expected by HelicaseBrain."""
 
-    def __init__(self, base_url, api_key, model, usage_sink):
+    def __init__(self, base_url, api_key, model, usage_sink, seed=None):
         import openai
 
         self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.usage_sink = usage_sink
+        self.seed = seed
         self.last_prompt = ""
         self.last_response = ""
 
     def call(self, prompt, max_tokens=300):
         self.last_prompt = prompt
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
+        request = {
+            "model": self.model,
+            "messages": [
                 {
                     "role": "system",
                     "content": "You are the MindNav Helicase KG reasoning brain. Follow the requested output format exactly.",
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=max_tokens,
-            temperature=0,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+        }
+        if self.seed is not None:
+            request["seed"] = int(self.seed)
+        response = self.client.chat.completions.create(
+            **request,
         )
         content = response.choices[0].message.content.strip()
         self.last_response = content
@@ -151,71 +158,67 @@ class OpenAICompatibleBrainAdapter:
 
 def build_room_frontier_audit(
         episode_index, episode_id, step, goal_name, enriched_frontiers,
-        kg, kg_updater, llm_response, final_goal_frontiers,
-        decision_method, tools_called):
-    """Build a read-only audit of dynamic frontier to persistent room mapping."""
+        current_frontiers, kg, llm_response, final_goal_frontiers,
+        decision_audit, decision_method, tools_called):
+    """Audit that every executed frontier belongs to the current view."""
     active_frontiers = []
-    active_by_idx = {}
-    current_room_groups = defaultdict(list)
-
-    for ef in enriched_frontiers:
-        frontier_idx = int(ef["idx"])
-        cy, cx = float(ef["centroid"][0]), float(ef["centroid"][1])
-        room_id = kg_updater._pos_to_room_id(cy, cx)
-        record = {
-            "frontier_idx": frontier_idx,
-            "room_id": room_id,
-            "centroid": [cy, cx],
-            "area": int(ef["area"]),
-            "room_type": ef.get("room_type", "unknown"),
-            "room_confidence": float(ef.get("room_confidence", 0.0)),
-            "python_prior": float(ef.get("target_prior", 0.0)),
-        }
-        active_frontiers.append(record)
-        active_by_idx[frontier_idx] = record
-        current_room_groups[room_id].append(frontier_idx)
-
-    group_records = []
-    for room_id, frontier_indices in sorted(current_room_groups.items()):
-        node = kg.nodes.get(room_id)
-        stored_idx = None
-        if node is not None and "frontier_idx" in node.properties:
-            stored_idx = int(node.properties["frontier_idx"])
-        group_records.append({
-            "room_id": room_id,
-            "active_frontier_indices": frontier_indices,
-            "kg_stored_frontier_idx": stored_idx,
-            "collision": len(frontier_indices) > 1,
-            "overwritten_frontier_indices": [
-                idx for idx in frontier_indices if idx != stored_idx
-            ],
+    for frontier_idx in sorted(current_frontiers.frontiers):
+        frontier = current_frontiers.frontiers[frontier_idx]
+        active_frontiers.append({
+            "frontier_idx": frontier.idx,
+            "room_id": frontier.room_id,
+            "centroid": list(frontier.centroid),
+            "area": int(frontier.area),
+            "room_type": frontier.room_type,
+            "room_confidence": frontier.room_confidence,
+            "python_prior": frontier.target_prior,
         })
 
-    current_room_ids = set(current_room_groups)
-    kg_candidates = []
-    stale_candidate_rooms = []
-    misbound_candidate_rooms = []
+    group_records = []
+    for room_id, frontier_indices in sorted(
+            current_frontiers.room_to_frontiers.items()):
+        group_records.append({
+            "room_id": room_id,
+            "active_frontier_indices": list(frontier_indices),
+            "collision": len(frontier_indices) > 1,
+            "all_frontiers_preserved": all(
+                frontier_idx in current_frontiers.frontiers
+                for frontier_idx in frontier_indices
+            ),
+        })
+
+    current_room_ids = current_frontiers.room_ids
+    allowed_room_ids = set(decision_audit.get("allowed_room_ids", []))
+    exposed_noncurrent_rooms = sorted(allowed_room_ids - current_room_ids)
+    omitted_current_rooms = sorted(current_room_ids - allowed_room_ids)
+
+    transient_properties = {
+        "frontier_idx", "frontier_indices", "size",
+        "active_frontier", "target_prior",
+    }
+    persistent_transient_rooms = []
     for node in kg.get_nodes_by_type("room"):
-        if node.properties.get("explored") or "frontier_idx" not in node.properties:
-            continue
-        stored_idx = int(node.properties["frontier_idx"])
-        active_at_idx = active_by_idx.get(stored_idx)
-        is_current = node.id in current_room_ids
-        index_matches_room = bool(
-            active_at_idx is not None and active_at_idx["room_id"] == node.id
-        )
-        candidate_record = {
-            "room_id": node.id,
-            "kg_stored_frontier_idx": stored_idx,
-            "position": [float(node.position[0]), float(node.position[1])],
-            "is_current_room": is_current,
-            "stored_index_matches_current_room": index_matches_room,
-        }
-        kg_candidates.append(candidate_record)
-        if not is_current:
-            stale_candidate_rooms.append(node.id)
-        if not index_matches_room:
-            misbound_candidate_rooms.append(node.id)
+        leaked = sorted(transient_properties & set(node.properties))
+        if leaked:
+            persistent_transient_rooms.append({
+                "room_id": node.id,
+                "properties": leaked,
+            })
+
+    kg_candidates = []
+    for room_id in sorted(current_room_ids):
+        node = kg.nodes.get(room_id)
+        kg_candidates.append({
+            "room_id": room_id,
+            "active_frontier_indices": list(
+                current_frontiers.room_to_frontiers[room_id]
+            ),
+            "position": (
+                [float(node.position[0]), float(node.position[1])]
+                if node is not None else None
+            ),
+            "is_current_room": True,
+        })
 
     llm_probabilities = {}
     for match in re.finditer(
@@ -227,34 +230,54 @@ def build_room_frontier_audit(
             r'robot_(\d+)\s*:\s*(room_\d+_\d+)', llm_response):
         llm_room_assignments[f"robot_{match.group(1)}"] = match.group(2)
 
-    candidate_room_ids = {entry["room_id"] for entry in kg_candidates}
-    current_candidate_room_ids = candidate_room_ids & current_room_ids
     scored_room_ids = set(llm_probabilities)
     assigned_room_ids = set(llm_room_assignments.values())
+    selected_rooms = decision_audit.get("selected_room_by_robot", {})
+    accepted_rooms = decision_audit.get("accepted_llm_rooms", {})
 
     assignment_mapping = {}
-    for robot_id, room_id in llm_room_assignments.items():
-        node = kg.nodes.get(room_id)
-        stored_idx = None
-        if node is not None and "frontier_idx" in node.properties:
-            stored_idx = int(node.properties["frontier_idx"])
-        active_at_idx = active_by_idx.get(stored_idx)
+    executed_noncurrent = []
+    room_frontier_mismatches = []
+    robot_ids = sorted(set(final_goal_frontiers) | set(llm_room_assignments))
+    for robot_id in robot_ids:
+        frontier_idx = int(final_goal_frontiers.get(robot_id, -1))
+        frontier = current_frontiers.frontiers.get(frontier_idx)
+        frontier_room_id = frontier.room_id if frontier is not None else None
+        selected_room_id = selected_rooms.get(robot_id)
+        valid_current = frontier is not None
+        selected_matches = bool(
+            valid_current and selected_room_id == frontier_room_id
+        )
         assignment_mapping[robot_id] = {
-            "room_id": room_id,
-            "kg_stored_frontier_idx": stored_idx,
-            "room_is_current": room_id in current_room_ids,
-            "stored_index_matches_current_room": bool(
-                active_at_idx is not None and active_at_idx["room_id"] == room_id
+            "llm_room_id": llm_room_assignments.get(robot_id),
+            "llm_room_is_current": (
+                llm_room_assignments.get(robot_id) in current_room_ids
             ),
-            "final_frontier_idx": int(final_goal_frontiers.get(robot_id, -1)),
+            "accepted_llm_room_id": accepted_rooms.get(robot_id),
+            "selected_room_id": selected_room_id,
+            "final_frontier_idx": frontier_idx,
+            "frontier_room_id": frontier_room_id,
+            "valid_current_frontier": valid_current,
+            "selected_room_matches_frontier": selected_matches,
         }
+        if not valid_current:
+            executed_noncurrent.append(robot_id)
+        if valid_current and not selected_matches:
+            room_frontier_mismatches.append(robot_id)
 
-    collision_groups = [entry for entry in group_records if entry["collision"]]
-    overwritten_count = sum(
-        len(entry["overwritten_frontier_indices"]) for entry in collision_groups
+    final_indices = [
+        int(frontier_idx) for frontier_idx in final_goal_frontiers.values()
+    ]
+    duplicate_final_frontiers = (
+        len(current_frontiers.frontiers) >= len(final_indices)
+        and len(final_indices) != len(set(final_indices))
     )
 
+    collision_groups = [entry for entry in group_records if entry["collision"]]
+    rejected_room_ids = decision_audit.get("rejected_room_ids", [])
+
     return {
+        "schema_version": 2,
         "episode_index": int(episode_index),
         "episode": int(episode_index) + 1,
         "episode_id": str(episode_id),
@@ -268,40 +291,72 @@ def build_room_frontier_audit(
         "llm_probabilities": llm_probabilities,
         "llm_room_assignments": llm_room_assignments,
         "assignment_mapping": assignment_mapping,
+        "decision_audit": dict(decision_audit),
         "final_frontier_assignments": {
             key: int(value) for key, value in final_goal_frontiers.items()
         },
         "issues": {
             "collision_room_ids": [entry["room_id"] for entry in collision_groups],
-            "overwritten_active_frontier_count": overwritten_count,
-            "stale_candidate_room_ids": stale_candidate_rooms,
-            "misbound_candidate_room_ids": misbound_candidate_rooms,
+            "overwritten_active_frontier_count": 0,
+            "stale_candidate_room_ids": exposed_noncurrent_rooms,
+            "misbound_candidate_room_ids": [],
             "llm_scored_noncurrent_room_ids": sorted(scored_room_ids - current_room_ids),
-            "llm_omitted_current_candidate_room_ids": sorted(
-                current_candidate_room_ids - scored_room_ids
-            ),
+            "llm_omitted_current_candidate_room_ids": sorted(current_room_ids - scored_room_ids),
             "llm_assigned_noncurrent_room_ids": sorted(
                 assigned_room_ids - current_room_ids
             ),
+            "rejected_llm_room_ids": list(rejected_room_ids),
+            "omitted_current_room_ids_from_prompt": omitted_current_rooms,
+            "persistent_transient_room_properties": persistent_transient_rooms,
+            "executed_noncurrent_robot_ids": executed_noncurrent,
+            "room_frontier_mismatch_robot_ids": room_frontier_mismatches,
+            "duplicate_final_frontiers": duplicate_final_frontiers,
         },
         "counts": {
             "active_frontiers": len(active_frontiers),
             "unique_current_rooms": len(current_room_ids),
             "collision_rooms": len(collision_groups),
-            "overwritten_active_frontiers": overwritten_count,
-            "kg_candidate_rooms": len(candidate_room_ids),
-            "stale_candidate_rooms": len(stale_candidate_rooms),
-            "misbound_candidate_rooms": len(misbound_candidate_rooms),
+            "overwritten_active_frontiers": 0,
+            "kg_candidate_rooms": len(current_room_ids),
+            "stale_candidate_rooms": len(exposed_noncurrent_rooms),
+            "misbound_candidate_rooms": 0,
             "llm_scored_rooms": len(scored_room_ids),
             "llm_scored_noncurrent_rooms": len(scored_room_ids - current_room_ids),
-            "llm_omitted_current_candidate_rooms": len(
-                current_candidate_room_ids - scored_room_ids
-            ),
+            "llm_omitted_current_candidate_rooms": len(current_room_ids - scored_room_ids),
             "llm_assigned_noncurrent_rooms": len(
                 assigned_room_ids - current_room_ids
             ),
+            "rejected_llm_rooms": len(rejected_room_ids),
+            "persistent_transient_room_properties": len(
+                persistent_transient_rooms
+            ),
+            "executed_noncurrent_frontiers": len(executed_noncurrent),
+            "room_frontier_mismatches": len(room_frontier_mismatches),
+            "duplicate_final_frontiers": int(duplicate_final_frontiers),
         },
     }
+
+
+def get_per_agent_goal_distances(env, episode, num_agents):
+    """Return oracle distances for diagnostics only, never for control."""
+    try:
+        view_points = [
+            view_point.agent_state.position
+            for goal in episode.goals
+            for view_point in goal.view_points
+        ]
+        return [
+            float(env.sim.geodesic_distance(
+                env.sim.get_agent_state(agent_id=agent_id).position,
+                view_points,
+                episode,
+            ))
+            for agent_id in range(num_agents)
+        ]
+    except Exception as error:
+        print(f"STOP diagnostic distance error: {error}")
+        return [None] * num_agents
+
 
 def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visited_vis, map_edge, goal_points):
     dump_dir = "{}/dump/{}/".format(args.dump_location,
@@ -937,6 +992,13 @@ def main():
         open(mapping_jsonl_log, "w").close()
         print(f"Writing per-episode JSONL to {args.jsonl_log}")
         print(f"Writing room/frontier mapping audit to {mapping_jsonl_log}")
+    if args.stop_diag_jsonl:
+        stop_diag_dir = os.path.dirname(
+            os.path.abspath(args.stop_diag_jsonl)
+        )
+        os.makedirs(stop_diag_dir, exist_ok=True)
+        open(args.stop_diag_jsonl, "w").close()
+        print(f"Writing per-step STOP diagnostics to {args.stop_diag_jsonl}")
     # ------------------------------------------------------------------
 
 
@@ -957,6 +1019,7 @@ def main():
         api_key=brain_api_key,
         model=brain_model,
         usage_sink=total_usage,
+        seed=args.seed if args.reset_seed_each_episode else None,
     )
     kg = KnowledgeGraph()
     kg_updater = KGUpdater(kg)
@@ -964,6 +1027,14 @@ def main():
     print(f"Using MindNav core: {CODE_SRC}/brain.py + {CODE_SRC}/kg_construction.py")
 
     while count_episodes < num_episodes:
+        episode_seed = None
+        if args.reset_seed_each_episode:
+            episode_seed = reset_episode_rng(args.seed, env=env)
+            print(
+                f"[EPISODE_SEED] index="
+                f"{args.start_episode_index + count_episodes} "
+                f"seed={episode_seed} mode=fixed_global"
+            )
         observations = env.reset()
         current_episode = env.current_episode
         print(
@@ -1037,9 +1108,19 @@ def main():
                         for i in range(len(target_point_map))
                     }
 
-                    # Build/update the canonical MindNav KG once, then let the
-                    # code/src Helicase brain estimate room probabilities and
-                    # assign both robots in one LLM call.
+                    # Build the executable mapping for this decision only.
+                    # The persistent KG update below deliberately does not
+                    # retain frontier indices.
+                    current_frontiers = (
+                        kg_updater.build_current_frontier_view(enriched)
+                    )
+                    for frontier_idx in current_frontiers.frontiers:
+                        if not 0 <= frontier_idx < len(target_point_map):
+                            raise ValueError(
+                                f"Current frontier_{frontier_idx} has no "
+                                "matching target point"
+                            )
+
                     kg_updater.update(
                         enriched,
                         object_list,
@@ -1049,6 +1130,11 @@ def main():
 
                     retries = 3
                     vlm_success = False
+                    goal_frontiers = {}
+                    tools_called = []
+                    decision_method = ""
+                    last_llm_response = ""
+                    last_brain_error = None
                     while retries > 0:
                         try:
                             goal_frontiers, tools_called, decision_method = mindnav_brain.decide(
@@ -1059,7 +1145,9 @@ def main():
                                 agent[0].l_step,
                                 args.max_episode_length,
                                 decision_history,
+                                current_frontiers=current_frontiers,
                             )
+                            last_llm_response = brain_adapter.last_response
                             print(
                                 f"MindNav decision: {decision_method}; tools={tools_called}; "
                                 f"kg_nodes={len(kg.nodes)}, kg_edges={len(kg.edges)}"
@@ -1070,97 +1158,143 @@ def main():
                                 robot_key = "robot_" + str(i)
                                 if robot_key not in goal_frontiers:
                                     raise ValueError(f"Missing frontier assignment for {robot_key}")
-                                goal_frontiers[robot_key] = max(
-                                    0,
-                                    min(int(goal_frontiers[robot_key]), len(target_point_map) - 1),
-                                )
-
-                            # Fix Gap 2: prevent both robots going to same frontier
-                            if num_agents >= 2 and len(target_point_map) >= 2:
-                                if goal_frontiers.get("robot_0") == goal_frontiers.get("robot_1"):
-                                    # Assign robot_1 to the frontier with next-best target_prior
-                                    chosen = goal_frontiers["robot_0"]
-                                    best_alt = None
-                                    best_alt_prior = -1
-                                    for ef in enriched:
-                                        if ef["idx"] != chosen and ef["target_prior"] > best_alt_prior:
-                                            best_alt = ef["idx"]
-                                            best_alt_prior = ef["target_prior"]
-                                    if best_alt is not None:
-                                        goal_frontiers["robot_1"] = best_alt
-                                        print(f"  [FIX] Redirected robot_1 from frontier_{chosen} to frontier_{best_alt}")
-
-                            last_decision.clear()
-                            for i in range(num_agents):
-                                fi = goal_frontiers["robot_"+ str(i)]
-                                goal_points.append(target_point_map[fi])
-                                last_decision.append(Frontiers_dict.get("frontier_"+str(fi), ""))
-
-                            decision_history.append({
-                                "step": int(agent[0].l_step),
-                                "r0": int(goal_frontiers.get("robot_0", 0)),
-                                "r1": int(goal_frontiers.get("robot_1", 0)),
-                                "objects_found": ",".join(sorted(object_list.keys())),
-                            })
-
-                            # ── 025 Probe: log decision ──
-                            chosen_0 = goal_frontiers.get("robot_0", 0)
-                            chosen_1 = goal_frontiers.get("robot_1", 0)
-                            probe_record["chosen_0"] = chosen_0
-                            probe_record["chosen_1"] = chosen_1
-                            probe_record["same_frontier"] = (chosen_0 == chosen_1)
-                            print(f"  [PROBE] step={agent[0].l_step}, goal={agent[0].goal_name}, "
-                                  f"chose=({chosen_0},{chosen_1}), same={'Y' if chosen_0==chosen_1 else 'N'}, "
-                                  f"rooms={[e['room_type'] for e in enriched]}, "
-                                  f"priors={[e['target_prior'] for e in enriched]}")
-
-                            if mapping_jsonl_log:
-                                try:
-                                    mapping_audit = build_room_frontier_audit(
-                                        args.start_episode_index + count_episodes,
-                                        current_episode.episode_id,
-                                        agent[0].l_step,
-                                        agent[0].goal_name,
-                                        enriched,
-                                        kg,
-                                        kg_updater,
-                                        brain_adapter.last_response,
-                                        goal_frontiers,
-                                        decision_method,
-                                        tools_called,
+                                frontier_idx = int(goal_frontiers[robot_key])
+                                if frontier_idx not in current_frontiers.frontiers:
+                                    raise ValueError(
+                                        f"Non-current frontier_{frontier_idx} "
+                                        f"assigned to {robot_key}"
                                     )
-                                    with open(mapping_jsonl_log, "a") as mapping_file:
-                                        json.dump(mapping_audit, mapping_file, ensure_ascii=False)
-                                        mapping_file.write("\n")
-                                    audit_counts = mapping_audit["counts"]
-                                    print(
-                                        "  [MAPPING] "
-                                        f"active={audit_counts['active_frontiers']}, "
-                                        f"rooms={audit_counts['unique_current_rooms']}, "
-                                        f"collisions={audit_counts['collision_rooms']}, "
-                                        f"stale_candidates={audit_counts['stale_candidate_rooms']}, "
-                                        f"misbound={audit_counts['misbound_candidate_rooms']}"
+                                goal_frontiers[robot_key] = frontier_idx
+
+                            if len(current_frontiers.frontiers) >= num_agents:
+                                assigned_indices = list(goal_frontiers.values())
+                                if len(assigned_indices) != len(set(assigned_indices)):
+                                    raise ValueError(
+                                        "Duplicate frontier assignments despite "
+                                        "enough current candidates"
                                     )
-                                except Exception as audit_error:
-                                    print(f"  [MAPPING] audit logging failed: {audit_error}")
 
                             vlm_success = True
                             break
                         except Exception as e:
+                            last_brain_error = e
                             print(f"MindNav core brain error: {e}")
                             print('Retrying...')
                             retries -= 1
                             time.sleep(1)
 
-                    # Fallback: random frontier assignment if VLM failed
                     if not vlm_success:
-                        print("VLM failed all retries, using random frontier assignment")
-                        last_decision.clear()
-                        n_frontiers = len(target_point_map)
-                        for i in range(num_agents):
-                            rand_f = np.random.randint(0, n_frontiers)
-                            goal_points.append(target_point_map[rand_f])
-                            last_decision.append(Frontiers_dict["frontier_"+str(rand_f)])
+                        reason = (
+                            type(last_brain_error).__name__
+                            if last_brain_error is not None else "brain_error"
+                        )
+                        print(
+                            "MindNav failed all retries; using deterministic "
+                            f"current-frontier fallback ({reason})"
+                        )
+                        goal_frontiers, tools_called, decision_method = (
+                            mindnav_brain.deterministic_fallback(
+                                current_frontiers,
+                                pose_pred,
+                                reason=reason,
+                            )
+                        )
+
+                    # One strict execution path for both LLM and fallback
+                    # decisions. No index clamping or post-hoc redirection.
+                    for i in range(num_agents):
+                        robot_key = "robot_" + str(i)
+                        if robot_key not in goal_frontiers:
+                            raise ValueError(
+                                f"Missing final assignment for {robot_key}"
+                            )
+                        frontier_idx = int(goal_frontiers[robot_key])
+                        if frontier_idx not in current_frontiers.frontiers:
+                            raise ValueError(
+                                f"Final assignment frontier_{frontier_idx} "
+                                "is not current"
+                            )
+                        goal_frontiers[robot_key] = frontier_idx
+
+                    if len(current_frontiers.frontiers) >= num_agents:
+                        final_indices = list(goal_frontiers.values())
+                        if len(final_indices) != len(set(final_indices)):
+                            raise ValueError(
+                                "Final current-frontier assignments are not unique"
+                            )
+
+                    last_decision.clear()
+                    for i in range(num_agents):
+                        fi = goal_frontiers["robot_" + str(i)]
+                        goal_points.append(target_point_map[fi])
+                        last_decision.append(
+                            Frontiers_dict.get("frontier_" + str(fi), "")
+                        )
+
+                    decision_history.append({
+                        "step": int(agent[0].l_step),
+                        "r0": int(goal_frontiers.get("robot_0", 0)),
+                        "r1": int(goal_frontiers.get("robot_1", 0)),
+                        "objects_found": ",".join(sorted(object_list.keys())),
+                    })
+
+                    chosen_0 = goal_frontiers.get("robot_0", 0)
+                    chosen_1 = goal_frontiers.get("robot_1", 0)
+                    probe_record["chosen_0"] = chosen_0
+                    probe_record["chosen_1"] = chosen_1
+                    probe_record["same_frontier"] = (chosen_0 == chosen_1)
+                    print(
+                        f"  [PROBE] step={agent[0].l_step}, "
+                        f"goal={agent[0].goal_name}, "
+                        f"chose=({chosen_0},{chosen_1}), "
+                        f"same={'Y' if chosen_0 == chosen_1 else 'N'}, "
+                        f"rooms={[e['room_type'] for e in enriched]}, "
+                        f"priors={[e['target_prior'] for e in enriched]}"
+                    )
+
+                    if mapping_jsonl_log:
+                        try:
+                            mapping_audit = build_room_frontier_audit(
+                                args.start_episode_index + count_episodes,
+                                current_episode.episode_id,
+                                agent[0].l_step,
+                                agent[0].goal_name,
+                                enriched,
+                                current_frontiers,
+                                kg,
+                                last_llm_response,
+                                goal_frontiers,
+                                mindnav_brain.last_decision_audit,
+                                decision_method,
+                                tools_called,
+                            )
+                            with open(mapping_jsonl_log, "a") as mapping_file:
+                                json.dump(
+                                    mapping_audit,
+                                    mapping_file,
+                                    ensure_ascii=False,
+                                )
+                                mapping_file.write("\n")
+                            audit_counts = mapping_audit["counts"]
+                            print(
+                                "  [MAPPING] "
+                                f"active={audit_counts['active_frontiers']}, "
+                                f"rooms={audit_counts['unique_current_rooms']}, "
+                                f"collisions={audit_counts['collision_rooms']}, "
+                                f"stale_candidates="
+                                f"{audit_counts['stale_candidate_rooms']}, "
+                                f"executed_noncurrent="
+                                f"{audit_counts['executed_noncurrent_frontiers']}, "
+                                f"mismatches="
+                                f"{audit_counts['room_frontier_mismatches']}, "
+                                f"persistent_transient="
+                                f"{audit_counts['persistent_transient_room_properties']}"
+                            )
+                        except Exception as audit_error:
+                            print(
+                                f"  [MAPPING] audit logging failed: "
+                                f"{audit_error}"
+                            )
                 else:
                     for i in range(num_agents):
                         actions = np.random.rand(1, 2).squeeze()*(target_edge_map.shape[0] - 1)
@@ -1176,6 +1310,56 @@ def main():
 
 
             observations = env.step(action)
+
+            if args.stop_diag_jsonl:
+                step_metrics = env.get_metrics()
+                per_agent_dtg = get_per_agent_goal_distances(
+                    env,
+                    current_episode,
+                    num_agents,
+                )
+                stop_record = {
+                    "schema_version": 1,
+                    "episode_index": int(
+                        args.start_episode_index + count_episodes
+                    ),
+                    "episode": int(
+                        args.start_episode_index + count_episodes + 1
+                    ),
+                    "episode_id": str(current_episode.episode_id),
+                    "goal": agent[0].goal_name,
+                    "step": int(agent[0].l_step),
+                    "global_distance_to_goal": float(
+                        step_metrics.get("distance_to_goal", -1.0)
+                    ),
+                    "per_agent_distance_to_goal": per_agent_dtg,
+                    "success": float(step_metrics.get("success", 0.0)),
+                    "episode_over": bool(env.episode_over),
+                    "any_stop_action": any(int(a) == 0 for a in action),
+                    "robots": [
+                        {
+                            "robot_id": f"robot_{i}",
+                            "action": int(action[i]),
+                            "found_goal": int(agent[i].last_found_goal),
+                            "planner_stop": bool(agent[i].last_planner_stop),
+                            "target_map_mass": float(
+                                agent[i].last_target_map_mass
+                            ),
+                            "goal_map_mass": float(
+                                agent[i].last_goal_map_mass
+                            ),
+                            "replan_count": int(agent[i].replan_count),
+                            "pose": [
+                                float(value)
+                                for value in agent[i].planner_pose_inputs[:3]
+                            ],
+                        }
+                        for i in range(num_agents)
+                    ],
+                }
+                with open(args.stop_diag_jsonl, "a") as stop_diag_file:
+                    json.dump(stop_record, stop_diag_file, ensure_ascii=False)
+                    stop_diag_file.write("\n")
             # step_end = time.time()
             # step_time = step_end - act_end
             # print('step_time: %.3f秒'%step_time)
@@ -1211,6 +1395,11 @@ def main():
                 "goal": agent[0].goal_name,
                 "steps": int(agent[0].l_step),
                 "distance_to_goal": float(metrics.get("distance_to_goal", -1.0)),
+                "episode_seed": episode_seed,
+                "seed_mode": (
+                    "fixed_global"
+                    if args.reset_seed_each_episode else "continuous"
+                ),
             }
             with open(args.jsonl_log, "a") as jsonl_file:
                 json.dump(episode_record, jsonl_file, ensure_ascii=False)

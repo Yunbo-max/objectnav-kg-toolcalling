@@ -382,3 +382,266 @@ Episode 15是最明显的案例。step 174之后，当前 `frontier_1` 的bed先
 - `results/runs/main_mindnav_hm3d_val_first15_qwen25_7b_no_kg_target_20260715.mapping.jsonl`：117次room/frontier映射审计；
 - `results/runs/main_mindnav_hm3d_val_first15_qwen25_7b_no_kg_target_20260715.log`：完整运行日志；
 - `results/runs/main_mindnav_hm3d_val_first15_qwen25_7b_32k_20260715.jsonl`：删除前的7B对照结果。
+
+## 6. 第一阶段修复实现与验证（`kg` 分支，2026-07-16）
+
+### 6.1 阶段目标与完成状态
+
+第一阶段只处理第5节定位出的room/frontier生命周期与执行映射问题，不恢复 `helicase_target_found`，也不改变底层语义目标检测和局部规划器的STOP规则。
+
+当前状态：**实现完成、单元验证完成、历史审计重放完成、前15个episode配对运行完成**。
+
+核心修改如下：
+
+1. 在 `code/src/kg_construction.py` 中增加每次决策独立构建的 `CurrentFrontierView`。它同时保存当前frontier实体和 `room_id -> [frontier]` 的一对多映射，避免同room中的frontier互相覆盖。
+2. 持久KG room节点不再写入 `frontier_idx`、`size`、`target_prior` 等瞬时字段；更新时还会清理旧版本遗留的瞬时属性。
+3. KG提示词明确分成 `CURRENT ASSIGNABLE ROOMS` 和 `HISTORICAL ROOM CONTEXT — NOT ASSIGNABLE`。历史room只用于空间关系推理，不能被LLM分配。
+4. 在 `code/src/brain.py` 中只接受当次白名单内的 `room_id`，并只通过当次 `CurrentFrontierView` 把room转换成frontier。非法room、非法概率或不完整响应进入确定性当前frontier回退。
+5. 当一个room对应多个当前frontier时，使用目标先验、距离、面积和索引进行稳定排序；frontier足够时给两台机器人分配不同候选，候选不足时才允许复用。
+6. 在 `code/vendor/conavgpt/exp_main_brain.py` 中删除索引截断、随机回退和事后重复重定向。LLM与回退结果共用同一条严格执行校验路径。
+7. 映射审计升级到schema v2，记录提示词白名单、LLM原始/接受room、最终frontier、持久KG瞬时属性泄漏及room/frontier一致性。
+
+第一阶段形成的接口边界为：
+
+| 数据 | 生命周期 | 是否可被分配 | 保存位置 |
+|---|---|---:|---|
+| room实体、位置、相邻关系、已见物体 | episode内持久 | 仅当它同时属于当前视图 | KG |
+| frontier索引、面积、当前目标先验 | 单次规划决策 | 是 | `CurrentFrontierView` |
+| 历史room上下文 | episode内持久 | 否 | KG提示词的历史区域 |
+
+### 6.2 无GPU验证
+
+所有Python命令均按项目约定使用 `mindnav38` conda环境。
+
+```bash
+conda run -n mindnav38 python -m unittest discover -s tests -v
+conda run -n mindnav38 python -m py_compile \
+  code/src/kg_construction.py \
+  code/src/brain.py \
+  code/vendor/conavgpt/exp_main_brain.py \
+  code/scripts/replay_frontier_mapping.py \
+  tests/test_current_frontier_mapping.py
+git diff --check
+```
+
+结果：10/10个单元测试通过，Python编译检查和diff空白检查通过。测试覆盖同room多frontier保留、frontier过期、确定性回退、候选不足时复用、旧瞬时属性清理、提示词隔离、陈旧room拒绝、异常LLM响应及主程序使用canonical `KGUpdater` 等路径。
+
+对删除快捷路径后的旧审计文件执行离线重放：
+
+```bash
+conda run -n mindnav38 python code/scripts/replay_frontier_mapping.py \
+  results/runs/main_mindnav_hm3d_val_first15_qwen25_7b_no_kg_target_20260715.mapping.jsonl
+```
+
+| 重放指标 | 旧接口 | 第一阶段接口模拟 |
+|---|---:|---:|
+| 决策数 | 117 | 117 |
+| 当前frontier实例 | 415 | 415 |
+| 同room碰撞决策 | 45 | 45，全部走一对多映射 |
+| 被同room覆盖的实例 | 54 | 0 |
+| LLM非当前room分配 | 139/234 | 139个被拒绝 |
+| 当前接口模拟后的重复frontier决策 | 不适用 | 0 |
+| 最终执行非当前frontier | 无严格保证 | 0 |
+
+重放还确认旧日志可以无歧义地重建当次room ID，重建不一致数为0。这说明修复针对的是已观测到的真实失败模式，而不是仅对人工样例有效。
+
+### 6.3 定点仿真回归
+
+启动Habitat前已检查GPU，按约定使用GPU 0运行Habitat、GPU 1运行语义模型、GPU 2运行Qwen2.5-7B的vLLM服务。
+
+| 定点运行 | Success | SPL | steps | distance-to-goal | 映射审计 |
+|---|---:|---:|---:|---:|---|
+| Episode 2（toilet） | 1 | 0.3593 | 96 | 0.0434 m | 3次决策，全部错误项为0 |
+| Episode 15（bed） | 1 | 0.4479 | 195 | 0.0538 m | 8次决策，全部错误项为0 |
+
+结果文件为 `results/runs/kg_phase1_ep2_20260716.jsonl` 和 `results/runs/kg_phase1_ep15_20260716.jsonl`。定点运行跳过了前序episode，仿真随机状态与完整顺序运行不同，因此这里只把它们用作运行接口与异常路径回归，不作为性能配对样本。
+
+### 6.4 完整前15个episode设置
+
+- 数据集：HM3D ObjectNav v2，`val` split；
+- 场景与episode顺序：与第5节相同，`start_episode_index=0`，共15个episode；
+- 随机种子：1；
+- 最大步数：500；
+- 两台机器人；
+- 决策模型：本地Qwen2.5-7B-Instruct，vLLM，32K上下文，`temperature=0`；
+- 方法：删除 `helicase_target_found` 后叠加第一阶段room/frontier修复；
+- 总运行时间：35分08秒。
+
+逐episode原始配对结果如下。左侧“删除后”是第5节的未修复版本，右侧“第一阶段”是本次版本。
+
+| Ep | 目标 | 删除后 S/SPL/steps | 第一阶段 S/SPL/steps | 第一阶段DTG |
+|---:|---|---:|---:|---:|
+| 1 | bed | 1 / 0.4369 / 122 | 1 / 0.5013 / 127 | 0.0412 m |
+| 2 | toilet | 1 / 0.2710 / 162 | 0 / 0 / 500 | 0.0471 m |
+| 3 | tv_monitor | 0 / 0 / 34 | 0 / 0 / 40 | 11.0383 m |
+| 4 | chair | 0 / 0 / 155 | 0 / 0 / 500 | 0.0808 m |
+| 5 | sofa | 0 / 0 / 500 | 0 / 0 / 500 | 5.0105 m |
+| 6 | toilet | 1 / 0.8153 / 43 | 1 / 0.7041 / 54 | 0.0354 m |
+| 7 | sofa | 0 / 0 / 500 | 0 / 0 / 500 | 2.8852 m |
+| 8 | tv_monitor | 0 / 0 / 52 | 0 / 0 / 92 | 3.3552 m |
+| 9 | toilet | 1 / 0.4939 / 141 | 1 / 0.3139 / 174 | 0.0030 m |
+| 10 | chair | 0 / 0 / 165 | 1 / 0.9685 / 270 | 0.0516 m |
+| 11 | sofa | 1 / 0.5521 / 136 | 1 / 0.4774 / 161 | 0.0113 m |
+| 12 | tv_monitor | 0 / 0 / 29 | 0 / 0 / 57 | 5.1425 m |
+| 13 | chair | 0 / 0 / 76 | 1 / 0.4904 / 174 | 0.0539 m |
+| 14 | toilet | 1 / 0.0766 / 201 | 1 / 0.1735 / 111 | 0.0298 m |
+| 15 | bed | 0 / 0 / 500 | 1 / 0.2486 / 453 | 0.0446 m |
+
+### 6.5 汇总与配对分析
+
+| 指标 | 删除前快捷路径 | 删除后未修复 | 第一阶段修复 | 第一阶段相对未修复 |
+|---|---:|---:|---:|---:|
+| SR | 0.4000（6/15） | 0.4000（6/15） | **0.5333（8/15）** | +0.1333（相对+33.3%） |
+| SPL | 0.1946 | 0.1764 | **0.2585** | +0.0821（相对+46.6%） |
+| 平均distance-to-goal | 3.4126 m | 4.0709 m | **1.8554 m** | -2.2155 m（-54.4%） |
+| 平均steps | 185.27 | 187.73 | 247.53 | +59.80 |
+| 总steps | 2779 | 2816 | 3713 | +897 |
+
+成功episode：
+
+- 删除前快捷路径：1、6、9、11、14、15；
+- 删除后未修复：1、2、6、9、11、14；
+- 第一阶段修复：1、6、9、10、11、13、14、15。
+
+相对未修复版本，第一阶段新增成功Episode 10、13、15，丢失Episode 2。使用episode配对bootstrap（200,000次，seed 20260716）得到95%区间：SR差值 `[-0.1333, 0.4000]`，SPL差值 `[-0.0456, 0.2458]`，steps差值 `[5.73, 126.13]`，DTG差值 `[-3.9639, -0.6410]`。成功/失败的discordant pair为1个丢失、3个新增，双侧exact McNemar `p=0.625`。
+
+因此可以观察到SR、SPL和DTG方向上的改善，但15个episode、单场景顺序和单一seed不足以支持统计显著性或完整HM3D泛化结论。步数明显上升，一部分来自新增成功episode继续探索到目标，另一部分来自下面讨论的两个“到达但未STOP”episode。
+
+### 6.6 在线映射审计验收
+
+完整运行共记录152次决策、304个机器人分配和576个当前frontier实例。
+
+| 验收项 | 第5节未修复版本 | 第一阶段修复 |
+|---|---:|---:|
+| 决策数 | 117 | 152 |
+| 同room多frontier决策 | 45 | 85 |
+| 同room多frontier组 | 未完整保留 | 87组全部保留 |
+| 被覆盖的当前frontier | 54 | **0** |
+| 陈旧候选room决策 | 97 | **0** |
+| LLM对非当前room评分 | 有 | **0** |
+| LLM非当前room分配 | 139/234 | **0/304** |
+| 持久room瞬时属性泄漏 | 未清理 | **0** |
+| 最终执行非当前frontier | 可能发生 | **0** |
+| room与最终frontier不一致 | 可能发生 | **0** |
+| 最终重复frontier | 52次分配受重定向 | **0个决策** |
+| 当前room未进入提示词白名单 | 未约束 | **0** |
+
+152次决策中有85次（55.9%）实际包含room碰撞，说明一对多映射不是少数边缘情况。新接口保留了576/576个当前frontier。298/304个分配直接来自合法LLM room，剩余6个使用 `current_frontier_reuse`；这6次决策都只有一个当前frontier，符合“候选不足才复用”的设计。
+
+**第一阶段的映射正确性验收通过。** 性能提升仍应视为初步信号，但第5节的三类关键错误——覆盖、陈旧候选和错误执行映射——在本次完整运行中均降为0。
+
+### 6.7 Episode 2和4：已进入成功距离但没有结束
+
+完整顺序运行中，Episode 2最终DTG为0.0471 m，Episode 4为0.0808 m，均小于任务配置 `TASK.SUCCESS.SUCCESS_DISTANCE=0.2 m`，但两者都运行到500 steps且Success为0。
+
+这不是“两台机器人必须同时到达”的问题。当前多机器人任务的实际判定链如下：
+
+1. `DistanceToGoal` 遍历两台机器人并取最小距离，即只要其中一台接近目标即可；
+2. `env.step([action_0, action_1])` 只要动作列表中包含一个 `0`，就调用任务级全局 `STOP`；
+3. `Success` 只有在“已调用STOP”且最小DTG小于0.2 m时才为1；
+4. 底层 `LLM_Agent` 只在本地语义地图存在目标类别（`found_goal=1`）且FMM对该语义目标返回 `stop=True` 时输出动作0。
+
+因此，**只需要一个Agent触发STOP，且两台Agent中的任意一台处于成功距离内即可成功；单纯进入0.2 m范围不会自动结束。** Episode 2和4跑满500步说明两台Agent都没有输出STOP。
+
+Habitat的DTG是相对数据集目标view point计算的oracle地理距离，而策略的STOP来自RedNet语义预测、建图和FMM局部目标。这两个坐标/信号并不等价：机器人可以进入oracle成功区域，但因目标漏检、视角不合适、语义地图目标偏移或局部FMM尚未判定到达而不STOP。现有完整运行日志没有逐step保存 `found_goal` 和FMM `stop`，所以仅凭这次旧日志不能进一步区分具体是哪一个内部条件失败。
+
+另一个配置陷阱是命令行参数 `--success_dist=1.0` 目前只在参数解析器中定义，在本执行路径没有被使用；真正的评测阈值来自 `multi_objectnav_hm3d.yaml`，为0.2 m。
+
+该问题与本阶段已修复的room/frontier映射相互独立，建议作为第二阶段的第一个诊断项：
+
+- 先记录每台机器人每步的动作、`found_goal`、FMM `stop`、目标语义面积和仅用于评测诊断的per-agent oracle DTG；
+- 单独重跑Episode 2和4，定位“首次进入0.2 m”到episode结束之间是哪一个STOP条件未满足；
+- 不应在策略中直接读取Habitat oracle DTG并据此自动STOP，否则会引入评测信息泄漏；
+- 在不使用oracle信息的前提下，增加基于当前视觉目标置信度、连续帧确认和到语义目标地图距离的STOP仲裁；任意一个Agent确认后发出全局STOP；
+- 统一或删除未生效的 `--success_dist` 参数，避免实验配置误读。
+
+### 6.8 第一阶段结论与下一步
+
+第一阶段达到了预定目标：持久room与瞬时frontier已经解耦，LLM只能选择当前room，同room中的多个frontier不再丢失，最终执行与LLM选择保持一致。前15个episode的SR从未修复版本的0.4000上升到0.5333，SPL从0.1764上升到0.2585，平均DTG从4.0709 m下降到1.8554 m；但由于样本量和seed有限，这些是后续扩大验证的依据，不是最终性能结论。
+
+下一阶段建议按以下顺序进行：
+
+1. 先补齐STOP链路可观测性并复现Episode 2和4，避免有效到达被计为超时失败；
+2. 保持当前严格映射接口不变，再调整LLM room评分与Python先验融合，减少低价值长时间探索；
+3. 扩展到更多episode和至少3个seed，报告均值、标准差、bootstrap区间和成功交换情况；
+4. 在扩大实验前继续保留schema v2映射审计作为回归门槛，所有正确性错误项必须维持为0。
+
+本次主要结果文件：
+
+- `results/runs/main_mindnav_hm3d_val_first15_qwen25_7b_kg_phase1_20260716.jsonl`：第一阶段15个episode结果；
+- `results/runs/main_mindnav_hm3d_val_first15_qwen25_7b_kg_phase1_20260716.mapping.jsonl`：152次schema v2映射审计；
+- `results/runs/main_mindnav_hm3d_val_first15_qwen25_7b_kg_phase1_20260716.log`：完整运行日志；
+- `results/runs/kg_phase1_ep2_20260716.jsonl`、`results/runs/kg_phase1_ep15_20260716.jsonl`：定点回归结果。
+
+### 6.9 Episode 2和4的STOP诊断复现（2026-07-16）
+
+为判断第6.7节的近目标超时是否为偶然现象，本次增加了可选的逐step STOP诊断日志。该日志记录每台机器人的动作、目标语义地图质量、`found_goal`、FMM `planner_stop` 和per-agent oracle DTG。oracle距离只用于事后诊断，不参与动作选择或STOP控制。
+
+复现分为两种设置：
+
+- **顺序复现**：从Episode 1运行到Episode 4，`seed=1`、`EPISODE_SHUFFLE=0`，保持与15-episode实验相同的前序随机数消耗；
+- **隔离复现**：通过 `start_episode_index` 直接跳到Episode 2或4。跳过操作只调用 `env.reset()`，不会执行前序episode，因此不会消耗其导航过程中的Torch/NumPy随机数。
+
+这里的“前序RNG/轨迹影响”不表示上一episode的机器人位置或KG被带入下一episode；它们都会reset。它表示程序只在进程启动时设一次seed，前序导航会推进随机数生成器状态，从而改变目标episode早期的随机目标、动作、观测、地图、frontier和后续LLM提示，最终形成不同轨迹。
+
+| 运行方式 | Episode | 结果 | steps | DTG | 终止原因 |
+|---|---:|---:|---:|---:|---|
+| 原15集顺序运行 | 2 | 失败 | 500 | 0.0471 m | timeout，未STOP |
+| 本次顺序复现 | 2 | 失败 | 500 | 0.0471 m | timeout，未STOP |
+| 先前隔离定点 | 2 | 成功 | 96 | 0.0434 m | robot_0 STOP |
+| 本次隔离诊断 | 2 | 成功 | 96 | 0.0434 m | robot_0 STOP |
+| 原15集顺序运行 | 4 | 失败 | 500 | 0.0808 m | timeout，未STOP |
+| 本次顺序复现 | 4 | 失败 | 149 | 8.2426 m | 远距离语义误检后误STOP |
+| 本次隔离诊断 | 4 | 成功 | 275 | 0.0628 m | robot_0 STOP，SPL 0.6079 |
+
+#### Episode 2：原顺序下可以稳定复现，不是一次偶然超时
+
+本次顺序复现与原15集运行得到完全相同的Episode 2终值：500 steps、Success 0、DTG 0.047094 m；两次运行在所有共同决策step上的最终frontier分配也完全一致。
+
+逐step诊断显示：
+
+- step 110首次进入0.2 m，之后共有391步处于成功距离内；
+- robot_0最小DTG为0.0327 m，并有395步 `found_goal=1`；
+- robot_0有26步 `planner_stop=true`，但都发生在它具有有效目标语义证据之前，因此 `found_goal && planner_stop` 的同step交集为0；
+- robot_1有451步 `planner_stop=true`，但500步内始终 `found_goal=0`；
+- 两台机器人均没有输出动作0。
+
+在step 110，具体状态为：robot_0 `found_goal=1, planner_stop=false`，robot_1 `found_goal=0, planner_stop=true`。该互补状态持续到最后一步。当前实现要求**同一台机器人**同时满足两个条件才STOP，不能把两台机器人的信号合并，因此Episode 2即使长时间位于成功区域也不会结束。
+
+隔离Episode 2则在step 90首次进入0.2 m；step 96时robot_0同时满足 `found_goal=1, planner_stop=true` 并输出STOP，因此成功。这说明Episode 2对进入episode时的RNG状态和早期轨迹敏感，但在论文主实验采用的原顺序设置下，超时路径是可复现的。
+
+#### Episode 4：原始“近目标超时”没有稳定复现，但STOP链路仍不稳定
+
+本次顺序复现没有重复原来的500步近目标超时。它在step 99首次与原运行发生frontier分配分叉：
+
+| step 99 | 原运行 | 本次顺序复现 |
+|---|---|---|
+| LLM概率 | `room_2_2=0.15, room_2_3=0.20, room_3_2=0.25` | `room_2_2=0.20, room_2_3=0.30, room_3_2=0.10` |
+| 最终分配 `(robot_0, robot_1)` | `(frontier_0, frontier_1)` | `(frontier_3, frontier_2)` |
+
+分叉后，本次顺序运行在step 149由robot_1触发STOP，但STOP机器人距离目标仍为8.2426 m，当前两台机器人的最小重新计算DTG也为4.8581 m。诊断显示robot_1出现chair语义误检并同时满足FMM停止条件，因此这是一次远距离误STOP，而不是近目标超时。
+
+隔离Episode 4走了第三条轨迹：step 270首次进入0.2 m，step 275时robot_0的目标检测和FMM停止条件在同一步成立，最终成功。
+
+因此不能把Episode 4原来的500步超时视为稳定、确定性的单episode结果；它对LLM概率输出和早期轨迹高度敏感。不过三条轨迹共同说明当前STOP链路存在系统性脆弱点：既可能出现“真实接近目标但语义目标与FMM停止条件不重合”的漏停，也可能出现“语义误检与FMM停止恰好重合”的误停。
+
+#### 诊断结论和修复约束
+
+1. Episode 2的近目标timeout在相同顺序条件下精确复现，不能归为偶然情况。
+2. Episode 4的具体近目标timeout未复现，属于轨迹敏感结果；但复现暴露了同一机制的远距离误STOP风险。
+3. 不能简单改成“任意Agent检测到目标且任意Agent的FMM停止就全局STOP”。Episode 2正好存在这种跨Agent互补信号，而它在其他场景会把一个Agent的语义误检和另一个Agent到达普通frontier错误组合，增加误STOP。
+4. 下一步应让每台Agent的FMM停止判定明确对应它自己的、当前且新鲜的目标语义组件，并增加连续帧/面积/置信度确认；全局任务仍可在任一Agent通过本地一致性检查后结束。
+5. 为提高配对实验复现性，建议在每个episode开始时使用可记录的派生seed，并向vLLM请求显式传入seed；同时保留逐step STOP诊断作为回归日志。
+
+本次复现新增文件：
+
+- `results/runs/kg_phase1_stopdiag_seq_ep1_4_20260716.jsonl`：Episode 1–4顺序复现结果；
+- `results/runs/kg_phase1_stopdiag_seq_ep1_4_20260716.stop.jsonl`：顺序复现的逐step STOP诊断；
+- `results/runs/kg_phase1_stopdiag_isolated_ep2_20260716.jsonl`：隔离Episode 2结果；
+- `results/runs/kg_phase1_stopdiag_isolated_ep2_20260716.stop.jsonl`：隔离Episode 2诊断；
+- `results/runs/kg_phase1_stopdiag_isolated_ep4_20260716.jsonl`：隔离Episode 4结果；
+- `results/runs/kg_phase1_stopdiag_isolated_ep4_20260716.stop.jsonl`：隔离Episode 4诊断。
+
+三组运行共49次KG决策，schema v2映射审计中的覆盖、陈旧候选、非当前room分配、瞬时属性泄漏、执行非当前frontier、room/frontier不一致及重复分配均保持为0。
+
+

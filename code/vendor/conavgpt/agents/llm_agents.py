@@ -88,6 +88,10 @@ class LLM_Agent(Agent):
         self.collision_s = 0
         self.replan_count = 0
         self.replan_flag = 0
+        self.last_found_goal = 0
+        self.last_planner_stop = False
+        self.last_target_map_mass = 0.0
+        self.last_goal_map_mass = 0.0
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
@@ -188,6 +192,10 @@ class LLM_Agent(Agent):
         self.replan_count = 0
         self.replan_flag = 0
         self.stop = 0
+        self.last_found_goal = 0
+        self.last_planner_stop = False
+        self.last_target_map_mass = 0.0
+        self.last_goal_map_mass = 0.0
 
         self.eve_angle = 0
 
@@ -360,7 +368,10 @@ class LLM_Agent(Agent):
             # print("Don't Find the edge")
 
         cn = coco_categories[self.goal_id] + 4
-        if self.local_map[cn, :, :].sum() != 0.:
+        self.last_target_map_mass = float(
+            self.local_map[cn, :, :].sum().detach().cpu().item()
+        )
+        if self.last_target_map_mass != 0.:
             cat_semantic_map = self.local_map[cn, :, :].cpu().numpy()
             cat_semantic_scores = cat_semantic_map
             cat_semantic_scores[cat_semantic_scores > 0] = 1.
@@ -368,6 +379,9 @@ class LLM_Agent(Agent):
                 cat_semantic_scores = cv2.dilate(cat_semantic_scores, self.tv_kernel)
             local_goal_maps = self.find_big_connect(cat_semantic_scores)
             found_goal = 1
+
+        self.last_found_goal = int(found_goal)
+        self.last_goal_map_mass = float(local_goal_maps.sum())
      
         # ------------------------------------------------------------------
 
@@ -494,6 +508,7 @@ class LLM_Agent(Agent):
         # start_stg = time.time()
         stg, stop = self._get_stg(map_pred, start, np.copy(goal),
                                   planning_window)
+        self.last_planner_stop = bool(stop)
         # stg_end = time.time()
         # stg_time = stg_end - start_stg
         # print('act_time: %.3f秒'%stg_time)
@@ -912,4 +927,3 @@ class LLM_Agent(Agent):
         #         dump_dir, self.episode_n,
         #         self.agent_id, self.l_step)
         #     cv2.imwrite(fn, self.vis_image)
-
