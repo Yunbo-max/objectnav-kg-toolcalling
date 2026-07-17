@@ -344,6 +344,22 @@ class HelicaseToolCallingTests(unittest.TestCase):
         return assignments, view, fake_brain, helicase, tools, method, kg
 
     def test_equivalent_qwen_tool_syntax_is_canonicalized(self):
+        canonical_list = HelicaseBrain._load_json(json.dumps([{
+            "name": "estimate_room_probability",
+            "arguments": {
+                "room_id": "room_2_2",
+                "target": "bed",
+                "probability": 0.2,
+                "confidence": 0.8,
+                "evidence_ids": [],
+                "reason": "unknown room",
+            },
+        }]), expected_tool_name="estimate_room_probability")
+        self.assertEqual(
+            canonical_list["tool_calls"][0]["name"],
+            "estimate_room_probability",
+        )
+
         compact = HelicaseBrain._load_json(json.dumps([{
             "tool_call": "estimate_room_probability",
             "room_id": "room_2_2",

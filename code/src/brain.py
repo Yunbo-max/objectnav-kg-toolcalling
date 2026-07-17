@@ -83,7 +83,12 @@ class HelicaseBrain:
                         "schema_error: compact tool call must be an object"
                     )
                 tool_call = compact_call.get("tool_call")
-                if isinstance(tool_call, str):
+                if (set(compact_call) == {"name", "arguments"}
+                        and isinstance(compact_call["name"], str)):
+                    # DeepSeek may omit the outer ``tool_calls`` object while
+                    # otherwise returning canonical OpenAI-style calls.
+                    canonical_calls.append(compact_call)
+                elif isinstance(tool_call, str):
                     canonical_calls.append({
                         "name": tool_call,
                         "arguments": {
@@ -1041,21 +1046,52 @@ class HelicaseBrain:
         } for room_id in current_room_ids]
         probability_prompt = (
             "You are the central MindNav KG reasoning LLM. This is LLM CALL "
-            "1/2 for the current planning decision. Read the complete "
-            "serialized KG and deterministic room-object query results. For "
-            "every current room, call estimate_room_probability exactly once. "
-            "Estimate your own P(target|room) using observed room type, object "
-            "identity and certainty, exploration evidence, and your parametric "
-            "world knowledge. probability means target presence likelihood; "
-            "confidence means evidence reliability. Independent room "
-            "probabilities need not sum to one. Do not use a Python target "
-            "prior; none is provided. Return pure JSON with only tool_calls. "
-            "Each call arguments must contain exactly room_id, target, "
-            "probability, confidence, evidence_ids, reason. Copy evidence_ids "
-            "only from that room's allowed list. These citations are stable "
-            "room/object node IDs; never cite relation labels or frontier "
-            "IDs. You may use the complete KG for reasoning even when a fact "
-            "is not cited as an evidence_id.\n\n"
+            "1/2 for the current planning decision. This call is an "
+            "exploration-time SEMANTIC BELIEF ESTIMATOR, not an action "
+            "planner.\n\n"
+            "REGION SEMANTICS: each room_id denotes a fixed spatial map "
+            "region associated with current frontiers. It is not guaranteed "
+            "to be one complete physical room. observed_type=unknown is "
+            "normal and means that current evidence cannot classify the "
+            "region. Never guess a room type from its ID, coordinates, "
+            "frontier size, or evidence belonging to another room.\n\n"
+            "Read the complete serialized KG and deterministic room-object "
+            "query results. For every current room, call "
+            "estimate_room_probability exactly once. probability means "
+            "P(target is physically present in this region | accumulated "
+            "semantic evidence). It "
+            "is a semantic belief only: do NOT include robot distance, "
+            "frontier area, navigation cost, robot assignment, or exploration "
+            "utility. Independent room probabilities need not sum to one. Do "
+            "not use a Python target prior; none is provided.\n\n"
+            "Use this evidence order for each region: (1) same-region direct "
+            "target or target-diagnostic objects, including certainty and "
+            "observation count; (2) a compatible observed room type, weighted "
+            "by type_certainty; (3) explored and observation_count only as "
+            "weak negative evidence, because visited does not mean "
+            "exhaustively searched; and (4) graph topology or historical "
+            "context only as weak context. Never transfer an object, room "
+            "type, or other factual evidence across room IDs.\n\n"
+            "UNKNOWN POLICY: unknown means unresolved, not target-incompatible. "
+            "If evidence-equivalent unknown regions have no target-relevant "
+            "evidence, give them an honest shared baseline belief with low "
+            "confidence; exact ties are valid and you must not fabricate "
+            "differences. An unresolved unknown region may be more worth "
+            "searching than a confidently observed target-incompatible "
+            "region, but exploration value is decided only in CALL 2.\n\n"
+            "confidence means reliability of this semantic estimate. It is "
+            "not probability and must not simply copy type_certainty. High "
+            "probability plus high confidence means grounded positive "
+            "evidence; low probability plus high confidence means grounded "
+            "negative evidence; low confidence means unresolved. Keep reason "
+            "concise and factual, using only evidence belonging to that same "
+            "region.\n\n"
+            "Return pure JSON with only tool_calls. Each call arguments must "
+            "contain exactly room_id, target, probability, confidence, "
+            "evidence_ids, reason. Copy evidence_ids only from that room's "
+            "allowed list. These citations are stable room/object node IDs; "
+            "never cite relation labels or frontier IDs."
+            "\n\n"
             f"TARGET: {target_name}\n"
             f"STEP: {int(step)}/{int(max_steps)}\n"
             f"CURRENT_ROOM_IDS: {json.dumps(current_room_ids)}\n"
@@ -1079,7 +1115,10 @@ class HelicaseBrain:
                     target_name,
                     allowed_evidence,
                 ),
-                max_tokens=1200,
+                # Keep enough completion headroom for four complete room
+                # records.  DeepSeek JSON mode can still be cut mid-object if
+                # max_tokens is too small.
+                max_tokens=2048,
             )
         )
         llm_call_count += len(responses)
@@ -1131,18 +1170,59 @@ class HelicaseBrain:
         ]
         assignment_prompt = (
             "You are the central MindNav allocation LLM. This is LLM CALL "
-            "2/2. Use only the current decision packet below; it is the "
-            "task-relevant projection of the KG. Make the final joint "
-            "assignment yourself—Python will not rerank a valid answer.\n\n"
-            "Follow a strict room-first procedure: (A) compare current rooms "
-            "using target_probability, confidence, objects, exploration state "
-            "and recent progress; (B) choose one room per robot; (C) within "
-            "each chosen room select one of that room's frontier IDs using "
-            "robot distance and frontier area. Avoid repeatedly sending the "
-            "same robot to a room when recent assignments produced no new "
-            "object or room evidence and another current room is available. "
-            "Repetition is allowed when new evidence appeared, the room has "
-            "clearly stronger target likelihood, or no alternative exists.\n\n"
+            "2/2. Your objective is to choose the joint "
+            "assignment that maximizes the chance that at least one robot "
+            "visually detects the target before the next global replanning "
+            "step, while limiting travel and redundant coverage. Use only the "
+            "current decision packet below; Python will not rerank a valid "
+            "answer.\n\n"
+            "REGION SEMANTICS: a room_id is a fixed spatial map region, not "
+            "necessarily one complete physical room. observed_type=unknown is "
+            "normal. Never invent its room type or copy semantic facts from a "
+            "different room. CURRENT_DECISION_PACKET fields are authoritative. "
+            "probability_reason is only a summary; verify every factual claim "
+            "against the selected room's observed_type, objects, probability, "
+            "confidence, history, and frontiers.\n\n"
+            "Interpret CALL 1 correctly: high target_probability with high "
+            "probability_confidence is grounded semantic evidence; low "
+            "probability with high confidence is grounded negative evidence; "
+            "low confidence means unresolved and must be judged through "
+            "exploration coverage. Do not let small numerical differences "
+            "between low-confidence unknown regions drive the assignment.\n\n"
+            "First identify GROUNDED_PROMISING regions. A region is grounded "
+            "only when its target belief is supported by same-region "
+            "target-related objects or by a compatible non-unknown room type "
+            "with meaningful certainty. A larger probability alone is not "
+            "grounding. Then follow this adaptive room-first policy:\n"
+            "(A) If at least two distinct grounded promising regions exist, "
+            "select the best distinct grounded regions.\n"
+            "(B) If exactly one grounded promising region exists, assign one "
+            "suitable robot to exploit it and send the other robot to the best "
+            "spatially complementary fresh region.\n"
+            "(C) If no grounded promising region exists, enter COVERAGE MODE: "
+            "treat evidence-equivalent low-confidence unknown regions as "
+            "semantically tied and choose by new visual exposure, spatial "
+            "complementarity, recent progress, and travel cost.\n\n"
+            "For toilet and bed, strong grounded room/object evidence may "
+            "dominate. For sofa and tv_monitor, combine semantic evidence with "
+            "fresh coverage. For broadly distributed chair and plant, rely on "
+            "semantic evidence only when it is strong; otherwise emphasize "
+            "complementary coverage.\n\n"
+            "COVERAGE AND HISTORY RULES: do not penalize a repeated room by "
+            "itself. A repeat remains useful when its current frontier centroid "
+            "is substantially different from recent centroids, represents a "
+            "different entrance/viewpoint, or has progressed outward into "
+            "unknown space. Strongly downrank sending the same robot toward a "
+            "similar, stationary frontier centroid after repeated assignments "
+            "without new evidence. No new KG object alone does not prove that "
+            "the whole region was visually exhausted. Prefer two frontiers "
+            "that expose spatially different areas; distinct room IDs alone "
+            "do not guarantee non-overlapping views. Use frontier area only as "
+            "a weak tie-breaker, not as evidence that the target is present.\n\n"
+            "After choosing the distinct room/frontier set, jointly match "
+            "robots to it to minimize total distance and avoid crossing or "
+            "duplicated travel. Distance is an exploration cost, never "
+            "semantic evidence.\n\n"
             f"ROOM_DIVERSITY_REQUIRED: {str(distinct_rooms_required).lower()}. "
             "When true, assigned room_id values MUST be distinct. When false, "
             "robots may share the only available room but must use distinct "
@@ -1153,6 +1233,13 @@ class HelicaseBrain:
             "with a frontier_id from another entry.\n\n"
             f"VALID_ROOM_FRONTIER_PAIRS: "
             f"{json.dumps(valid_room_frontier_pairs)}\n\n"
+            "Each reason must be a concise, auditable statement using only "
+            "the selected room/frontier's actual packet fields. State whether "
+            "the choice is semantic exploitation or complementary coverage. "
+            "Do not say higher, closest, largest, fresh, or different unless "
+            "the packet numerically or historically supports that comparison. "
+            "The diversity field is a protocol literal and MUST always be "
+            "true, even when distinct rooms are unavailable.\n\n"
             "Return pure JSON with only tool_calls and exactly one "
             "assign_frontiers call. Its arguments must be {assignments, "
             "diversity}; diversity must be true. assignments must map every "
@@ -1165,7 +1252,12 @@ class HelicaseBrain:
             '{"assignments":{"robot_0":{"frontier_id":0,"room_id":'
             '"room_ID","reason":"reason"},"robot_1":{"frontier_id":1,'
             '"room_id":"room_ID","reason":"reason"}},"diversity":true}}]}'
-            " Do not add a top-level assign_frontiers field.\n\n"
+            " Do not add a top-level assign_frontiers field. Before returning, "
+            "silently verify that every robot appears exactly once, every "
+            "room/frontier pair was copied intact from "
+            "VALID_ROOM_FRONTIER_PAIRS, required rooms and frontiers are "
+            "distinct, diversity is true, and every statement in each reason "
+            "matches the selected packet record.\n\n"
             f"TARGET: {target_name}\n"
             f"STEP: {int(step)}/{int(max_steps)}\n"
             f"CURRENT_DECISION_PACKET:\n"
@@ -1178,7 +1270,9 @@ class HelicaseBrain:
                 lambda payload: self._validate_assignment_calls(
                     payload, current_frontiers
                 ),
-                max_tokens=750,
+                # Assignment reasons sometimes exceeded the previous limit;
+                # JSON mode only guarantees validity when output is not cut.
+                max_tokens=2048,
             )
         )
         llm_call_count += len(responses)

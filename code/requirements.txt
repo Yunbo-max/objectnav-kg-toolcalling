@@ -5,6 +5,8 @@ numpy==1.26.4
 networkx>=3.2
 Pillow>=10.0
 pyyaml>=6.0
+openai>=1.109.1
+python-dotenv>=1.0
 habitat-sim==0.2.1
 habitat-lab==0.2.1
 # Co-NavGPT perception stack (pinned)

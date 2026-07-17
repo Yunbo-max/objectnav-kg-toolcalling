@@ -299,17 +299,35 @@ class HabitatSim(habitat_sim.Simulator, Simulator):
         )
         sim_config.scene_id = self.habitat_config.SCENE
         agent_config = habitat_sim.AgentConfiguration()
+        # Habitat-Sim 0.2.2 removed the legacy agent dynamics fields that were
+        # present in 0.2.1.  Keep the vendored multi-agent Habitat-Lab fork
+        # compatible with both simulator versions without discarding those
+        # settings when the older simulator is used.
+        agent_ignore_keys = {
+            "is_set_start_state",
+            # This is the Sensor Config. Unpacked below
+            "sensors",
+            "start_position",
+            "start_rotation",
+        }
+        legacy_agent_dynamics = {
+            "angular_acceleration",
+            "angular_friction",
+            "coefficient_of_restitution",
+            "linear_acceleration",
+            "linear_friction",
+            "mass",
+        }
+        agent_ignore_keys.update(
+            key
+            for key in legacy_agent_dynamics
+            if not hasattr(agent_config, key)
+        )
         overwrite_config(
             config_from=self._get_agent_config(),
             config_to=agent_config,
             # These keys are only used by Hab-Lab
-            ignore_keys={
-                "is_set_start_state",
-                # This is the Sensor Config. Unpacked below
-                "sensors",
-                "start_position",
-                "start_rotation",
-            },
+            ignore_keys=agent_ignore_keys,
         )
 
         sensor_specifications = []

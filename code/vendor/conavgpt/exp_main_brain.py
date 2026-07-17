@@ -28,6 +28,11 @@ if CODE_SRC not in sys.path:
     sys.path.insert(0, CODE_SRC)
 from brain import HelicaseBrain
 from kg_construction import CurrentFrontierView, KnowledgeGraph, KGUpdater
+from llm_api import OpenAICompatibleBrainAdapter, load_brain_api_config
+from mcoconav_metrics import (
+    MCoCoNavMetricTracker,
+    build_instance_category_map,
+)
 from reproducibility import reset_episode_rng
 
 from skimage import measure
@@ -114,46 +119,6 @@ LOCAL_MODEL_PATHS = [
     os.path.join(PROJECT_ROOT, 'models', 'Qwen2.5-7B-Instruct'),
 ]
 gpt_name = ['Qwen2.5-3B', 'Qwen2.5-7B']
-
-
-class OpenAICompatibleBrainAdapter:
-    """Expose the ``brain.call`` interface expected by HelicaseBrain."""
-
-    def __init__(self, base_url, api_key, model, usage_sink, seed=None):
-        import openai
-
-        self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
-        self.model = model
-        self.usage_sink = usage_sink
-        self.seed = seed
-        self.last_prompt = ""
-        self.last_response = ""
-
-    def call(self, prompt, max_tokens=300):
-        self.last_prompt = prompt
-        request = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are the MindNav Helicase KG reasoning brain. Follow the requested output format exactly.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0,
-        }
-        if self.seed is not None:
-            request["seed"] = int(self.seed)
-        response = self.client.chat.completions.create(
-            **request,
-        )
-        content = response.choices[0].message.content.strip()
-        self.last_response = content
-        self.usage_sink.append(0)
-        print(f"MindNav core brain ({self.model}) response:")
-        print(content)
-        return content
 
 
 def build_room_frontier_audit(
@@ -356,6 +321,111 @@ def get_per_agent_goal_distances(env, episode, num_agents):
     except Exception as error:
         print(f"STOP diagnostic distance error: {error}")
         return [None] * num_agents
+
+
+def save_target_diagnostic_artifact(
+    agent,
+    base_dir,
+    episode_index,
+    goal,
+    step,
+    event,
+    action,
+    global_distance_to_goal,
+    agent_distance_to_goal,
+):
+    """Save passive RGB/mask/map evidence for a target event."""
+    if agent.last_rgb_observation is None:
+        return None
+
+    event_dir = os.path.join(
+        os.path.abspath(base_dir),
+        f"episode_{episode_index + 1:02d}_{goal}",
+    )
+    os.makedirs(event_dir, exist_ok=True)
+    stem = f"step_{step:03d}_robot_{agent.agent_id}_{event}"
+    masks = agent.last_target_frame_masks
+    rgb = agent.last_rgb_observation.astype(np.uint8, copy=True)
+    rednet = masks.get("rednet", np.zeros(rgb.shape[:2], dtype=np.uint8))
+    maskrcnn = masks.get(
+        "maskrcnn", np.zeros(rgb.shape[:2], dtype=np.uint8)
+    )
+    fused = masks.get(
+        "fused_union", np.zeros(rgb.shape[:2], dtype=np.uint8)
+    )
+    intersection = masks.get(
+        "source_intersection", np.zeros(rgb.shape[:2], dtype=np.uint8)
+    )
+
+    panels = [rgb]
+    for label, mask, color in (
+        ("RedNet", rednet, (255, 0, 0)),
+        ("Mask R-CNN", maskrcnn, (0, 0, 255)),
+        ("Fused", fused, (255, 0, 255)),
+    ):
+        overlay = rgb.copy()
+        overlay[mask.astype(bool)] = (
+            0.45 * overlay[mask.astype(bool)]
+            + 0.55 * np.asarray(color)
+        ).astype(np.uint8)
+        cv2.putText(
+            overlay,
+            label,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        panels.append(overlay)
+    composite = np.concatenate(panels, axis=1)
+    image_path = os.path.join(event_dir, stem + ".png")
+    cv2.imwrite(image_path, composite[:, :, ::-1])
+
+    array_path = os.path.join(event_dir, stem + ".npz")
+    np.savez_compressed(
+        array_path,
+        rgb=rgb,
+        rednet=rednet,
+        maskrcnn=maskrcnn,
+        fused_union=fused,
+        source_intersection=intersection,
+        target_map=(
+            agent.last_target_map_binary
+            if agent.last_target_map_binary is not None
+            else np.zeros((1, 1), dtype=np.uint8)
+        ),
+        goal_map=(
+            agent.last_goal_map_binary
+            if agent.last_goal_map_binary is not None
+            else np.zeros((1, 1), dtype=np.uint8)
+        ),
+    )
+
+    metadata = {
+        "episode_index": int(episode_index),
+        "episode": int(episode_index + 1),
+        "goal": goal,
+        "step": int(step),
+        "robot_id": f"robot_{agent.agent_id}",
+        "event": event,
+        "action": int(action),
+        "global_distance_to_goal": float(global_distance_to_goal),
+        "agent_distance_to_goal": agent_distance_to_goal,
+        "found_goal": int(agent.last_found_goal),
+        "planner_stop": bool(agent.last_planner_stop),
+        "target_map_mass": float(agent.last_target_map_mass),
+        "goal_map_mass": float(agent.last_goal_map_mass),
+        "semantic_sources": agent.last_semantic_source_stats,
+        "target_map_stats": agent.last_target_map_stats,
+        "image": image_path,
+        "arrays": array_path,
+    }
+    metadata_path = os.path.join(event_dir, stem + ".json")
+    with open(metadata_path, "w") as metadata_file:
+        json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
+    return metadata_path
 
 
 def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visited_vis, map_edge, goal_points):
@@ -879,12 +949,11 @@ class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
 def main():
     args = get_args()
 
-    brain_backend = os.environ.get("BRAIN_BACKEND", "siliconflow").strip().lower()
-    if brain_backend == "vllm":
-        brain_base_url = os.environ.get("BRAIN_BASE_URL", "http://127.0.0.1:8000/v1")
-        brain_api_key = os.environ.get("BRAIN_API_KEY", "local-vllm")
-        brain_model = os.environ.get("BRAIN_MODEL", "qwen2.5-3b")
-        if brain_base_url.startswith(("http://127.0.0.1", "http://localhost")):
+    brain_config = load_brain_api_config(PROJECT_ROOT)
+    if brain_config.backend == "vllm":
+        if brain_config.base_url.startswith(
+            ("http://127.0.0.1", "http://localhost")
+        ):
             for proxy_bypass_var in ("NO_PROXY", "no_proxy"):
                 bypass_hosts = os.environ.get(proxy_bypass_var, "").split(",")
                 bypass_hosts = [host for host in bypass_hosts if host]
@@ -892,15 +961,20 @@ def main():
                     if host not in bypass_hosts:
                         bypass_hosts.append(host)
                 os.environ[proxy_bypass_var] = ",".join(bypass_hosts)
-        print(f"Using vLLM brain service: {brain_base_url} ({brain_model})")
-        print("Skipping in-process Qwen loading; vLLM owns the model instance.")
-    else:
-        brain_base_url = os.environ.get("BRAIN_BASE_URL", "https://api.siliconflow.cn/v1")
-        brain_api_key = os.environ.get(
-            "BRAIN_API_KEY", os.environ.get("SILICONFLOW_API_KEY", "")
+        print(
+            "Using vLLM brain service: "
+            f"{brain_config.base_url} ({brain_config.model})"
         )
-        brain_model = os.environ.get("BRAIN_MODEL", "Pro/MiniMaxAI/MiniMax-M2.5")
-
+        print("Skipping in-process Qwen loading; vLLM owns the model instance.")
+    elif brain_config.backend == "deepseek":
+        thinking = brain_config.extra_body["thinking"]["type"]
+        print(
+            "Using DeepSeek API brain: "
+            f"{brain_config.base_url} ({brain_config.model}, "
+            f"thinking={thinking})"
+        )
+        print("Skipping in-process Qwen loading; DeepSeek is API-hosted.")
+    else:
         # Preserve the original local-model initialization outside vLLM mode.
         model_path = args.llm_path or LOCAL_MODEL_PATHS[args.gpt_type]
         model_type = "vl" if "VL" in model_path else "text"
@@ -999,6 +1073,18 @@ def main():
         os.makedirs(stop_diag_dir, exist_ok=True)
         open(args.stop_diag_jsonl, "w").close()
         print(f"Writing per-step STOP diagnostics to {args.stop_diag_jsonl}")
+    target_diag_goals = {
+        goal.strip()
+        for goal in args.target_diag_goals.split(",")
+        if goal.strip()
+    }
+    if args.target_diag_dir:
+        os.makedirs(os.path.abspath(args.target_diag_dir), exist_ok=True)
+        print(
+            "Writing target diagnostic artifacts to "
+            f"{os.path.abspath(args.target_diag_dir)} "
+            f"for goals={sorted(target_diag_goals)}"
+        )
     # ------------------------------------------------------------------
 
 
@@ -1015,15 +1101,17 @@ def main():
     decision_history = []
 
     brain_adapter = OpenAICompatibleBrainAdapter(
-        base_url=brain_base_url,
-        api_key=brain_api_key,
-        model=brain_model,
+        config=brain_config,
         usage_sink=total_usage,
         seed=args.seed if args.reset_seed_each_episode else None,
     )
     kg = KnowledgeGraph()
     kg_updater = KGUpdater(kg)
     mindnav_brain = HelicaseBrain(brain_adapter, num_agents=num_agents)
+    mcoconav_tracker = MCoCoNavMetricTracker(
+        num_agents=num_agents,
+        map_resolution_cm=args.map_resolution,
+    )
     print(f"Using MindNav core: {CODE_SRC}/brain.py + {CODE_SRC}/kg_construction.py")
 
     while count_episodes < num_episodes:
@@ -1049,6 +1137,17 @@ def main():
         goal_points.clear()
         for i in range(num_agents):
             agent[i].reset()
+        semantic_scene = env.sim.semantic_annotations()
+        instance_categories = build_instance_category_map(
+            semantic_scene.objects,
+            getattr(env, "hm3d_semantic_mapping", None),
+        )
+        mcoconav_tracker.reset(
+            goal_name=getattr(current_episode, "object_category", "unknown"),
+            initial_world_poses=[agent[i].curr_loc[:2] for i in range(num_agents)],
+            instance_categories=instance_categories,
+        )
+        target_first_found_saved = [False] * num_agents
 
         while not env.episode_over:
             action = [0, 0]
@@ -1304,6 +1403,13 @@ def main():
             # start_act = time.time()
             for i in range(num_agents):
                 action[i] = agent[i].act(goal_points[i])
+                mcoconav_tracker.observe_agent(
+                    agent_id=i,
+                    planner_pose_inputs=agent[i].planner_pose_inputs,
+                    map_shape=agent[i].local_map.shape[-2:],
+                    predicted_find_goal=agent[i].last_found_goal,
+                    semantic_observation=observations[i].get("semantic"),
+                )
             # act_end = time.time()
             # act_time = act_end - start_act
             # print('act_time: %.3f秒'%act_time)
@@ -1311,13 +1417,49 @@ def main():
 
             observations = env.step(action)
 
-            if args.stop_diag_jsonl:
+            if args.stop_diag_jsonl or args.target_diag_dir:
                 step_metrics = env.get_metrics()
                 per_agent_dtg = get_per_agent_goal_distances(
                     env,
                     current_episode,
                     num_agents,
                 )
+                target_artifacts = []
+                if (
+                    args.target_diag_dir
+                    and agent[0].goal_name in target_diag_goals
+                ):
+                    for i in range(num_agents):
+                        events = []
+                        if (
+                            agent[i].last_found_goal
+                            and not target_first_found_saved[i]
+                        ):
+                            events.append("first_found")
+                            target_first_found_saved[i] = True
+                        if int(action[i]) == 0:
+                            events.append("stop")
+                        for event in events:
+                            artifact = save_target_diagnostic_artifact(
+                                agent=agent[i],
+                                base_dir=args.target_diag_dir,
+                                episode_index=(
+                                    args.start_episode_index + count_episodes
+                                ),
+                                goal=agent[0].goal_name,
+                                step=int(agent[0].l_step),
+                                event=event,
+                                action=action[i],
+                                global_distance_to_goal=float(
+                                    step_metrics.get(
+                                        "distance_to_goal", -1.0
+                                    )
+                                ),
+                                agent_distance_to_goal=per_agent_dtg[i],
+                            )
+                            if artifact:
+                                target_artifacts.append(artifact)
+            if args.stop_diag_jsonl:
                 stop_record = {
                     "schema_version": 1,
                     "episode_index": int(
@@ -1349,6 +1491,12 @@ def main():
                                 agent[i].last_goal_map_mass
                             ),
                             "replan_count": int(agent[i].replan_count),
+                            "semantic_sources": (
+                                agent[i].last_semantic_source_stats
+                            ),
+                            "target_map_stats": (
+                                agent[i].last_target_map_stats
+                            ),
                             "pose": [
                                 float(value)
                                 for value in agent[i].planner_pose_inputs[:3]
@@ -1356,6 +1504,7 @@ def main():
                         }
                         for i in range(num_agents)
                     ],
+                    "target_artifacts": target_artifacts,
                 }
                 with open(args.stop_diag_jsonl, "a") as stop_diag_file:
                     json.dump(stop_record, stop_diag_file, ensure_ascii=False)
@@ -1386,12 +1535,35 @@ def main():
         ]) + '\n'
 
         metrics = env.get_metrics()
+        mcoconav_metrics = mcoconav_tracker.result()
+        agg_metrics["mcoconav_success"] += mcoconav_metrics["success"]
+        agg_metrics["mcoconav_navigation_success"] += mcoconav_metrics[
+            "navigation_success"
+        ]
+        agg_metrics["mcoconav_spl"] += mcoconav_metrics["spl"]
+        agg_metrics["mcoconav_any_agent_success"] += mcoconav_metrics[
+            "any_agent_success"
+        ]
         if args.jsonl_log:
             episode_record = {
                 "method": args.method_name,
                 "episode": args.start_episode_index + count_episodes,
                 "success": float(metrics.get("success", 0.0)),
                 "spl": float(metrics.get("spl", 0.0)),
+                "habitat_success": float(metrics.get("success", 0.0)),
+                "habitat_spl": float(metrics.get("spl", 0.0)),
+                "mcoconav_success": mcoconav_metrics["success"],
+                "mcoconav_navigation_success": mcoconav_metrics[
+                    "navigation_success"
+                ],
+                "mcoconav_spl": mcoconav_metrics["spl"],
+                "mcoconav_any_agent_success": mcoconav_metrics[
+                    "any_agent_success"
+                ],
+                "mcoconav_deciding_robot": mcoconav_metrics[
+                    "deciding_robot"
+                ],
+                "mcoconav_agent_metrics": mcoconav_metrics["agent_metrics"],
                 "goal": agent[0].goal_name,
                 "steps": int(agent[0].l_step),
                 "distance_to_goal": float(metrics.get("distance_to_goal", -1.0)),

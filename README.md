@@ -35,12 +35,25 @@ At matched perception + LLM scale, KG tool calling gives **+36% SPL**
 
 ## Quickstart
 
+Create the local API configuration (the real `.env` is git-ignored):
+
+```bash
+cp .env.example .env
+# Set DEEPSEEK_API_KEY in .env
+```
+
 ```bash
 pip install -r code/requirements.txt
 
-# Run MindNav on val_mini with Qwen2.5-7B brain
+# Run MindNav on val_mini with the DeepSeek API brain
 bash code/scripts/run_mindnav.sh
 ```
+
+MindNav's per-episode JSONL preserves Habitat's `success`/`spl` fields and
+also records `mcoconav_success`, `mcoconav_spl`, the original order-dependent
+MCoCoNav deciding robot, and per-robot detection/path audits. The MCoCoNav
+tracker is read-only and does not feed Habitat ground-truth semantics back into
+navigation.
 
 ## Citation
 

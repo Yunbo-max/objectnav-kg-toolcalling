@@ -24,3 +24,8 @@ data/**/*.scene_instance.json
 results/*.pkl
 results/*.jsonl
 results/runs/
+results/dump/
+results/diagnostics/
+ablation study.md
+AGENTS.md
+kg.md

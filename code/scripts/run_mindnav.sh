@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch MindNav on HM3D val_mini with Qwen2.5-7B brain.
+# Launch MindNav on HM3D val_mini with the API brain configured in .env.
 #
 # Uses the vendored Co-NavGPT perception stack in this repository.
 set -euo pipefail

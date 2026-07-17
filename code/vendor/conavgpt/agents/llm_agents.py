@@ -92,6 +92,12 @@ class LLM_Agent(Agent):
         self.last_planner_stop = False
         self.last_target_map_mass = 0.0
         self.last_goal_map_mass = 0.0
+        self.last_semantic_source_stats = {}
+        self.last_target_map_stats = {}
+        self.last_rgb_observation = None
+        self.last_target_frame_masks = {}
+        self.last_target_map_binary = None
+        self.last_goal_map_binary = None
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
@@ -196,6 +202,12 @@ class LLM_Agent(Agent):
         self.last_planner_stop = False
         self.last_target_map_mass = 0.0
         self.last_goal_map_mass = 0.0
+        self.last_semantic_source_stats = {}
+        self.last_target_map_stats = {}
+        self.last_rgb_observation = None
+        self.last_target_frame_masks = {}
+        self.last_target_map_binary = None
+        self.last_goal_map_binary = None
 
         self.eve_angle = 0
 
@@ -240,6 +252,8 @@ class LLM_Agent(Agent):
 
             if self.args.visualize or self.args.print_images:
                 self.vis_image = vu.init_vis_image(category_to_id[observations['objectgoal'][0]], 0)
+                self.rgb_vis = observations['rgb'][:, :, ::-1].astype(
+                    np.uint8, copy=True)
             # print("objectgoal: ", observations['objectgoal'])
 
             if observations['objectgoal'][0] == 3:
@@ -255,6 +269,15 @@ class LLM_Agent(Agent):
         state = np.concatenate((rgb, depth), axis=2).transpose(2, 0, 1)
 
         obs = self._preprocess_obs(state) 
+
+        # Detectron2 only returns a rendered RGB image in some visualization
+        # modes.  Image-only recording still needs a frame for the per-agent
+        # visualization, so fall back to the raw camera observation (BGR for
+        # OpenCV) when no rendered frame is available.
+        if self.args.print_images and self.args.visualize != 2:
+            self.rgb_vis = rgb[:, :, ::-1].astype(np.uint8, copy=True)
+        elif self.args.visualize and self.rgb_vis is None:
+            self.rgb_vis = rgb[:, :, ::-1].astype(np.uint8, copy=True)
 
         obs = torch.from_numpy(obs).float().to(self.device)
         # ------------------------------------------------------------------
@@ -371,6 +394,15 @@ class LLM_Agent(Agent):
         self.last_target_map_mass = float(
             self.local_map[cn, :, :].sum().detach().cpu().item()
         )
+        target_map_for_diag = (
+            self.local_map[cn, :, :].detach().cpu().numpy() > 0
+        )
+        self.last_target_map_stats = self._binary_mask_stats(
+            target_map_for_diag
+        )
+        self.last_target_map_binary = target_map_for_diag.astype(
+            np.uint8, copy=True
+        )
         if self.last_target_map_mass != 0.:
             cat_semantic_map = self.local_map[cn, :, :].cpu().numpy()
             cat_semantic_scores = cat_semantic_map
@@ -382,6 +414,9 @@ class LLM_Agent(Agent):
 
         self.last_found_goal = int(found_goal)
         self.last_goal_map_mass = float(local_goal_maps.sum())
+        self.last_goal_map_binary = (local_goal_maps > 0).astype(
+            np.uint8, copy=True
+        )
      
         # ------------------------------------------------------------------
 
@@ -614,6 +649,39 @@ class LLM_Agent(Agent):
         red_semantic_pred, semantic_pred = self._get_sem_pred(
             rgb.astype(np.uint8), depth, use_seg=use_seg)
 
+        # Diagnostic-only source attribution. These values are copied before
+        # fusion and are never fed back into mapping or control.
+        self.last_rgb_observation = rgb.astype(np.uint8, copy=True)
+        self.last_semantic_source_stats = {}
+        self.last_target_frame_masks = {}
+        if self.goal_id is not None:
+            target_category = coco_categories[self.goal_id]
+            rednet_target = (
+                red_semantic_pred == mp_categories_mapping[target_category]
+            )
+            maskrcnn_target = semantic_pred[:, :, target_category] > 0
+            fused_target = np.logical_or(rednet_target, maskrcnn_target)
+            agreement_target = np.logical_and(
+                rednet_target, maskrcnn_target
+            )
+            self.last_semantic_source_stats = {
+                "target_category_index": int(target_category),
+                "rednet": self._binary_mask_stats(rednet_target),
+                "maskrcnn": self._binary_mask_stats(maskrcnn_target),
+                "fused_union": self._binary_mask_stats(fused_target),
+                "source_intersection_pixels": int(
+                    agreement_target.sum()
+                ),
+            }
+            self.last_target_frame_masks = {
+                "rednet": rednet_target.astype(np.uint8, copy=True),
+                "maskrcnn": maskrcnn_target.astype(np.uint8, copy=True),
+                "fused_union": fused_target.astype(np.uint8, copy=True),
+                "source_intersection": agreement_target.astype(
+                    np.uint8, copy=True
+                ),
+            }
+
         sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], 15 + 1))   
         for i in range(0, 15):
             # print(mp_categories_mapping[i])
@@ -641,6 +709,39 @@ class LLM_Agent(Agent):
                                axis=2).transpose(2, 0, 1)
 
         return state
+
+    @staticmethod
+    def _binary_mask_stats(mask):
+        """Summarize a binary mask without changing the navigation state."""
+        binary = np.asarray(mask, dtype=np.uint8)
+        pixels = int(binary.sum())
+        if pixels == 0:
+            return {
+                "pixels": 0,
+                "components": 0,
+                "largest_component": 0,
+                "largest_bbox_xywh": None,
+            }
+
+        num_labels, _, component_stats, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
+        foreground_stats = component_stats[1:]
+        largest_index = int(np.argmax(
+            foreground_stats[:, cv2.CC_STAT_AREA]
+        ))
+        largest = foreground_stats[largest_index]
+        return {
+            "pixels": pixels,
+            "components": int(num_labels - 1),
+            "largest_component": int(largest[cv2.CC_STAT_AREA]),
+            "largest_bbox_xywh": [
+                int(largest[cv2.CC_STAT_LEFT]),
+                int(largest[cv2.CC_STAT_TOP]),
+                int(largest[cv2.CC_STAT_WIDTH]),
+                int(largest[cv2.CC_STAT_HEIGHT]),
+            ],
+        }
 
 
     def _preprocess_depth(self, depth, min_d, max_d):
@@ -922,8 +1023,10 @@ class LLM_Agent(Agent):
             cv2.imshow("episode_n {} agent_{}".format(self.episode_n, self.agent_id), self.vis_image)
             cv2.waitKey(1)
 
-        # if args.print_images:
-        #     fn = '{}/episodes/eps_{}/agent-{}-Vis-{}.png'.format(
-        #         dump_dir, self.episode_n,
-        #         self.agent_id, self.l_step)
-        #     cv2.imwrite(fn, self.vis_image)
+        if args.print_images:
+            frame_dir = '{}/episodes/eps_{}/'.format(
+                dump_dir, self.episode_n)
+            os.makedirs(frame_dir, exist_ok=True)
+            fn = '{}agent-{}-Vis-{}.png'.format(
+                frame_dir, self.agent_id, self.l_step)
+            cv2.imwrite(fn, self.vis_image)

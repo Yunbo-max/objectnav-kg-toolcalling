@@ -36,6 +36,11 @@ def get_args():
                         help='optional per-episode JSONL metrics path')
     parser.add_argument('--stop_diag_jsonl', type=str, default=None,
                         help='optional per-step target/STOP diagnostic JSONL path')
+    parser.add_argument('--target_diag_dir', type=str, default=None,
+                        help='optional directory for first-target/STOP RGB and semantic-mask artifacts')
+    parser.add_argument('--target_diag_goals', type=str,
+                        default='plant,tv_monitor',
+                        help='comma-separated goals recorded by --target_diag_dir')
     parser.add_argument('--method_name', type=str, default='mindnav_main',
                         help='method label stored in per-episode JSONL')
     parser.add_argument('--save_periodic', type=int, default=500000,

@@ -257,7 +257,7 @@ def Frontiers(full_map_pred):
     wall_edge = local_ex_map - target_edge
 
     # contours, hierarchy = cv2.findContours(cv2.inRange(wall_edge,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    _, contours, hierarchy = cv2.findContours(cv2.inRange(wall_edge,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(cv2.inRange(wall_edge,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     # if len(contours)>0:
     #     dst = np.zeros(wall_edge.shape)
     #     cv2.drawContours(dst, contours, -1, 1, 1)
@@ -317,7 +317,7 @@ def Objects_Extract(full_map_pred):
             se_object_map[se_object_map>0.1] = 1
             se_object_map = cv2.morphologyEx(se_object_map, cv2.MORPH_CLOSE, kernel)
             # contours, hierarchy = cv2.findContours(cv2.inRange(se_object_map,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-            _, contours, hierarchy = cv2.findContours(cv2.inRange(se_object_map,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+            contours, hierarchy = cv2.findContours(cv2.inRange(se_object_map,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
             for cnt in contours:
                 if len(cnt) > 30:
                     epsilon = 0.05 * cv2.arcLength(cnt, True)
@@ -435,6 +435,27 @@ def parse_answer(response_message):
     
     return parsed_dict_num
 
+
+def validate_frontier_assignments(assignments, num_agents, num_frontiers):
+    """Validate one complete Co-NavGPT frontier assignment."""
+    required_robots = [f"robot_{i}" for i in range(num_agents)]
+    missing = [robot_id for robot_id in required_robots if robot_id not in assignments]
+    extra = sorted(set(assignments) - set(required_robots))
+    invalid = {
+        robot_id: assignments[robot_id]
+        for robot_id in required_robots
+        if robot_id in assignments
+        and not 0 <= assignments[robot_id] < num_frontiers
+    }
+    if missing or extra or invalid:
+        raise ValueError(
+            "Invalid frontier assignment: "
+            f"missing={missing}, extra={extra}, invalid={invalid}; "
+            f"legal frontiers are frontier_0..frontier_{num_frontiers - 1}"
+        )
+
+    return [assignments[robot_id] for robot_id in required_robots]
+
 @habitat.registry.register_action_space_configuration
 class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
     def get(self):
@@ -454,10 +475,40 @@ class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
 def main():
     args = get_args()
 
-    # Load local LLM (replaces OpenAI API)
-    model_path = LOCAL_MODEL_PATHS[args.gpt_type]
-    vlm_device = f"cuda:{args.sem_gpu_id}"
-    load_model(model_path, device=vlm_device, model_type="text")
+    brain_backend = os.environ.get("BRAIN_BACKEND", "local").strip().lower()
+    brain_client = None
+    brain_model = None
+    if brain_backend == "vllm":
+        import openai
+
+        brain_base_url = os.environ.get(
+            "BRAIN_BASE_URL", "http://127.0.0.1:8000/v1"
+        )
+        brain_api_key = os.environ.get("BRAIN_API_KEY", "local-vllm")
+        brain_model = os.environ.get("BRAIN_MODEL", "qwen2.5-7b")
+        if brain_base_url.startswith(("http://127.0.0.1", "http://localhost")):
+            for proxy_bypass_var in ("NO_PROXY", "no_proxy"):
+                bypass_hosts = [
+                    host
+                    for host in os.environ.get(proxy_bypass_var, "").split(",")
+                    if host
+                ]
+                for host in ("127.0.0.1", "localhost"):
+                    if host not in bypass_hosts:
+                        bypass_hosts.append(host)
+                os.environ[proxy_bypass_var] = ",".join(bypass_hosts)
+        brain_client = openai.OpenAI(
+            api_key=brain_api_key,
+            base_url=brain_base_url,
+        )
+        print(f"Using vLLM brain service: {brain_base_url} ({brain_model})")
+        print("Skipping in-process Qwen loading; vLLM owns the model instance.")
+    else:
+        # Backward-compatible in-process local model path.
+        model_path = args.llm_path or LOCAL_MODEL_PATHS[args.gpt_type]
+        llm_gpu_id = args.llm_gpu_id if args.llm_gpu_id >= 0 else args.sem_gpu_id
+        vlm_device = f"cuda:{llm_gpu_id}"
+        load_model(model_path, device=vlm_device, model_type="text")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -472,6 +523,13 @@ def main():
     # Apply split argument
     config_env.DATASET.SPLIT = args.split
     config_env.DATASET.DATA_PATH = config_env.DATASET.DATA_PATH.replace("{split}", args.split)
+    config_env.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = args.sim_gpu_id
+    config_env.ENVIRONMENT.MAX_EPISODE_STEPS = args.max_episode_length
+    episode_shuffle = os.environ.get("EPISODE_SHUFFLE")
+    if episode_shuffle is not None:
+        config_env.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = episode_shuffle.lower() in {
+            "1", "true", "yes", "on"
+        }
 
     config_env.TASK.POSSIBLE_ACTIONS = config_env.TASK.POSSIBLE_ACTIONS + [
         "TURN_LEFT_S",
@@ -487,7 +545,19 @@ def main():
 
     env = Multi_Agent_Env(config_env=config_env)
 
-    num_episodes = env.number_of_episodes
+    total_episodes = env.number_of_episodes
+    if args.start_episode_index < 0 or args.start_episode_index >= total_episodes:
+        raise ValueError(
+            f"start_episode_index must be in [0, {total_episodes - 1}], "
+            f"got {args.start_episode_index}"
+        )
+
+    for _ in range(args.start_episode_index):
+        env.reset()
+
+    num_episodes = total_episodes - args.start_episode_index
+    if args.max_episodes > 0:
+        num_episodes = min(num_episodes, args.max_episodes)
 
     assert num_episodes > 0, "num_episodes should be greater than 0"
 
@@ -514,6 +584,11 @@ def main():
     print("Dumping at {}".format(log_dir))
     # print(args)
     logging.info(args)
+    if args.jsonl_log:
+        jsonl_dir = os.path.dirname(os.path.abspath(args.jsonl_log))
+        os.makedirs(jsonl_dir, exist_ok=True)
+        open(args.jsonl_log, "w").close()
+        print(f"Writing per-episode JSONL to {args.jsonl_log}")
     # ------------------------------------------------------------------
 
 
@@ -530,6 +605,13 @@ def main():
 
     while count_episodes < num_episodes:
         observations = env.reset()
+        current_episode = env.current_episode
+        print(
+            f"[EPISODE_START] index={args.start_episode_index + count_episodes} "
+            f"episode_id={current_episode.episode_id} "
+            f"scene={os.path.basename(current_episode.scene_id)} "
+            f"target={getattr(current_episode, 'object_category', 'unknown')}"
+        )
         for i in range(num_agents):
             agent[i].reset()
 
@@ -585,39 +667,85 @@ def main():
 
                     retries = 10    
                     while retries > 0:  
+                        response_message = None
                         try: 
-                            response = chat_completion_create(
-                                model=gpt_name[args.gpt_type],
-                                messages=message_list,
-                                temperature=0,
-                            )
-
-                            response_message = response["choices"][0]["message"]["content"]
+                            if brain_client is not None:
+                                response = brain_client.chat.completions.create(
+                                    model=brain_model,
+                                    messages=message_list,
+                                    temperature=0,
+                                )
+                                response_message = response.choices[0].message.content
+                            else:
+                                response = chat_completion_create(
+                                    model=gpt_name[args.gpt_type],
+                                    messages=message_list,
+                                    temperature=0,
+                                )
+                                response_message = response["choices"][0]["message"]["content"]
                             usage = 0
-                            print(gpt_name[args.gpt_type] + " response: ")
+                            print((brain_model or gpt_name[args.gpt_type]) + " response: ")
                             print(response_message)
-                            if gpt_name[args.gpt_type] == 'gpt-4':
+                            if brain_client is None and gpt_name[args.gpt_type] == 'gpt-4':
                                 usage = response['usage']['prompt_tokens'] * 0.03 / 1000 + response['usage']['completion_tokens'] * 0.06 / 1000
-                            elif gpt_name[args.gpt_type] == 'gpt-3.5-turbo':
+                            elif brain_client is None and gpt_name[args.gpt_type] == 'gpt-3.5-turbo':
                                 usage = response['usage']['total_tokens'] * 0.002 / 1000
                             total_usage.append(usage)
                             goal_frontiers = parse_answer(response_message)
+                            frontier_indices = validate_frontier_assignments(
+                                goal_frontiers,
+                                num_agents=num_agents,
+                                num_frontiers=len(target_point_map),
+                            )
 
-                            last_decision.clear()
-                            for i in range(num_agents):
-                                goal_points.append(target_point_map[goal_frontiers["robot_"+ str(i)]])
-
-                                last_decision.append(Frontiers_dict["frontier_"+str(goal_frontiers["robot_"+ str(i)])] ) 
+                            goal_points.extend(
+                                target_point_map[frontier_index]
+                                for frontier_index in frontier_indices
+                            )
+                            last_decision[:] = [
+                                Frontiers_dict[f"frontier_{frontier_index}"]
+                                for frontier_index in frontier_indices
+                            ]
                             
                             break
-                        except OpenAIError as e:
-                            if e:
-                                print(e)
-                                print('Timeout error, retrying...')    
-                                retries -= 1
-                                time.sleep(5)
-                            else:
-                                raise e
+                        except Exception as e:
+                            print(e)
+                            print('LLM request failed, retrying...')
+                            retries -= 1
+                            if retries == 0:
+                                fallback_indices = [
+                                    i % len(target_point_map)
+                                    for i in range(num_agents)
+                                ]
+                                goal_points.extend(
+                                    target_point_map[frontier_index]
+                                    for frontier_index in fallback_indices
+                                )
+                                last_decision[:] = [
+                                    Frontiers_dict[f"frontier_{frontier_index}"]
+                                    for frontier_index in fallback_indices
+                                ]
+                                print(
+                                    "[LLM_FALLBACK] retries exhausted; "
+                                    f"using frontier indices {fallback_indices}"
+                                )
+                                break
+                            if response_message:
+                                message_list.extend([
+                                    {
+                                        "role": "assistant",
+                                        "content": response_message,
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            f"Your output was invalid: {e}. "
+                                            "Return exactly one valid frontier_<number> "
+                                            "assignment for every robot and no other labels."
+                                        ),
+                                    },
+                                ])
+                            time.sleep(5)
                 else:
                     for i in range(num_agents):
                         actions = np.random.rand(1, 2).squeeze()*(target_edge_map.shape[0] - 1)
@@ -659,6 +787,23 @@ def main():
         ]) + '\n'
 
         metrics = env.get_metrics()
+        if args.jsonl_log:
+            episode_record = {
+                "method": args.method_name,
+                "episode": args.start_episode_index + count_episodes,
+                "episode_id": str(current_episode.episode_id),
+                "scene": os.path.basename(current_episode.scene_id),
+                "goal": agent[0].goal_name,
+                "steps": int(agent[0].l_step),
+                "success": float(metrics.get("success", 0.0)),
+                "spl": float(metrics.get("spl", 0.0)),
+                "distance_to_goal": float(metrics.get("distance_to_goal", -1.0)),
+                "seed": int(args.seed),
+                "seed_mode": "continuous",
+            }
+            with open(args.jsonl_log, "a") as jsonl_file:
+                json.dump(episode_record, jsonl_file, ensure_ascii=False)
+                jsonl_file.write("\n")
         for m, v in metrics.items():
             if isinstance(v, dict):
                 for sub_m, sub_v in v.items():
@@ -668,7 +813,8 @@ def main():
 
         log += ", ".join(k + ": {:.3f}".format(v / count_episodes) for k, v in agg_metrics.items()) + " ---({:.0f}/{:.0f})".format(count_episodes, num_episodes)
 
-        log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(np.mean(total_usage))
+        average_usage = float(np.mean(total_usage)) if total_usage else 0.0
+        log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(average_usage)
         print(log)
         logging.info(log)
         # ------------------------------------------------------------------

@@ -1019,9 +1019,9 @@ class DistanceToGoal(Measure):
     def __init__(
         self, sim: Simulator, config: Config, *args: Any, **kwargs: Any
     ):
-        self._previous_position = []
-        for i in range(sim.habitat_config.NUM_AGENTS):
-            self._previous_position.append(None)
+        num_agents = sim.habitat_config.NUM_AGENTS
+        self._previous_position = [None] * num_agents
+        self._agent_distances = [None] * num_agents
         self._sim = sim
         self._config = config
         self._episode_view_points: Optional[
@@ -1034,9 +1034,9 @@ class DistanceToGoal(Measure):
         return self.cls_uuid
 
     def reset_metric(self, episode, *args: Any, **kwargs: Any):
-        self._previous_position = []
-        for i in range(self._sim.habitat_config.NUM_AGENTS):
-            self._previous_position.append(None)
+        num_agents = self._sim.habitat_config.NUM_AGENTS
+        self._previous_position = [None] * num_agents
+        self._agent_distances = [None] * num_agents
         self._metric = None
         if self._config.DISTANCE_TO == "VIEW_POINTS":
             self._episode_view_points = [
@@ -1049,7 +1049,6 @@ class DistanceToGoal(Measure):
     def update_metric(
         self, episode: NavigationEpisode, *args: Any, **kwargs: Any
     ):
-        distance_to_target = []
         for i in range(self._sim.habitat_config.NUM_AGENTS):
             current_position = self._sim.get_agent_state(agent_id = i).position
 
@@ -1057,26 +1056,35 @@ class DistanceToGoal(Measure):
                 self._previous_position[i], current_position, atol=1e-4
             ):
                 if self._config.DISTANCE_TO == "POINT":
-                    distance_to_target.append(self._sim.geodesic_distance(
+                    distance_to_target = self._sim.geodesic_distance(
                         current_position,
                         [goal.position for goal in episode.goals],
                         episode,
-                    ))
+                    )
                 elif self._config.DISTANCE_TO == "VIEW_POINTS":
-                    distance_to_target.append(self._sim.geodesic_distance(
+                    distance_to_target = self._sim.geodesic_distance(
                         current_position, self._episode_view_points, episode
-                    ))
+                    )
                 else:
                     logger.error(
                         f"Non valid DISTANCE_TO parameter was provided: {self._config.DISTANCE_TO}"
                     )
+                    continue
 
+                self._agent_distances[i] = distance_to_target
                 self._previous_position[i] = (
                     current_position[0],
                     current_position[1],
                     current_position[2],
                 )
-                self._metric = min(distance_to_target)
+
+        valid_distances = [
+            distance
+            for distance in self._agent_distances
+            if distance is not None
+        ]
+        if valid_distances:
+            self._metric = min(valid_distances)
 
 
 @registry.register_task_action
