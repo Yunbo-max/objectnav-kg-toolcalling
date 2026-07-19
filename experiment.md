@@ -1,13 +1,14 @@
 # MindNav 在 HM3D `val_60` 上的实验方案与结果
 
-**状态**：PARTIAL（E1–E4 已完成：6 个配置、360/360 个正式 episode；E5 机器人数量消融已规划、尚未实现/运行）  
+**状态**：COMPLETE（E1–E5 已完成：8 个唯一配置、480/480 个正式 episode；E5 的 2-agent 对照复用 `M-DS-TEXT`，未重复运行）
 **制定日期**：2026-07-18  
 **E1–E4 完成日期**：2026-07-18  
 **E5 规划日期**：2026-07-19  
+**E5 完成日期**：2026-07-19
 **主评测集**：HM3D ObjectNav `val_60`  
 **主方法**：MindNav；E1–E4 固定 2 个机器人，E5 比较 1/2/3 个机器人；无需训练，高层决策每 25 步调用一次
 
-> 当前内容包含 1 组主实验和 4 组消融/诊断实验。本文档将 GT 语义实验视为 oracle perception study（感知上界诊断），不把它作为可部署方法参与主结果比较。
+> 当前内容包含 1 组主实验和 4 组消融/诊断实验，全部完成。本文档将 GT 语义实验视为 oracle perception study（感知上界诊断），不把它作为可部署方法参与主结果比较。
 
 ## 1. 实验目标与 Claim Map
 
@@ -17,7 +18,7 @@
 | C2 | KG 的组织形式会影响决策效果和调用效率 | 在同一 DeepSeek、同一 KG 事实、同一 episode 上，仅改变 text/JSON/triples 序列化；同时报告性能、token 和 API 调用数 | E2 KG 形式消融 |
 | C3 | 决策历史包能减少无效重复探索并改善导航 | DeepSeek 完整方法与 no-history 版本的 paired SR/SPL/DTG 差异 | E3 历史消融 |
 | C4 | 语义感知误差是 MindNav 性能上限的重要来源 | 仅将预测语义替换为 Habitat GT 语义，测量 SR/SPL/DTG 相对提升 | E4 GT 语义上界 |
-| C5 | 在其余设置和同步 episode horizon 不变时，增加机器人数量能提升团队覆盖与导航成功率，并呈现可量化的收益/成本曲线 | 在相同 60 个 episode、同一代码提交和同一 DeepSeek 配置下比较 1/2/3 robots 的 paired SR/SPL/DTG，同时报告动作、token、调用和时间成本 | E5 机器人数量消融 |
+| C5 | 在其余设置和同步 episode horizon 不变时，增加机器人数量能提升团队覆盖与导航成功率，并呈现可量化的收益/成本曲线 | 复用已审计的 2-robot `M-DS-TEXT`，在相同 60 个 episode 和 DeepSeek 配置下新增 1/3 robots，比较 paired SR/SPL/DTG 并报告动作、token、调用和时间成本 | E5 机器人数量消融 |
 
 需要排除的替代解释：
 
@@ -124,15 +125,15 @@ DeepSeek-text 完整运行 `M-DS-TEXT` 同时作为 E1 主实验、E2 text 对�
 | A-NO-HISTORY | E3 历史 | DeepSeek | text | **off** | predicted | SR, SPL, DTG | COMPLETE |
 | A-GT-SEM | E4 oracle 感知 | DeepSeek | text | on | **GT** | SR, SPL, DTG | COMPLETE |
 
-E5 推荐在完成动态机器人实现后，用同一代码提交、同一时间窗口重新运行完整的 1/2/3 robots 矩阵，而不是把旧的 2-robot 结果与新代码下的 1/3-robot 结果直接拼接。这样新增 **3 个配置、180 episodes**：
+E5 固定复用已经完成并通过审计的 2-robot `M-DS-TEXT`，不重复正式运行 2 robots。动态扩展完成后只新增 1/3 robots 两个配置，共 **120 episodes**：
 
 | Run ID | 实验 | Robots | LLM | KG / history / semantics | 主要统计 | 状态 |
 |---|---|---:|---|---|---|---|
-| A-ROBOTS-1 | E5 数量消融 | 1 | DeepSeek | text / on / predicted | SR, SPL, DTG, costs | TODO |
-| A-ROBOTS-2 | E5 数量消融的同期对照 | 2 | DeepSeek | text / on / predicted | SR, SPL, DTG, costs | TODO |
-| A-ROBOTS-3 | E5 数量消融 | 3 | DeepSeek | text / on / predicted | SR, SPL, DTG, costs | TODO |
+| A-ROBOTS-1 | E5 数量消融 | 1 | DeepSeek | text / on / predicted | SR, SPL, DTG, costs | COMPLETE |
+| M-DS-TEXT | E5 数量消融对照（复用） | 2 | DeepSeek | text / on / predicted | SR, SPL, DTG, costs | COMPLETE |
+| A-ROBOTS-3 | E5 数量消融 | 3 | DeepSeek | text / on / predicted | SR, SPL, DTG, costs | COMPLETE |
 
-若计算预算严格受限，可在 2-robot 动态化回归测试证明 prompt、地图融合、动作和指标路径均未变化后，复用 `M-DS-TEXT`，只新增 1/3 robots 共 120 episodes；但论文优先采用同期重跑的 180-episode 方案，以减小代码版本和远端 DeepSeek 服务时间漂移的混杂。
+1/3-robot 扩展使用独立 launcher 和严格的 `num_agents != 2` 分支；2-robot 主 launcher、Habitat 配置、`HelicaseBrain` 类、prompt 文本、双地图融合和输出文件均保持原路径。正式运行前用 deterministic compatibility tests 证明扩展实现若取 N=2 时在配置、地图融合、robot keys、frontier assignment 和指标上与原路径一致，但不启动新的 2-robot 正式实验。由于 2-robot 与 1/3-robot 不是同期远端 API 运行，论文中需把 DeepSeek 服务时间漂移列为限制；episode paired bootstrap 不覆盖这部分不确定性。
 
 若后续决定 Qwen2.5-7B 是论文默认主干，可在附录补跑 Qwen 的 no-history 与 GT-semantic；当前不是 must-run，避免把 LLM 差异与核心消融混在一起。
 
@@ -188,9 +189,9 @@ E5 推荐在完成动态机器人实现后，用同一代码提交、同一时�
 ### E5：机器人数量消融（1 / 2 / 3 robots）
 
 - **目的**：量化团队规模从 1 增至 3 时的导航收益、边际收益和推理/执行成本，回答 2 robots 是否是合理默认点。
-- **比较项**：`A-ROBOTS-1`、`A-ROBOTS-2`、`A-ROBOTS-3`。
+- **比较项**：`A-ROBOTS-1`、复用的 `M-DS-TEXT`（2 robots）、`A-ROBOTS-3`。
 - **唯一自变量**：`num_agents ∈ {1, 2, 3}`。DeepSeek/text KG/history on/predicted semantics、60 个 episode、seed、500 个同步 team steps、25-step 高层规划间隔、成功距离和所有导航逻辑均固定。
-- **初始状态约束**：继续沿用当前多机器人协议——所有机器人共享 dataset start position，`robot_0` 使用 episode rotation，其余机器人使用 seeded random rotation；必须为三种规模保存 initial-pose manifest，并核对 `robot_0` 以及 2/3-robot 设置中的 `robot_1` 初始状态完全一致。
+- **初始状态约束**：继续沿用当前多机器人协议——所有机器人共享 dataset start position，`robot_0` 使用 episode rotation，其余机器人使用 seeded random rotation。1/3-robot 新运行保存 initial-pose manifest；由于既有 2-robot JSONL 未记录完整初始姿态，通过相同 episode/seed 下的配置级 deterministic fixture 证明 N=3 的 `robot_0/robot_1` 与原 N=2 初始化规则一致。
 - **主指标**：SR、SPL、DTG；分别报告 2−1、3−2、3−1 的 paired delta 与 95% bootstrap CI。
 - **成本诊断**：team steps、robot-actions、累计路径长度（若接线）、input/output tokens、API calls、planning rounds、wall-clock/episode。机器人数量会改变 LLM 输出中的 assignment 数量，这部分 token/call 成本属于规模扩展的真实成本，不应人为对齐。
 - **预算解释**：固定 500 个同步 team steps 意味着总可用 robot-actions 随机器人数量线性增长。结果应写成“团队规模扩展的端到端效果”；若要进一步声称协作本身有效，需要另做固定总 robot-actions 或 independent-agent baseline，不纳入本轮 must-run。
@@ -201,7 +202,7 @@ E5 推荐在完成动态机器人实现后，用同一代码提交、同一时�
 
 ## 6. 正式运行前的实现与验收项
 
-截至 2026-07-18，E1–E4 的实现与审计项均已完成；E5 仍需先完成 6.4，当前不能直接启动 1/3-robot 正式运行。
+截至 2026-07-19，E1–E5 的实现、smoke、正式运行和数据审计均已完成。
 
 ### 6.1 已具备
 
@@ -236,28 +237,26 @@ E5 推荐在完成动态机器人实现后，用同一代码提交、同一时�
 
 验收结果：6/6 初始关键路径通过；三种 KG 格式的 canonical current rooms/frontiers 相同，history-off 无字段泄漏。GT 还额外经历两次阻断性审计：Habitat-Sim 0.2.1 无 annotation 的 smoke 被判 INVALID；第一次全量运行又发现仓库中的 category mapping 文件只是 placeholder，造成 tv/couch 通道缺失，该批也被判 INVALID。补入完整 mapping 后，sofa/tv targeted smoke 的目标通道均非零且 SR=1，随后才重新执行有效 GT 全量。
 
-### 6.4 E5 动态机器人数量：当前可行性与待实现项
+### 6.4 E5 动态机器人数量：实现与验收结果
 
-**可行性结论：可以实现，但当前代码不可直接运行该消融。** 仓库中的 `HelicaseBrain`、KG assignment、Habitat `DistanceToGoal` 和团队 SPL 主体已按 `num_agents` 循环，具备扩展基础；阻断点集中在 launcher、Habitat agent 配置和 `exp_main_brain.py` 的双机器人硬编码。
+**结论：隔离接入已完成，2-agent golden path 未改写，也未重复正式运行。** KG assignment、Habitat `DistanceToGoal`、团队 SPL 和日志均按实际 `num_agents` 运行；1/3-agent 只进入扩展分支。
 
-必须在 smoke 前完成：
+- [x] **独立 launcher**：新增 `code/scripts/run_mindnav_robot_ablation.sh`，只接受 `NUM_AGENTS=1` 或 `3`，显式拒绝 `2`；原 `run_mindnav.sh` 未修改。
+- [x] **按 N 隔离 Habitat 配置**：仅在 `args.num_agents != 2` 时设置动态 `SIMULATOR.NUM_AGENTS/AGENTS`；N=3 的 `AGENT_2` 从 `AGENT_0` clone，N=1 只保留 `AGENT_0`。实际 YACS 配置分别审计为 `[AGENT_0]` 和 `[AGENT_0, AGENT_1, AGENT_2]`。
+- [x] **保留 2-agent 主循环原语句**：N=2 仍走原 `action=[0, 0]`、双地图融合、原 history/probe 格式和原 `HelicaseBrain`；N=1/3 才调用动态 action/map/history helper。
+- [x] **独立动态 brain 子类**：新增 `RobotCountAblationBrain`，只 override `assign_frontiers` 阶段的双机器人 prompt wrapper；原 validator、fallback 和其余决策路径复用，原 `code/src/brain.py` 未修改。
+- [x] **感知模型保持原加载方式**：3 robots 直接加载三份 RedNet/Mask R-CNN 语义模型；smoke 和正式运行均无 OOM。
+- [x] **独立日志与聚合**：新行记录 `num_agents`、`initial_agent_poses`、`team_steps`、`robot_actions`；独立聚合器输出到 `results/aggregated_robot_count/`，不改写 E1–E4 聚合结果。
+- [x] **动态与兼容性测试**：新增 7 个 E5 测试；`mindnav38` 全套 55/55 通过。launcher 拒绝 N=2，N=2 类选择与原始语句均由测试保护。
+- [x] **Habitat smoke**：只运行 N=1/3 的同一个 episode。N=1 完成 500 team steps，SR=0、SPL=0、DTG=7.305 m；N=3 在 198 steps 成功，SR=1、SPL=0.518、DTG=0.039 m。两行 metadata/action/mapping 审计通过，N=3 三份语义模型均完成推理。Smoke 只用于接线验收，不进入正式聚合。
+- [x] **正式 mapping audit**：N=1 的 603 次和 N=3 的 438 次高层分配均包含精确 robot key；`executed_noncurrent_robot_ids`、`room_frontier_mismatch_robot_ids` 和 duplicate final frontier 均为 0。
 
-- [ ] **统一参数入口**：`run_mindnav.sh` 新增 `NUM_AGENTS=${NUM_AGENTS:-2}`，只接受 1–3，并显式传入 `--num_agents "$NUM_AGENTS"`。当前 CLI 虽已有 `--num_agents`，但 launcher 未传，且程序未将它写回 Habitat 配置。
-- [ ] **动态 Habitat 配置**：在创建环境前设置 `config_env.SIMULATOR.NUM_AGENTS=args.num_agents` 和 `SIMULATOR.AGENTS=["AGENT_0", ...]`；对缺失的 `AGENT_2` 从 `AGENT_0` clone 相同 height/radius/sensors。不得只改 `NUM_AGENTS` 而保留长度为 2 的 `AGENTS`。
-- [ ] **移除主循环双机器人硬编码**：把 `action=[0, 0]` 改为按 `num_agents` 初始化；把 `torch.cat((full_map[0], full_map[1]))` 改为对全部 `full_map` 做 `torch.stack(...).max(0)`，确保 1 台不越界、3 台不漏图。
-- [ ] **动态化活动 prompt/schema**：`code/src/brain.py` 当前仍包含“two frontiers / other robot”规则和只列 `robot_0/robot_1` 的 exact JSON wrapper。按 `self.num_agents` 生成 robot keys、示例 JSON 和覆盖策略：N=1 不要求跨机器人 diversity；N=3 在候选不足时允许受约束复用，在候选充足时要求三台完整且唯一的合法 room/frontier pair。否则 N=3 会持续缺 key 并进入 repair/fallback，N=1 会被示例诱导输出多余 key。
-- [ ] **动态历史与 probe**：将 history 中固定的 `r0/r1`、`chosen_0/chosen_1` 和二元打印改为 `assignments={robot_i: frontier_i}`、动态 chosen list、duplicate count；否则第三台决策无法完整审计，单机器人字段也会产生伪值。
-- [ ] **共享冻结感知模型**：当前每个 `LLM_Agent` 都各自构造一份 Mask R-CNN 和 RedNet，N=3 会在同一 `SEM_GPU_ID` 上加载三份权重。优先让多个 agent 共享同一份 eval-only perception model bundle、仍逐机器人顺序推理并保留各自地图状态；不得为了规避 OOM 只给 3-robot 行降低分辨率、换模型或改阈值。若暂不重构，N=3 smoke 必须证明显存确实足够。
-- [ ] **元数据和成本日志**：per-episode JSONL 增加 `num_agents`、`initial_agent_poses`、`team_steps`、`robot_actions`；聚合器必须审计同一 Run ID 内 `num_agents` 恒定、跨规模初始姿态满足嵌套约束，并加入 E5 三个 paired comparison。
-- [ ] **动态单元测试**：至少覆盖 N=1/2/3 的 action/map shape、Habitat `AGENTS` 配置、brain assignment 完整性/唯一性、deterministic fallback、DTG 和团队 SPL；保留现有 N=2 测试作为回归门。
-- [ ] **2-robot 行为兼容审计**：在不调用远端 LLM 的 deterministic fixture 下，动态化前后的 N=2 地图融合、prompt robot keys、最终 frontier assignments、action list 和指标必须一致。未通过则不得复用旧 `M-DS-TEXT`。
-
-实现后的 smoke 使用每种规模相同的 1 个 episode，按 N=1→2→3 顺序执行；N=3 先单独检查显存，再允许进入并行排程。每条记录必须满足 `len(observations/actions/semantic_pixel_counts_by_agent)==num_agents`，prompt 与最终 assignments 恰有 `robot_0...robot_{N-1}`，融合地图包含所有机器人，`robot_actions=num_agents×team_steps`，SR/SPL/DTG 合法。任何条件失败都应修复并重跑 smoke，不能进入全量。
+正式 1/3-agent 每个规模按 `0–14 / 15–29 / 30–44 / 45–59` 四个固定 shard 执行并严格合并；合并器确认每行恰好 60 个连续 `episode_index`、无重复 compound key。2-agent 直接读取既有 `results/runs/m_ds_text_val60.jsonl`。
 
 
 ## 7. 推荐运行顺序与决策门
 
-E1–E4 的 M0–M5 均已完成。为减少空闲，实际执行在保持两个固定 GPU 槽位和全部配置不变的前提下采用滚动衔接；有效 GT 的 mapping recovery 则使用两个 30-episode shard 并行重跑。E5 新增 M6–M9，尚未开始。
+E1–E4 的 M0–M5 和 E5 的 M6–M9 均已完成。E5 先通过隔离实现、55/55 测试和 1/3-agent smoke，再把每个规模拆成四个固定 15-episode shard；所有 shard 严格合并为 60 条，2-agent 对照未重跑。
 
 | Milestone | 内容 | 运行量 | Go/No-Go 条件 | 风险与处理 |
 |---|---|---:|---|---|
@@ -267,10 +266,10 @@ E1–E4 的 M0–M5 均已完成。为减少空闲，实际执行在保持两个
 | M3 / 第 2 轮 | 并行：`A-KG-JSON`（H0/S1）与 `A-KG-TRIPLES`（H1/S0） | 120 episodes | 与 text 对照 episode 完全配对 | 启动前检查 GPU 0/1 交叉负载后的显存 |
 | M4 / 第 3 轮 | 并行：`A-NO-HISTORY`（H0/S1）与 `A-GT-SEM`（H1/GT） | 120 episodes | 消融变量审计通过 | GT 映射错误时禁止解释结果，先回到 smoke |
 | M5 | 聚合、bootstrap、paired analysis、失败案例抽查 | 0 episodes | 表格 N=60、无重复/缺失/非法值 | 保留 raw JSONL，聚合表可重建 |
-| M6 / E5 实现 | 动态化 1–3 agents，补单元测试和 JSONL/聚合字段 | 0 episodes | `mindnav38` 下全量单测通过，N=2 deterministic regression 一致 | 双机器人硬编码遗漏会使消融无效 |
-| M7 / E5 smoke | N=1/2/3 各跑同一 1 episode；N=3 先独占检查显存 | 3 episodes | 通过 6.4 的 shape、assignment、map、metric、cost 验收 | 启动 Habitat 前先 `nvidia-smi`；失败只重跑对应规模 |
-| M8 / E5 全量 | 推荐同期跑 1/2/3 robots，共 180 episodes | 180 episodes | 三行均 60/60，同 commit、episode keys、模型配置和阈值 | 第一轮 N=1 与 N=3 并行；第二轮 N=2；N=3 OOM 时降低并发而非改模型 |
-| M9 / E5 分析 | 计算 2−1、3−2、3−1 paired CI 和成本曲线 | 0 episodes | `num_agents` 审计通过，主表同时呈现效果与成本 | 不把固定 team-step 结果误写成固定总动作预算 |
+| M6 / E5 实现 | 隔离接入 1/3 agents，补单元测试和独立 JSONL/聚合 | 0 episodes | `mindnav38` 下原 N=2 测试与 golden compatibility gate 通过 | 扩展分支不得改变原 2-agent launcher、brain 或主循环语义 |
+| M7 / E5 smoke | N=1/3 各跑同一 1 episode | 2 episodes | 通过 6.4 的 shape、assignment、map、metric、cost 验收 | 启动 Habitat 前先 `nvidia-smi`；失败只重跑对应规模 |
+| M8 / E5 全量 | 分片并行运行 1/3 robots，复用现有 2-robot 对照 | 120 episodes | 新增两行均 60/60，与 M-DS-TEXT 的 episode keys、模型配置和阈值一致 | 每个规模固定四个 15-episode shard；输出路径完全隔离并严格合并 |
+| M9 / E5 分析 | 计算 2−1、3−2、3−1 paired CI 和成本曲线 | 0 episodes | 1/3 行的 `num_agents` 审计通过，既有 M-DS-TEXT 按已冻结配置认定 N=2 | 不把固定 team-step 结果误写成固定总动作预算 |
 
 
 
@@ -306,7 +305,7 @@ bash code/scripts/run_mindnav.sh --reset_seed_each_episode --seed 1
 | A-NO-HISTORY | 独立 DeepSeek `ENV_FILE` | `KG_SERIALIZATION=text --decision_history off --use_gtsem 0` |
 | A-GT-SEM | 独立 DeepSeek `ENV_FILE` | `KG_SERIALIZATION=text --decision_history on --use_gtsem 1` |
 
-E5 完成 6.4 后，三行只改变 `NUM_AGENTS` 和唯一输出路径：
+E5 使用独立 ablation launcher，只允许启动 N=1 和 N=3。下列命令保留为复现模板：
 
 ```bash
 # 每次启动 Habitat 前先检查 GPU；Python 使用 mindnav38。
@@ -323,10 +322,11 @@ JSONL_LOG="results/runs/a_robots_${N}_val60.jsonl" \
 EPISODE_SHUFFLE=0 SPLIT=val_60 MAX_EPISODES=60 START_EPISODE_INDEX=0 \
 MAX_EPISODE_LENGTH=500 SIM_GPU_ID="$SIM_GPU" SEM_GPU_ID="$SEM_GPU" \
 KG_SERIALIZATION=text DECISION_HISTORY=on USE_GTSEM=0 \
-bash code/scripts/run_mindnav.sh --reset_seed_each_episode --seed 1
+bash code/scripts/run_mindnav_robot_ablation.sh \
+    --reset_seed_each_episode --seed 1
 ```
 
-推荐排程：第一轮 `A-ROBOTS-1` 用 H0/S1、`A-ROBOTS-3` 用 H1/S0 并行；第二轮 `A-ROBOTS-2` 用 H0/S1。DeepSeek 不占本地 LLM GPU，E5 不需要启动 vLLM。根据现有 2-robot 运行约 2.5–3 小时/60 episodes 的记录，预计 E5 同期重跑墙钟约 6–8 小时；N=3 的实际吞吐和显存必须以 smoke 为准。
+实际执行没有启动 `A-ROBOTS-2`，也没有启动 vLLM。GPU 0 上已有用户进程，因此四组 shard 使用 GPU 1/2/3 交叉承载 Habitat 和语义模型：N=1 为 H1/S3、H2/S3 或 H1/S2，N=3 为 H3/S1、H2/S1 或 H3/S2。峰值显存约 12.1/24.6 GiB，无 OOM。四 shard 并行下，记录时间范围为 N=1 的 02:09:38–03:05:08 UTC 和 N=3 的 02:09:41–03:31:05 UTC；表 5 的 runtime/episode 是各 episode 运行时长之和再除以 60，不是并行后的墙钟跨度。
 
 `--decision_history` 与 `--use_gtsem 1` 均已完成接线和审计。Qwen 服务在独立终端和 `vllm` 环境启动：
 
@@ -339,7 +339,7 @@ CONDA_ENV=vllm bash code/scripts/run_vllm_qwen.sh
 
 ## 9. 论文实验结果
 
-所有均值与 CI 由 `code/scripts/aggregate_results.py` 从正式 JSONL 生成。单项 CI 为 10,000 次 episode bootstrap；差值 CI 为相同 compound episode key 的 paired bootstrap；seed 均为 `20260718`。数值保留三位小数。
+表 1–4 由 `code/scripts/aggregate_results.py`、表 5 由 `code/scripts/aggregate_robot_count_ablation.py` 从正式 JSONL 生成。单项 CI 为 10,000 次 episode bootstrap；差值 CI 为相同 compound episode key 的 paired bootstrap；seed 均为 `20260718`。数值保留三位小数。
 
 ### 表 1：MindNav 主实验（HM3D `val_60`, 2 robots, predicted semantics, success distance 0.2 m）
 
@@ -391,6 +391,34 @@ Paired `on − off`：ΔSR = +0.017，CI [−0.083, 0.117]；ΔSPL = +0.001，CI
 
 Paired `GT − predicted`：ΔSR = +0.067，CI [−0.050, 0.183]；ΔSPL = +0.073，CI [0.009, 0.140]；ΔDTG = −0.281 m，CI [−0.828, 0.258]。因此只有 SPL 的提升在本次 60-episode paired bootstrap 下区间不跨 0。
 
+### 表 5：机器人数量消融（DeepSeek, text KG, history on, predicted semantics, success distance 0.2 m）
+
+每个规模固定最多 500 个同步 team steps；因此 robot-actions 随机器人数量增加，不是固定总动作预算。2 robots 直接复用 `M-DS-TEXT`。
+
+| Robots | Run ID | N | SR ↑ | 95% CI | SPL ↑ | 95% CI | DTG (m) ↓ | 95% CI |
+|---:|---|---:|---:|---|---:|---|---:|---|
+| 1 | A-ROBOTS-1 | 60 | 0.600 | [0.483, 0.717] | 0.234 | [0.171, 0.300] | 1.905 | [1.107, 2.845] |
+| 2 | M-DS-TEXT（复用） | 60 | 0.717 | [0.600, 0.817] | 0.353 | [0.276, 0.430] | 0.947 | [0.518, 1.445] |
+| 3 | A-ROBOTS-3 | 60 | 0.733 | [0.617, 0.850] | 0.428 | [0.346, 0.510] | 0.996 | [0.501, 1.578] |
+
+相同 episode 的 paired 差值如下；正的 ΔSR/ΔSPL、负的 ΔDTG 表示左侧规模更优。
+
+| Comparison | ΔSR | 95% CI | ΔSPL | 95% CI | ΔDTG (m) | 95% CI |
+|---|---:|---|---:|---|---:|---|
+| 2 − 1 | +0.117 | [0.000, 0.233] | +0.119 | [0.052, 0.187] | −0.958 | [−1.938, −0.054] |
+| 3 − 2 | +0.017 | [−0.083, 0.133] | +0.075 | [0.024, 0.128] | +0.049 | [−0.402, 0.542] |
+| 3 − 1 | +0.133 | [0.000, 0.267] | +0.194 | [0.122, 0.269] | −0.909 | [−1.768, −0.119] |
+
+规模成本诊断：
+
+| Robots | Team steps / ep ↓ | Robot-actions / ep ↓ | Input tokens / ep ↓ | Output tokens / ep ↓ | API calls / ep ↓ | Runtime / ep (s) ↓ |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 261.467 | 261.467 | 42,589.633 | 5,302.733 | 20.350 | 129.982 |
+| 2 | 194.017 | 388.033 | 35,495.900 | 4,814.367 | 15.767 | 150.980 |
+| 3 | 175.000 | 525.000 | 37,596.800 | 5,233.150 | 15.500 | 203.218 |
+
+从 1 增到 2 robots，SPL 提高 0.119、DTG 降低 0.958 m，paired CI 均不跨 0；从 2 增到 3 robots，SR 和 DTG 差异不确定，但 SPL 仍提高 0.075，CI 不跨 0。整体 3−1 的 SPL 与 DTG 改善也可靠。SR 点估计单调上升，但两项 SR paired CI 均触及或跨越 0，不能声称 SR 显著提高。更多机器人减少 team steps 和 LLM calls，却线性扩大每步并行动作，并使 3-agent runtime/episode 增至 203.218 s。
+
 ### 可选附录表：按目标类别诊断
 
 样本少（特别是 tv_monitor 仅 5 个），该表只作诊断，不作显著性结论。
@@ -412,44 +440,44 @@ Paired `GT − predicted`：ΔSR = +0.067，CI [−0.050, 0.183]；ΔSPL = +0.07
 | A-KG-TRIPLES | 2B | H1/S0 | DeepSeek / deepseek-v4-flash | 09:55:14 | 12:38:21 | 60/60 | COMPLETE | — |
 | A-NO-HISTORY | 3A | H0/S1 | DeepSeek / deepseek-v4-flash | 12:24:46 | 15:03:32 | 60/60 | COMPLETE | 正式 mapping audit 无 history 泄漏 |
 | A-GT-SEM | recovery | H0/GT + H1/GT | DeepSeek / deepseek-v4-flash | 16:29:19 | 17:41:31 | 60/60 | COMPLETE | `mindnav38_hm3d022`；修正 mapping 后按 0–29/30–59 两 shard 重跑并合并 |
-| A-ROBOTS-1 | E5-1A | H0/S1 | DeepSeek / deepseek-v4-flash | `results/runs/a_robots_1_val60.jsonl` | — | — | 0/60 | TODO | 等待 M6/M7 |
-| A-ROBOTS-2 | E5-2A | H0/S1 | DeepSeek / deepseek-v4-flash | `results/runs/a_robots_2_val60.jsonl` | — | — | 0/60 | TODO | 推荐同期重跑；仅在严格 N=2 回归通过且预算受限时复用 M-DS-TEXT |
-| A-ROBOTS-3 | E5-1B | H1/S0 | DeepSeek / deepseek-v4-flash | `results/runs/a_robots_3_val60.jsonl` | — | — | 0/60 | TODO | N=3 smoke 先独占验证显存 |
+| A-ROBOTS-1 | E5 shards | H1/S3, H2/S3, H1/S2 | DeepSeek / deepseek-v4-flash | `results/runs/a_robots_1_val60.jsonl` | 02:09:38 | 03:05:08 | 60/60 | COMPLETE | 四个 15-episode shard；metadata/action/mapping audit 通过 |
+| A-ROBOTS-3 | E5 shards | H3/S1, H2/S1, H3/S2 | DeepSeek / deepseek-v4-flash | `results/runs/a_robots_3_val60.jsonl` | 02:09:41 | 03:31:05 | 60/60 | COMPLETE | 四个 15-episode shard；三份语义模型；无 OOM |
 
 状态仅使用：`TODO`、`SMOKE_PASS`、`RUNNING`、`COMPLETE`、`INVALID`。中断后续跑时必须记录 episode 范围和合并方式。
 
 ## 11. 最终数据检查清单
 
-- [x] 每个主运行恰好有 60 个唯一 `(scene, episode_id)` compound key，且六行 key 集与顺序相同；
+- [x] 每个主运行恰好有 60 个唯一 `(scene, episode_id)` compound key，且八行 key 集与顺序相同；
 - [x] scene、goal、episode 顺序与 `val_60/selection_manifest.json` 一致；
 - [x] 没有把 smoke、失败重试的重复 episode 或其他 split 混入聚合；
 - [x] SR、SPL、DTG 使用 Habitat 主字段，口径和成功距离一致；
 - [x] 所有运行的 success distance 都是 0.2 m，且未聚合或报告任何 MCoCoNav 指标；
 - [x] token/calls 来自 provider usage 和最低层 transport 计数；
 - [x] 三种 KG 格式仅改变序列化；history-off prompt 审计通过；GT 无导航信息泄漏；
-- [x] 报告 fallback/repair/retry，outer retry 六组均为 0；
+- [x] 报告 fallback/repair/retry，outer retry 八组均为 0；
 - [x] 使用 paired bootstrap 计算消融差值与 CI；
 - [x] 表格中的 model、commit、seed、运行时间、GPU、配置和 raw log 路径均可追溯；
 - [x] 保留 raw JSONL、无效批次和 shard，所有表格均可由脚本重建。
-- [ ] E5 的 `num_agents` 已真正进入 Habitat、brain、地图融合、动作和日志，而不只是 CLI 元数据；
-- [ ] E5 三个规模各有 60 个相同 compound episode keys，2−1、3−2、3−1 paired CI 与成本列可重建；
-- [ ] E5 结果明确标注固定 500 team steps、总 robot-actions 随 N 增长，不把 fleet scaling 误解为纯协调增益。
+- [x] E5 新增 1/3-robot 行的 `num_agents` 已真正进入 Habitat、brain、地图融合、动作和日志，而不只是 CLI 元数据；原 2-robot 路径未改变；
+- [x] E5 三个规模各有 60 个相同 compound episode keys，2−1、3−2、3−1 paired CI 与成本列可重建；
+- [x] E5 结果明确标注固定 500 team steps、总 robot-actions 随 N 增长，不把 fleet scaling 误解为纯协调增益。
 
 ## 12. 结果分析与结论
 
 ### 12.1 Claim verdict
 
 - **C1：部分支持。** DeepSeek 与本地 Qwen2.5-7B 都完成 60/60，点估计上 DeepSeek 高 5.0 pp SR、0.046 SPL，DTG 低 0.529 m；但三项 paired CI 都跨 0。因此可以声称方法能在两个后端执行并取得相近量级结果，不能声称两者统计等价，也不能断言 DeepSeek 显著更优。
-- **C2：支持“格式影响效率形态”，不支持某一格式导航性能显著更优。** JSON/Triples 相对 text 的 SR、SPL、DTG paired CI 均跨 0。JSON 比 text 多 26.8% input tokens、16.3% output tokens、13.1% calls；Triples 多 75.1% input tokens、约 1.0% output tokens，calls 只少 0.7%。结构化格式减少了 invalid/fallback（text 68/28，JSON 52/17，Triples 35/13），但在当前 prompt 下并未转化为显著导航收益，Triples 还显著扩大输入上下文。
+- **C2：部分支持。** JSON/Triples 相对 text 的 SR、SPL、DTG paired CI 均跨 0，不支持某一格式导航性能显著更优。格式主要改变可靠性与成本：JSON 比 text 多 25.5% total tokens、13.1% calls；Triples 多 66.3% total tokens，calls 少 0.7%。逐 episode paired bootstrap 显示 JSON 每 episode 多 10,284 tokens，CI [4,204, 17,259]；Triples 多 26,718，CI [17,638, 36,717]。结构化格式减少 invalid/fallback（text 68/28，JSON 52/17，Triples 35/13）；Triples 的 invalid 与 fallback 每 episode 分别减少 0.550 和 0.250，paired CI 均不跨 0，但该格式遵循优势未转化为显著导航收益。Text 因此是综合默认，Triples 只在严格协议遵循优先时更合适。
 - **C3：不支持历史包带来可测导航增益。** History-on 相对 off 的 ΔSR=+0.017、ΔSPL=+0.001、ΔDTG=−0.143 m，CI 全跨 0；history-on 的 input tokens 反而高 16.6%。当前证据更符合“持久化 KG 已包含足够累积信息，短期历史包大多冗余”，而不是历史包有效改善导航。
 - **C4：部分支持感知瓶颈。** 修正类别映射后的 GT 把 SR 从 0.717 提至 0.783、SPL 从 0.353 提至 0.425、DTG 从 0.947 降至 0.667 m。只有 paired SPL 增益的 CI 不跨 0；SR 与 DTG 仍不确定。因此可信结论是 GT semantic 显著改善路径效率，提供约 +0.073 SPL 的 perception headroom，而不是宣称 SR 已显著提高。
-- **C5：待验证。** 当前只有 2-robot 数据，且代码仍含双机器人硬编码；在完成 M6/M7 和 1/2/3 同期全量前，不对机器人数量收益作结论。
+- **C5：部分支持。** 1/2/3 robots 的 SPL 为 0.234/0.353/0.428；2−1、3−2、3−1 的 paired ΔSPL CI 均不跨 0。2−1 和 3−1 的 DTG 也分别降低 0.958 m 和 0.909 m，CI 不跨 0。SR 点估计为 0.600/0.717/0.733，但 paired CI 触及或跨 0，因此只能写成上升趋势。可信 claim 是固定 500 个同步 team steps 下 fleet-size scaling 改善路径效率；可用 robot-actions 随 N 增加，因而不能单独归因于协作算法。2-agent 与 1/3-agent 非同期运行，runtime 差异也不能作纯机器人数量的因果解释。
 
 ### 12.2 诊断观察
 
 - Text、Triples、no-history 的规划轮数分别为 465、465、468，说明它们的 token 差异不是简单由运行轮数造成；Triples 的主要成本来自 wire format 本身。
 - Qwen 的 invalid outputs/fallback 为 32/10，少于 DeepSeek text 的 68/28，但 Qwen 规划轮数和 calls 更多（526 轮、1,071 calls），最终性能点估计略低。格式遵循更好不等同于导航推理更好。
 - GT 的类别诊断提升集中在 sofa（0.667→0.833）与 tv_monitor（0.400→0.800）；这与修正 `couch→sofa`、`tv/monitor→tv_monitor` 映射后的目标通道恢复一致。类别样本很小，只作为接线与误差来源诊断。
+- E5 中 1/2/3 robots 的 team steps/episode 为 261.467/194.017/175.000，说明更大团队更早结束；但 robot-actions/episode 同时从 261.467 增至 388.033/525.000。1-agent 反而需要最多 planning rounds 和 API calls（603 rounds、20.350 calls/episode），而 3-agent 的三份感知推理使 runtime/episode 最高。
 - Bootstrap 只刻画这一次完整运行中的 episode 不确定性，不包含 DeepSeek 服务端非确定性或跨 seed 方差。所有“显著/不显著”表述均限于本协议、这 60 个 episodes 和该 bootstrap 口径。
 
 ### 12.3 异常处理与有效数据边界
@@ -465,4 +493,7 @@ Paired `GT − predicted`：ΔSR = +0.067，CI [−0.050, 0.183]；ΔSPL = +0.07
 - 表格：`results/aggregated/run_summary.csv`、`results/aggregated/paired_comparisons.csv`
 - 数据与配置审计：`results/aggregated_audit.txt`、`results/aggregated/semantic_and_config_audit.txt`
 - 正式 per-episode 数据：`results/runs/{m_ds_text,m_q7b_text,a_kg_json,a_kg_triples,a_no_history,a_gt_sem}_val60.jsonl`
-- 单元测试：`conda run --no-capture-output -n mindnav38 python -m unittest discover -s tests -p 'test_*.py' -q`，结果 47/47 通过。
+- E5 机器可读汇总：`results/aggregated_robot_count/experiment_summary.json`
+- E5 表格：`results/aggregated_robot_count/run_summary.csv`、`results/aggregated_robot_count/paired_comparisons.csv`
+- E5 正式 per-episode 数据：`results/runs/a_robots_{1,3}_val60.jsonl`；原始 shard 与 mapping audit 日志保存在相同目录。
+- 单元测试：`conda run --no-capture-output -n mindnav38 python -m unittest discover -s tests -p 'test_*.py' -q`，结果 55/55 通过。

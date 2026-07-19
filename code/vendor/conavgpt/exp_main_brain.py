@@ -990,6 +990,16 @@ def main():
                                          + args.task_config])
     config_env.defrost()
 
+    # The audited two-agent configuration remains the untouched default.
+    # Only the isolated robot-count ablation launcher passes 1 or 3 here.
+    robot_count_runtime = None
+    if args.num_agents != 2:
+        import robot_count_runtime as robot_count_runtime_module
+        robot_count_runtime = robot_count_runtime_module
+        robot_count_runtime.configure_habitat_agents(
+            config_env, args.num_agents
+        )
+
     # Apply --split argument to dataset config
     config_env.DATASET.SPLIT = args.split
     config_env.DATASET.DATA_PATH = config_env.DATASET.DATA_PATH.replace("{split}", args.split)
@@ -1115,7 +1125,11 @@ def main():
     )
     kg = KnowledgeGraph()
     kg_updater = KGUpdater(kg)
-    mindnav_brain = HelicaseBrain(
+    brain_class = HelicaseBrain
+    if num_agents != 2:
+        from brain_robot_ablation import RobotCountAblationBrain
+        brain_class = RobotCountAblationBrain
+    mindnav_brain = brain_class(
         brain_adapter,
         num_agents=num_agents,
         kg_serialization=args.kg_serialization,
@@ -1144,6 +1158,11 @@ def main():
             )
         observations = env.reset()
         current_episode = env.current_episode
+        initial_agent_poses = None
+        if num_agents != 2:
+            initial_agent_poses = robot_count_runtime.capture_initial_agent_poses(
+                env, num_agents
+            )
         print(
             f"[EPISODE_START] index={args.start_episode_index + count_episodes} "
             f"episode_id={current_episode.episode_id} "
@@ -1159,7 +1178,10 @@ def main():
         target_first_found_saved = [False] * num_agents
 
         while not env.episode_over:
-            action = [0, 0]
+            if num_agents == 2:
+                action = [0, 0]
+            else:
+                action = robot_count_runtime.initialize_actions(num_agents)
             full_map = []
             visited_vis = []
             pose_pred = []
@@ -1180,9 +1202,11 @@ def main():
                 )
                 pose_pred.append(pos)
                 
-            full_map2 = torch.cat((full_map[0].unsqueeze(0), full_map[1].unsqueeze(0)), 0)
-
-            full_map_pred, _ = torch.max(full_map2, 0)
+            if num_agents == 2:
+                full_map2 = torch.cat((full_map[0].unsqueeze(0), full_map[1].unsqueeze(0)), 0)
+                full_map_pred, _ = torch.max(full_map2, 0)
+            else:
+                full_map_pred = robot_count_runtime.fuse_agent_maps(full_map)
 
             # mapping_end = time.time()
             # mapping_time = mapping_end - start
@@ -1365,28 +1389,53 @@ def main():
                         )
 
                     if args.decision_history == "on":
-                        decision_history.append({
-                            "step": int(agent[0].l_step),
-                            "r0": int(goal_frontiers.get("robot_0", 0)),
-                            "r1": int(goal_frontiers.get("robot_1", 0)),
-                            "objects_found": ",".join(
-                                sorted(object_list.keys())
-                            ),
-                        })
+                        if num_agents == 2:
+                            decision_history.append({
+                                "step": int(agent[0].l_step),
+                                "r0": int(goal_frontiers.get("robot_0", 0)),
+                                "r1": int(goal_frontiers.get("robot_1", 0)),
+                                "objects_found": ",".join(
+                                    sorted(object_list.keys())
+                                ),
+                            })
+                        else:
+                            decision_history.append(
+                                robot_count_runtime.build_history_record(
+                                    agent[0].l_step,
+                                    goal_frontiers,
+                                    object_list.keys(),
+                                    num_agents,
+                                )
+                            )
 
-                    chosen_0 = goal_frontiers.get("robot_0", 0)
-                    chosen_1 = goal_frontiers.get("robot_1", 0)
-                    probe_record["chosen_0"] = chosen_0
-                    probe_record["chosen_1"] = chosen_1
-                    probe_record["same_frontier"] = (chosen_0 == chosen_1)
-                    print(
-                        f"  [PROBE] step={agent[0].l_step}, "
-                        f"goal={agent[0].goal_name}, "
-                        f"chose=({chosen_0},{chosen_1}), "
-                        f"same={'Y' if chosen_0 == chosen_1 else 'N'}, "
-                        f"rooms={[e['room_type'] for e in enriched]}, "
-                        f"priors={[e['target_prior'] for e in enriched]}"
-                    )
+                    if num_agents == 2:
+                        chosen_0 = goal_frontiers.get("robot_0", 0)
+                        chosen_1 = goal_frontiers.get("robot_1", 0)
+                        probe_record["chosen_0"] = chosen_0
+                        probe_record["chosen_1"] = chosen_1
+                        probe_record["same_frontier"] = (chosen_0 == chosen_1)
+                        print(
+                            f"  [PROBE] step={agent[0].l_step}, "
+                            f"goal={agent[0].goal_name}, "
+                            f"chose=({chosen_0},{chosen_1}), "
+                            f"same={'Y' if chosen_0 == chosen_1 else 'N'}, "
+                            f"rooms={[e['room_type'] for e in enriched]}, "
+                            f"priors={[e['target_prior'] for e in enriched]}"
+                        )
+                    else:
+                        probe_fields = robot_count_runtime.build_probe_fields(
+                            goal_frontiers, num_agents
+                        )
+                        probe_record.update(probe_fields)
+                        print(
+                            f"  [PROBE] step={agent[0].l_step}, "
+                            f"goal={agent[0].goal_name}, "
+                            f"chose={probe_fields['chosen_frontiers']}, "
+                            f"duplicates="
+                            f"{probe_fields['duplicate_frontier_count']}, "
+                            f"rooms={[e['room_type'] for e in enriched]}, "
+                            f"priors={[e['target_prior'] for e in enriched]}"
+                        )
 
                     if mapping_jsonl_log:
                         try:
@@ -1625,6 +1674,14 @@ def main():
                 "status": "complete",
                 "errors": episode_errors,
             }
+            if num_agents != 2:
+                episode_record.update({
+                    "num_agents": int(num_agents),
+                    "initial_agent_poses": initial_agent_poses,
+                    "team_steps": int(agent[0].l_step),
+                    "robot_actions": int(num_agents * agent[0].l_step),
+                    "robot_count_ablation": True,
+                })
             with open(args.jsonl_log, "a") as jsonl_file:
                 json.dump(episode_record, jsonl_file, ensure_ascii=False)
                 jsonl_file.write("\n")
