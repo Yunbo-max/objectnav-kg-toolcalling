@@ -221,6 +221,75 @@ class PersistentKnowledgeGraphTests(unittest.TestCase):
         self.assertNotIn("frontier_idx", prompt_text)
         self.assertNotIn("prior=", prompt_text)
 
+    def test_json_prompt_separates_current_rooms_from_history(self):
+        kg = KnowledgeGraph()
+        updater = KGUpdater(kg)
+        poses = [(400, 400, 0), (420, 420, 0)]
+        updater.update([frontier(0, 110, 110)], {}, poses, None)
+
+        current = [frontier(0, 210, 210, prior=0.7)]
+        view = updater.build_current_frontier_view(current)
+        updater.update(current, {}, poses, None)
+        payload = json.loads(kg.to_json(current_frontier_view=view))
+
+        current_ids = {
+            room["room_id"] for room in payload["current_assignable_rooms"]
+        }
+        historical_ids = {
+            room["room_id"]
+            for room in payload[
+                "historical_room_context_not_assignable"
+            ]
+        }
+        self.assertEqual(current_ids, {"room_4_4"})
+        self.assertIn("room_2_2", historical_ids)
+        self.assertNotIn("room_2_2", current_ids)
+        self.assertNotIn("target_prior", payload)
+
+    def test_json_serialization_preserves_display_precision(self):
+        kg = KnowledgeGraph()
+        kg.add_node(KGNode(
+            id="room_2_2",
+            node_type="room",
+            name="bedroom",
+            certainty=0.846,
+            properties={"explored": False, "observation_count": 3},
+        ))
+        view = CurrentFrontierView.from_enriched([
+            frontier(0, 110.4, 110.6, area=10.5),
+        ])
+        payload = json.loads(kg.to_json(current_frontier_view=view))
+        room = payload["current_assignable_rooms"][0]
+
+        self.assertEqual(room["type_certainty_percent"], 85)
+        self.assertEqual(room["current_frontiers"][0]["centroid_rc"], [110, 111])
+
+    def test_triples_are_three_field_facts_with_context_roles(self):
+        kg = KnowledgeGraph()
+        updater = KGUpdater(kg)
+        poses = [(400, 400, 0), (420, 420, 0)]
+        updater.update([frontier(0, 110, 110)], {}, poses, None)
+
+        current = [frontier(0, 210, 210, prior=0.7)]
+        view = updater.build_current_frontier_view(current)
+        updater.update(current, {}, poses, None)
+        triples = json.loads(kg.to_triples(current_frontier_view=view))
+
+        self.assertTrue(all(len(triple) == 3 for triple in triples))
+        self.assertIn(
+            ["kg", "serialization_format", "mindnav_kg_triples_v1"],
+            triples,
+        )
+        self.assertIn(
+            ["room_4_4", "context_role", "current_assignable"],
+            triples,
+        )
+        self.assertIn(
+            ["room_2_2", "context_role", "historical_not_assignable"],
+            triples,
+        )
+        self.assertNotIn("target_prior", json.dumps(triples))
+
     def test_repeated_room_snapshot_is_idempotent(self):
         kg = KnowledgeGraph()
         updater = KGUpdater(kg)
@@ -342,6 +411,49 @@ class HelicaseToolCallingTests(unittest.TestCase):
             current_frontiers=view,
         )
         return assignments, view, fake_brain, helicase, tools, method, kg
+
+    def test_history_off_omits_all_history_derived_packet_fields(self):
+        enriched = [frontier(0, 110, 110), frontier(1, 210, 210)]
+        kg = KnowledgeGraph()
+        updater = KGUpdater(kg)
+        poses = [(100, 100, 0), (220, 220, 0)]
+        view = updater.build_current_frontier_view(enriched)
+        updater.update(enriched, {}, poses, None)
+        fake_brain = FakeBrain(valid_pipeline(enriched))
+        helicase = HelicaseBrain(
+            fake_brain,
+            num_agents=2,
+            decision_history_enabled=False,
+        )
+
+        helicase.decide(
+            kg,
+            target_name="bed",
+            enriched_frontiers=enriched,
+            pose_pred=poses,
+            step=25,
+            max_steps=500,
+            decision_history=[{"should": "not leak"}],
+            current_frontiers=view,
+        )
+
+        packet = decision_packet_from_prompt(fake_brain.prompts[1])
+        self.assertNotIn("recent_assignments", packet)
+        self.assertTrue(all(
+            "recent_history_summary" not in room
+            for room in packet["current_rooms"].values()
+        ))
+        self.assertNotIn("COVERAGE AND HISTORY RULES", fake_brain.prompts[1])
+        self.assertFalse(
+            helicase.last_decision_audit["decision_history_enabled"]
+        )
+        self.assertEqual(
+            helicase.last_decision_audit["recent_assignment_history"], []
+        )
+        self.assertEqual(
+            helicase.last_decision_audit["room_history_summary"], {}
+        )
+        self.assertEqual(helicase._recent_assignment_history, [])
 
     def test_equivalent_qwen_tool_syntax_is_canonicalized(self):
         canonical_list = HelicaseBrain._load_json(json.dumps([{
@@ -625,6 +737,65 @@ class HelicaseToolCallingTests(unittest.TestCase):
         self.assertNotIn("HISTORICAL ROOM CONTEXT", fake_brain.prompts[1])
         self.assertIn("CURRENT_DECISION_PACKET", fake_brain.prompts[1])
         self.assertIn("ROOM_DIVERSITY_REQUIRED: true", fake_brain.prompts[1])
+
+    def test_json_format_only_changes_probability_kg_serialization(self):
+        enriched = [frontier(0, 110, 110), frontier(1, 210, 210)]
+        kg, poses, view, fake_brain, _ = self.make_runtime(
+            enriched, valid_pipeline(enriched)
+        )
+        helicase = HelicaseBrain(
+            fake_brain,
+            num_agents=2,
+            kg_serialization="json",
+        )
+        helicase.decide(
+            kg,
+            target_name="bed",
+            enriched_frontiers=enriched,
+            pose_pred=poses,
+            step=25,
+            max_steps=500,
+            decision_history=[],
+            current_frontiers=view,
+        )
+
+        self.assertIn(
+            '"format":"mindnav_kg_json_v1"',
+            fake_brain.prompts[0],
+        )
+        self.assertIn('"current_assignable_rooms"', fake_brain.prompts[0])
+        self.assertNotIn('"format":"mindnav_kg_json_v1"', fake_brain.prompts[1])
+        self.assertIn("CURRENT_DECISION_PACKET", fake_brain.prompts[1])
+
+    def test_triples_only_change_probability_kg_serialization(self):
+        enriched = [frontier(0, 110, 110), frontier(1, 210, 210)]
+        kg, poses, view, fake_brain, _ = self.make_runtime(
+            enriched, valid_pipeline(enriched)
+        )
+        helicase = HelicaseBrain(
+            fake_brain,
+            num_agents=2,
+            kg_serialization="triples",
+        )
+        helicase.decide(
+            kg,
+            target_name="bed",
+            enriched_frontiers=enriched,
+            pose_pred=poses,
+            step=25,
+            max_steps=500,
+            decision_history=[],
+            current_frontiers=view,
+        )
+
+        marker = '["kg","serialization_format","mindnav_kg_triples_v1"]'
+        self.assertIn(marker, fake_brain.prompts[0])
+        self.assertIn(
+            '["room_2_2","context_role","current_assignable"]',
+            fake_brain.prompts[0],
+        )
+        self.assertNotIn(marker, fake_brain.prompts[1])
+        self.assertIn("CURRENT_DECISION_PACKET", fake_brain.prompts[1])
 
     def test_decision_packet_groups_frontiers_without_topology_or_history(self):
         enriched = [

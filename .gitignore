@@ -21,11 +21,7 @@ data/**/*.glb
 data/**/*.navmesh
 data/**/*.stage_config.json
 data/**/*.scene_instance.json
-results/*.pkl
-results/*.jsonl
-results/runs/
-results/dump/
-results/diagnostics/
+results/*
 ablation study.md
 AGENTS.md
 kg.md

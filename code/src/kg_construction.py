@@ -4,6 +4,8 @@ The graph keeps episode-level region/object evidence, while executable frontier
 indices live only in :class:`CurrentFrontierView`.  All stored geometry uses map
 ``(row, column)`` coordinates.
 """
+import json
+
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Set
@@ -457,6 +459,386 @@ class KnowledgeGraph:
                 lines.append(f"  {room.id}: type={room.name}, objects=[{','.join(obj_names)}]")
 
         return "\n".join(lines)
+
+    def to_json(self, current_frontier_view=None,
+                max_historical_rooms=6) -> str:
+        """Render the same bounded KG view as :meth:`to_text` in JSON.
+
+        This serializer intentionally preserves the text representation's
+        room selection, relation caps, and displayed numeric precision.  The
+        serialization ablation therefore changes the wire format without
+        exposing additional graph evidence to the LLM.
+        """
+        current_room_ids = (
+            current_frontier_view.room_ids
+            if current_frontier_view is not None else set()
+        )
+
+        def rounded(value):
+            return int(round(float(value)))
+
+        def percent(value):
+            return int(round(100.0 * float(value)))
+
+        robots = []
+        for robot in self.get_nodes_by_type("robot"):
+            in_room = None
+            paths = []
+            explored = []
+            for edge in self.edges:
+                if edge.source != robot.id:
+                    continue
+                if edge.relation == "in":
+                    in_room = edge.target
+                elif edge.relation == "path_to":
+                    target = self.nodes.get(edge.target)
+                    is_current = (
+                        current_frontier_view is None
+                        or edge.target in current_room_ids
+                    )
+                    if (target and is_current
+                            and not target.properties.get("explored")):
+                        paths.append((edge.target, edge.distance))
+                elif edge.relation == "explored":
+                    explored.append(edge.target)
+            paths.sort(key=lambda item: item[1])
+            path_label = (
+                "reachable_current"
+                if current_frontier_view is not None
+                else "reachable_unexplored"
+            )
+            robots.append({
+                "id": robot.id,
+                "position_rc": [
+                    rounded(robot.position[0]),
+                    rounded(robot.position[1]),
+                ],
+                "in_room": in_room,
+                "explored_room_count": len(explored),
+                path_label: [
+                    {"room_id": room_id, "distance_px": rounded(distance)}
+                    for room_id, distance in paths[:5]
+                ],
+            })
+
+        def room_record(room, current_candidates=None):
+            objects = self.get_objects_in_room(room.id)
+            connections = []
+            walls = []
+            for edge in self.edges:
+                touches_room = (
+                    edge.source == room.id or edge.target == room.id
+                )
+                if not touches_room:
+                    continue
+                other = (
+                    edge.target if edge.source == room.id else edge.source
+                )
+                if edge.relation == "connected_to":
+                    connections.append({
+                        "room_id": other,
+                        "distance_px": rounded(edge.distance),
+                    })
+                elif edge.relation == "separated_by_wall":
+                    walls.append(other)
+
+            record = {
+                "room_id": room.id,
+                "observed_type": room.name or "unknown",
+                "type_certainty_percent": percent(room.certainty),
+                "observation_count": int(
+                    room.properties.get("observation_count", 0)
+                ),
+            }
+            if current_candidates is not None:
+                record["current_frontiers"] = []
+                for frontier_idx in current_candidates:
+                    frontier = current_frontier_view.frontiers[frontier_idx]
+                    record["current_frontiers"].append({
+                        "frontier_id": f"frontier_{frontier.idx}",
+                        "area_px": rounded(frontier.area),
+                        "centroid_rc": [
+                            rounded(frontier.centroid[0]),
+                            rounded(frontier.centroid[1]),
+                        ],
+                    })
+            if objects:
+                record["objects"] = [
+                    {
+                        "name": obj.name,
+                        "certainty_percent": percent(obj.certainty),
+                    }
+                    for obj in objects
+                ]
+                object_relations = []
+                for obj in objects:
+                    edges = [
+                        edge for edge in self.edges
+                        if (edge.source == obj.id or edge.target == obj.id)
+                        and edge.relation in ("next_to", "near")
+                    ]
+                    for edge in edges[:2]:
+                        other_id = (
+                            edge.target if edge.source == obj.id
+                            else edge.source
+                        )
+                        other = self.nodes.get(other_id)
+                        if other:
+                            object_relations.append({
+                                "source": obj.name,
+                                "relation": edge.relation,
+                                "target": other.name,
+                                "distance_px": rounded(edge.distance),
+                            })
+                if object_relations:
+                    record["object_relations"] = object_relations
+            if connections:
+                record["possible_connected"] = connections[:4]
+            if walls:
+                record["walls"] = walls[:3]
+            return record
+
+        rooms = self.get_nodes_by_type("room")
+        unexplored = [
+            room for room in rooms if not room.properties.get("explored")
+        ]
+        explored_rooms = [
+            room for room in rooms
+            if room.properties.get("explored")
+            and room.id not in current_room_ids
+        ]
+        payload = {
+            "format": "mindnav_kg_json_v1",
+            "robots": robots,
+        }
+
+        if current_frontier_view is not None:
+            payload["current_assignable_room_count"] = len(current_room_ids)
+            current_records = []
+            for room_id, frontier_indices in sorted(
+                    current_frontier_view.room_to_frontiers.items()):
+                room = self.nodes.get(room_id)
+                if room is None:
+                    room = KGNode(
+                        id=room_id,
+                        node_type="room",
+                        name="unknown",
+                        certainty=0.0,
+                    )
+                current_records.append(room_record(room, frontier_indices))
+            payload["current_assignable_rooms"] = current_records
+
+            historical = [
+                room for room in unexplored
+                if room.id not in current_room_ids
+            ]
+            historical.sort(
+                key=lambda room: (
+                    -room.properties.get("last_seen_update", -1),
+                    -room.certainty,
+                    room.id,
+                )
+            )
+            payload["historical_room_context_not_assignable_count"] = len(
+                historical
+            )
+            payload["historical_room_context_not_assignable"] = [
+                room_record(room)
+                for room in historical[:max_historical_rooms]
+            ]
+        elif unexplored:
+            payload["unexplored_context"] = [
+                room_record(room) for room in unexplored[:10]
+            ]
+
+        if explored_rooms:
+            explored_rooms.sort(
+                key=lambda room: (
+                    -room.properties.get("last_seen_update", -1),
+                    room.id,
+                )
+            )
+            payload["explored_room_count"] = len(explored_rooms)
+            payload["explored_rooms"] = [
+                {
+                    "room_id": room.id,
+                    "observed_type": room.name,
+                    "object_names": [
+                        obj.name for obj in self.get_objects_in_room(room.id)
+                    ],
+                }
+                for room in explored_rooms[:6]
+            ]
+
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def to_triples(self, current_frontier_view=None,
+                   max_historical_rooms=6) -> str:
+        """Render the bounded KG view as a list of ``[head, relation, tail]``.
+
+        The triple projection is derived from :meth:`to_json`, so it inherits
+        exactly the same room selection, relation caps, and numeric precision.
+        Synthetic references only reify attributes such as edge distance; they
+        do not expose additional persistent-KG evidence.
+        """
+        payload = json.loads(self.to_json(
+            current_frontier_view=current_frontier_view,
+            max_historical_rooms=max_historical_rooms,
+        ))
+        triples = [[
+            "kg",
+            "serialization_format",
+            "mindnav_kg_triples_v1",
+        ]]
+
+        def add(head, relation, tail):
+            triples.append([head, relation, tail])
+
+        for robot_index, robot in enumerate(payload.get("robots", [])):
+            robot_id = robot["id"]
+            add(robot_id, "node_type", "robot")
+            add(robot_id, "position_row", robot["position_rc"][0])
+            add(robot_id, "position_column", robot["position_rc"][1])
+            add(robot_id, "in_room", robot["in_room"])
+            add(
+                robot_id,
+                "explored_room_count",
+                robot["explored_room_count"],
+            )
+            path_label = (
+                "reachable_current"
+                if "reachable_current" in robot
+                else "reachable_unexplored"
+            )
+            for path_index, path in enumerate(robot.get(path_label, [])):
+                path_ref = f"{robot_id}::serialized_path_{path_index}"
+                add(robot_id, path_label, path_ref)
+                add(path_ref, "target_room", path["room_id"])
+                add(path_ref, "distance_px", path["distance_px"])
+
+        def add_room(record, context_role):
+            room_id = record["room_id"]
+            add(room_id, "node_type", "room")
+            add(room_id, "context_role", context_role)
+            add(room_id, "observed_type", record["observed_type"])
+            if "type_certainty_percent" in record:
+                add(
+                    room_id,
+                    "type_certainty_percent",
+                    record["type_certainty_percent"],
+                )
+            if "observation_count" in record:
+                add(
+                    room_id,
+                    "observation_count",
+                    record["observation_count"],
+                )
+
+            for frontier in record.get("current_frontiers", []):
+                frontier_id = frontier["frontier_id"]
+                add(room_id, "has_current_frontier", frontier_id)
+                add(frontier_id, "node_type", "frontier")
+                add(frontier_id, "area_px", frontier["area_px"])
+                add(
+                    frontier_id,
+                    "centroid_row",
+                    frontier["centroid_rc"][0],
+                )
+                add(
+                    frontier_id,
+                    "centroid_column",
+                    frontier["centroid_rc"][1],
+                )
+
+            for object_index, obj in enumerate(record.get("objects", [])):
+                object_ref = (
+                    f"{room_id}::serialized_object_{object_index}"
+                )
+                add(room_id, "contains_serialized_object", object_ref)
+                add(object_ref, "name", obj["name"])
+                add(
+                    object_ref,
+                    "certainty_percent",
+                    obj["certainty_percent"],
+                )
+
+            for relation_index, relation in enumerate(
+                    record.get("object_relations", [])):
+                relation_ref = (
+                    f"{room_id}::serialized_object_relation_"
+                    f"{relation_index}"
+                )
+                add(room_id, "has_object_relation", relation_ref)
+                add(relation_ref, "source_name", relation["source"])
+                add(relation_ref, "relation", relation["relation"])
+                add(relation_ref, "target_name", relation["target"])
+                add(
+                    relation_ref,
+                    "distance_px",
+                    relation["distance_px"],
+                )
+
+            for connection_index, connection in enumerate(
+                    record.get("possible_connected", [])):
+                connection_ref = (
+                    f"{room_id}::serialized_connection_{connection_index}"
+                )
+                add(room_id, "possible_connected", connection_ref)
+                add(
+                    connection_ref,
+                    "target_room",
+                    connection["room_id"],
+                )
+                add(
+                    connection_ref,
+                    "distance_px",
+                    connection["distance_px"],
+                )
+
+            for wall_room_id in record.get("walls", []):
+                add(room_id, "separated_by_wall", wall_room_id)
+
+            for object_name in record.get("object_names", []):
+                add(room_id, "contains_object_name", object_name)
+
+        if "current_assignable_room_count" in payload:
+            add(
+                "kg",
+                "current_assignable_room_count",
+                payload["current_assignable_room_count"],
+            )
+        for room in payload.get("current_assignable_rooms", []):
+            add_room(room, "current_assignable")
+
+        if "historical_room_context_not_assignable_count" in payload:
+            add(
+                "kg",
+                "historical_room_context_not_assignable_count",
+                payload[
+                    "historical_room_context_not_assignable_count"
+                ],
+            )
+        for room in payload.get(
+                "historical_room_context_not_assignable", []):
+            add_room(room, "historical_not_assignable")
+
+        for room in payload.get("unexplored_context", []):
+            add_room(room, "unexplored_context")
+
+        if "explored_room_count" in payload:
+            add("kg", "explored_room_count", payload["explored_room_count"])
+        for room in payload.get("explored_rooms", []):
+            add_room(room, "explored")
+
+        return json.dumps(
+            triples,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
 
 # ═══════════════════════════════════════

@@ -70,6 +70,40 @@ class DeepSeekConfigTests(unittest.TestCase):
         )
         self.assertNotIn("seed", request)
 
+    def test_adapter_records_provider_usage_and_real_call_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / ".env").write_text(
+                "BRAIN_BACKEND=vllm\nBRAIN_MODEL=qwen2.5-7b\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_brain_api_config(directory)
+
+        usage_sink = []
+        usage = Mock(
+            prompt_tokens=123,
+            completion_tokens=17,
+            prompt_tokens_details=Mock(cached_tokens=11),
+            completion_tokens_details=Mock(reasoning_tokens=3),
+        )
+        client = Mock()
+        client.chat.completions.create.return_value = Mock(
+            choices=[Mock(message=Mock(content="{}"))],
+            usage=usage,
+        )
+        with patch("openai.OpenAI", return_value=client):
+            adapter = OpenAICompatibleBrainAdapter(config, usage_sink, seed=1)
+            adapter.call("assign", max_tokens=64)
+
+        self.assertEqual(adapter.usage_snapshot(), {
+            "input_tokens": 123,
+            "output_tokens": 17,
+            "cached_input_tokens": 11,
+            "reasoning_tokens": 3,
+            "api_calls": 1,
+        })
+        self.assertEqual(usage_sink[0]["api_calls"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

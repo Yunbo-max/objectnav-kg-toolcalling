@@ -30,9 +30,16 @@ from kg_construction import (
 class HelicaseBrain:
     """Central LLM that reasons over the KG and assigns current frontiers."""
 
-    def __init__(self, brain, num_agents=2):
+    def __init__(self, brain, num_agents=2, kg_serialization="text",
+                 decision_history_enabled=True):
         self.brain = brain
         self.num_agents = int(num_agents)
+        if kg_serialization not in {"text", "json", "triples"}:
+            raise ValueError(
+                "kg_serialization must be one of: text, json, triples"
+            )
+        self.kg_serialization = kg_serialization
+        self.decision_history_enabled = bool(decision_history_enabled)
         self.reflexion_memory: List[str] = []
         self.last_decision_audit: Dict = {}
         self._recent_assignment_history: List[Dict] = []
@@ -529,8 +536,9 @@ class HelicaseBrain:
                 if key != "room_id"
             })
 
-        history_summary = self._room_history_summary(
-            current_room_ids, recent_history
+        history_summary = (
+            self._room_history_summary(current_room_ids, recent_history)
+            if self.decision_history_enabled else {}
         )
         current_rooms = {}
         for room_id in current_room_ids:
@@ -559,12 +567,15 @@ class HelicaseBrain:
                 } for obj in query["objects"]],
                 "explored": query["explored"],
                 "observation_count": query["observation_count"],
-                "recent_history_summary": history_summary[room_id],
                 "frontiers": sorted(
                     frontiers_by_room.get(room_id, []),
                     key=lambda option: option["frontier_id"],
                 ),
             }
+            if self.decision_history_enabled:
+                current_rooms[room_id]["recent_history_summary"] = (
+                    history_summary[room_id]
+                )
 
         robot_states = {}
         for robot_index in range(self.num_agents):
@@ -582,10 +593,9 @@ class HelicaseBrain:
                 )
             }
 
-        return {
+        packet = {
             "robots": robot_states,
             "current_rooms": current_rooms,
-            "recent_assignments": recent_history,
             "constraints": {
                 "distinct_rooms_required": (
                     len(current_room_ids) >= self.num_agents
@@ -606,7 +616,10 @@ class HelicaseBrain:
                     )
                 ],
             },
-        }, history_summary
+        }
+        if self.decision_history_enabled:
+            packet["recent_assignments"] = recent_history
+        return packet, history_summary
 
     @staticmethod
     def _validate_probability_calls(payload, expected_room_ids, target_name,
@@ -932,6 +945,7 @@ class HelicaseBrain:
             ),
             "recent_assignment_history": list(recent_history or []),
             "room_history_summary": dict(room_history_summary or {}),
+            "decision_history_enabled": self.decision_history_enabled,
         }
 
     def _finish_fallback(self, current_frontiers, pose_pred,
@@ -971,7 +985,7 @@ class HelicaseBrain:
             recent_history=recent_history,
             room_history_summary=room_history_summary,
         )
-        if step is not None:
+        if step is not None and self.decision_history_enabled:
             self._record_assignment_history(
                 current_frontiers, assignments, step
             )
@@ -1011,17 +1025,32 @@ class HelicaseBrain:
             }
             return {}, ["no_current_frontiers"], "helicase_no_frontiers"
 
-        kg_text = kg.to_text(current_frontier_view=current_frontiers)
+        if self.kg_serialization == "json":
+            serialized_kg = kg.to_json(
+                current_frontier_view=current_frontiers
+            )
+        elif self.kg_serialization == "triples":
+            serialized_kg = kg.to_triples(
+                current_frontier_view=current_frontiers
+            )
+        else:
+            serialized_kg = kg.to_text(
+                current_frontier_view=current_frontiers
+            )
         current_room_ids = sorted(current_frontiers.room_ids)
         frontier_options = self._frontier_options(
             current_frontiers,
             pose_pred,
             self.num_agents,
         )
-        recent_history = self._prepare_recent_history(kg, step)
-        room_history_summary = self._room_history_summary(
-            current_room_ids, recent_history
-        )
+        if self.decision_history_enabled:
+            recent_history = self._prepare_recent_history(kg, step)
+            room_history_summary = self._room_history_summary(
+                current_room_ids, recent_history
+            )
+        else:
+            recent_history = []
+            room_history_summary = {}
         validation_errors = []
         stage_statuses = {"query_room_objects": "executed"}
         tools_called = ["query_room_objects"]
@@ -1101,7 +1130,7 @@ class HelicaseBrain:
             "yourself; evidence_ids must be a subset of that entry's allowed "
             "list.\n"
             f"{json.dumps(probability_call_identities, ensure_ascii=False)}\n\n"
-            f"SERIALIZED_KG:\n{kg_text}\n\n"
+            f"SERIALIZED_KG:\n{serialized_kg}\n\n"
             f"QUERY_ROOM_OBJECTS_RESULTS:\n"
             f"{json.dumps(query_results, ensure_ascii=False)}"
         )
@@ -1168,6 +1197,21 @@ class HelicaseBrain:
         valid_room_frontier_pairs = decision_packet["constraints"][
             "valid_room_frontier_pairs"
         ]
+        history_guidance = ""
+        if self.decision_history_enabled:
+            history_guidance = (
+                "COVERAGE AND HISTORY RULES: do not penalize a repeated room by "
+                "itself. A repeat remains useful when its current frontier centroid "
+                "is substantially different from recent centroids, represents a "
+                "different entrance/viewpoint, or has progressed outward into "
+                "unknown space. Strongly downrank sending the same robot toward a "
+                "similar, stationary frontier centroid after repeated assignments "
+                "without new evidence. No new KG object alone does not prove that "
+                "the whole region was visually exhausted. Prefer two frontiers "
+                "that expose spatially different areas; distinct room IDs alone "
+                "do not guarantee non-overlapping views. Use frontier area only as "
+                "a weak tie-breaker, not as evidence that the target is present.\n\n"
+            )
         assignment_prompt = (
             "You are the central MindNav allocation LLM. This is LLM CALL "
             "2/2. Your objective is to choose the joint "
@@ -1182,7 +1226,7 @@ class HelicaseBrain:
             "different room. CURRENT_DECISION_PACKET fields are authoritative. "
             "probability_reason is only a summary; verify every factual claim "
             "against the selected room's observed_type, objects, probability, "
-            "confidence, history, and frontiers.\n\n"
+            "confidence, frontiers, and any other fields actually present.\n\n"
             "Interpret CALL 1 correctly: high target_probability with high "
             "probability_confidence is grounded semantic evidence; low "
             "probability with high confidence is grounded negative evidence; "
@@ -1202,23 +1246,13 @@ class HelicaseBrain:
             "(C) If no grounded promising region exists, enter COVERAGE MODE: "
             "treat evidence-equivalent low-confidence unknown regions as "
             "semantically tied and choose by new visual exposure, spatial "
-            "complementarity, recent progress, and travel cost.\n\n"
+            "complementarity, and travel cost.\n\n"
             "For toilet and bed, strong grounded room/object evidence may "
             "dominate. For sofa and tv_monitor, combine semantic evidence with "
             "fresh coverage. For broadly distributed chair and plant, rely on "
             "semantic evidence only when it is strong; otherwise emphasize "
             "complementary coverage.\n\n"
-            "COVERAGE AND HISTORY RULES: do not penalize a repeated room by "
-            "itself. A repeat remains useful when its current frontier centroid "
-            "is substantially different from recent centroids, represents a "
-            "different entrance/viewpoint, or has progressed outward into "
-            "unknown space. Strongly downrank sending the same robot toward a "
-            "similar, stationary frontier centroid after repeated assignments "
-            "without new evidence. No new KG object alone does not prove that "
-            "the whole region was visually exhausted. Prefer two frontiers "
-            "that expose spatially different areas; distinct room IDs alone "
-            "do not guarantee non-overlapping views. Use frontier area only as "
-            "a weak tie-breaker, not as evidence that the target is present.\n\n"
+            f"{history_guidance}"
             "After choosing the distinct room/frontier set, jointly match "
             "robots to it to minimize total distance and avoid crossing or "
             "duplicated travel. Distance is an exploration cost, never "
@@ -1325,9 +1359,10 @@ class HelicaseBrain:
             recent_history=recent_history,
             room_history_summary=room_history_summary,
         )
-        self._record_assignment_history(
-            current_frontiers, assignments, step
-        )
+        if self.decision_history_enabled:
+            self._record_assignment_history(
+                current_frontiers, assignments, step
+            )
 
         probability_text = ",".join(
             f"{room_id}={probability_records[room_id]['probability']:.2f}"

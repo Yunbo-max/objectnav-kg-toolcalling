@@ -7,8 +7,9 @@ import numpy as np
 import quaternion
 import skimage.morphology
 import habitat
+from pathlib import Path
 
-from constants import category_to_id, mp3d_category_id
+from constants import category_to_id, hm3d_category
 import utils.pose as pu
 
 coco_categories = [0, 3, 2, 4, 5, 1]
@@ -19,21 +20,25 @@ class Multi_Agent_Env(habitat.Env):
     metrics.
     """
 
-    def __init__(self, config_env):
+    def __init__(self, config_env, use_gtsem=False):
 
         super().__init__(config_env)
+        self.use_gtsem = bool(use_gtsem)
 
         # Initializations
         self.episode_no = 0
    
-        fileName = 'data/matterport_category_mappings.tsv'
+        fileName = (
+            Path(__file__).resolve().parents[4]
+            / 'configs' / 'matterport_category_mappings.tsv'
+        )
 
         text = ''
         lines = []
         items = []
         self.hm3d_semantic_mapping={}
 
-        with open(fileName, 'r') as f:
+        with fileName.open('r') as f:
             text = f.read()
         lines = text.split('\n')
 
@@ -57,6 +62,17 @@ class Multi_Agent_Env(habitat.Env):
         self.episode_no += 1
 
         obs = super().reset()
+        if self.use_gtsem:
+            self.scene = self.sim.semantic_annotations()
+            if not getattr(self.scene, "objects", None):
+                raise RuntimeError(
+                    "GT semantic mode found no Habitat semantic annotations; "
+                    "use the mindnav38_hm3d022 environment"
+                )
+            for agent_obs in obs:
+                agent_obs["semantic"] = self._preprocess_semantic(
+                    agent_obs["semantic"]
+                )
   
         # rgb = obs['rgb'].astype(np.uint8)
         # depth = obs['depth']
@@ -83,6 +99,11 @@ class Multi_Agent_Env(habitat.Env):
         """
 
         obs = super().step(action)
+        if self.use_gtsem:
+            for agent_obs in obs:
+                agent_obs["semantic"] = self._preprocess_semantic(
+                    agent_obs["semantic"]
+                )
 
         # rgb = obs['rgb'].astype(np.uint8)
         # depth = obs['depth']
@@ -92,27 +113,29 @@ class Multi_Agent_Env(habitat.Env):
         return obs
 
     def _preprocess_semantic(self, semantic):
-        # print("*********semantic type: ", type(semantic))
-        se = list(set(semantic.ravel()))
-        # print(se) # []
-        for i in range(len(se)):
-            if self.scene.objects[se[i]].category.name() in self.hm3d_semantic_mapping:
-                hm3d_category_name = self.hm3d_semantic_mapping[self.scene.objects[se[i]].category.name()]
-            else:
-                hm3d_category_name = self.scene.objects[se[i]].category.name()
+        """Map Habitat instance IDs to MindNav's 15 semantic channels.
 
-            if hm3d_category_name in mp3d_category_id:
-                # print("sum: ", np.sum(sem_output[sem_output==se[i]])/se[i])
-                semantic[semantic==se[i]] = mp3d_category_id[hm3d_category_name]-1
-            else :
-                semantic[
-                    semantic==se[i]
-                    ] = 0
-    
-        # se = list(set(semantic.ravel()))
-        # print("semantic: ", se) # []
-        semantic = np.expand_dims(semantic.astype(np.uint8), 2)
-        return semantic
+        The conversion reads from an immutable copy so low-valued class IDs
+        cannot be mistaken for yet-unprocessed Habitat instance IDs.
+        Unknown categories use channel 15, which mapping treats as background.
+        """
+        instance_map = np.asarray(semantic).squeeze()
+        category_map = np.full(instance_map.shape, 15, dtype=np.uint8)
+        objects = getattr(self.scene, "objects", [])
+        category_index = {name: idx for idx, name in enumerate(hm3d_category)}
+        for instance_id in np.unique(instance_map):
+            instance_id = int(instance_id)
+            if instance_id < 0 or instance_id >= len(objects):
+                continue
+            obj = objects[instance_id]
+            if obj is None or getattr(obj, "category", None) is None:
+                continue
+            raw_name = obj.category.name()
+            mapped_name = self.hm3d_semantic_mapping.get(raw_name, raw_name)
+            channel = category_index.get(mapped_name)
+            if channel is not None:
+                category_map[instance_map == instance_id] = channel
+        return category_map
 
     def get_sim_location(self):
         """Returns x, y, o pose of the agent in the Habitat simulator."""

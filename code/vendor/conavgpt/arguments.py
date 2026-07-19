@@ -43,6 +43,12 @@ def get_args():
                         help='comma-separated goals recorded by --target_diag_dir')
     parser.add_argument('--method_name', type=str, default='mindnav_main',
                         help='method label stored in per-episode JSONL')
+    parser.add_argument('--kg_serialization', type=str, default='text',
+                        choices=('text', 'json', 'triples'),
+                        help='wire format for the full KG in LLM call 1')
+    parser.add_argument('--decision_history', type=str, default='on',
+                        choices=('on', 'off'),
+                        help='whether LLM prompts include recent decision history')
     parser.add_argument('--save_periodic', type=int, default=500000,
                         help='Model save frequency in number of updates')
     parser.add_argument('-v', '--visualize', type=int, default=0,

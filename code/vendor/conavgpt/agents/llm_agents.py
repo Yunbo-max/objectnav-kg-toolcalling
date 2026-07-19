@@ -61,13 +61,18 @@ class LLM_Agent(Agent):
         # ------------------------------------------------------------------
         ##### Semantic detecttion init
         # ------------------------------------------------------------------
-        self.sem_pred = SemanticPredMaskRCNN(args)
-        self.red_sem_pred = load_rednet(
-            self.device, ckpt='RedNet/model/rednet_semmap_mp3d_40.pth', 
-            resize=True, # since we train on half-vision
-        )
-        self.red_sem_pred.eval()
-        self.red_sem_pred.to(self.device)
+        if args.use_gtsem:
+            self.sem_pred = None
+            self.red_sem_pred = None
+            print("Using Habitat GT semantic channels; prediction models disabled")
+        else:
+            self.sem_pred = SemanticPredMaskRCNN(args)
+            self.red_sem_pred = load_rednet(
+                self.device, ckpt='RedNet/model/rednet_semmap_mp3d_40.pth',
+                resize=True, # since we train on half-vision
+            )
+            self.red_sem_pred.eval()
+            self.red_sem_pred.to(self.device)
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
@@ -98,6 +103,7 @@ class LLM_Agent(Agent):
         self.last_target_frame_masks = {}
         self.last_target_map_binary = None
         self.last_goal_map_binary = None
+        self.semantic_pixel_counts = np.zeros(16, dtype=np.int64)
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
@@ -208,6 +214,7 @@ class LLM_Agent(Agent):
         self.last_target_frame_masks = {}
         self.last_target_map_binary = None
         self.last_goal_map_binary = None
+        self.semantic_pixel_counts = np.zeros(16, dtype=np.int64)
 
         self.eve_angle = 0
 
@@ -268,7 +275,10 @@ class LLM_Agent(Agent):
         depth = observations['depth']
         state = np.concatenate((rgb, depth), axis=2).transpose(2, 0, 1)
 
-        obs = self._preprocess_obs(state) 
+        obs = self._preprocess_obs(
+            state,
+            gt_semantic=observations.get("semantic"),
+        )
 
         # Detectron2 only returns a rendered RGB image in some visualization
         # modes.  Image-only recording still needs a frame for the per-agent
@@ -639,60 +649,97 @@ class LLM_Agent(Agent):
 
         return (stg_x, stg_y), stop
 
-    def _preprocess_obs(self, obs, use_seg=True):
+    def _preprocess_obs(self, obs, use_seg=True, gt_semantic=None):
         args = self.args
         # print("obs: ", obs.shape)
         obs = obs.transpose(1, 2, 0)
         rgb = obs[:, :, :3]
         depth = obs[:, :, 3:4]
 
-        red_semantic_pred, semantic_pred = self._get_sem_pred(
-            rgb.astype(np.uint8), depth, use_seg=use_seg)
-
-        # Diagnostic-only source attribution. These values are copied before
-        # fusion and are never fed back into mapping or control.
         self.last_rgb_observation = rgb.astype(np.uint8, copy=True)
         self.last_semantic_source_stats = {}
         self.last_target_frame_masks = {}
-        if self.goal_id is not None:
-            target_category = coco_categories[self.goal_id]
-            rednet_target = (
-                red_semantic_pred == mp_categories_mapping[target_category]
-            )
-            maskrcnn_target = semantic_pred[:, :, target_category] > 0
-            fused_target = np.logical_or(rednet_target, maskrcnn_target)
-            agreement_target = np.logical_and(
-                rednet_target, maskrcnn_target
-            )
-            self.last_semantic_source_stats = {
-                "target_category_index": int(target_category),
-                "rednet": self._binary_mask_stats(rednet_target),
-                "maskrcnn": self._binary_mask_stats(maskrcnn_target),
-                "fused_union": self._binary_mask_stats(fused_target),
-                "source_intersection_pixels": int(
-                    agreement_target.sum()
-                ),
-            }
-            self.last_target_frame_masks = {
-                "rednet": rednet_target.astype(np.uint8, copy=True),
-                "maskrcnn": maskrcnn_target.astype(np.uint8, copy=True),
-                "fused_union": fused_target.astype(np.uint8, copy=True),
-                "source_intersection": agreement_target.astype(
-                    np.uint8, copy=True
-                ),
-            }
+        target_category = (
+            coco_categories[self.goal_id] if self.goal_id is not None else None
+        )
 
-        sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], 15 + 1))   
-        for i in range(0, 15):
-            # print(mp_categories_mapping[i])
-            sem_seg_pred[:,:,i][red_semantic_pred == mp_categories_mapping[i]] = 1
+        if args.use_gtsem:
+            if gt_semantic is None:
+                raise ValueError("GT semantic mode requires Habitat semantic sensor")
+            gt_category_map = np.asarray(gt_semantic).squeeze()
+            if gt_category_map.shape != rgb.shape[:2]:
+                raise ValueError(
+                    "GT semantic shape does not match RGB: "
+                    f"{gt_category_map.shape} vs {rgb.shape[:2]}"
+                )
+            sem_seg_pred = np.zeros(
+                (rgb.shape[0], rgb.shape[1], 15 + 1), dtype=np.float32
+            )
+            for category_idx in range(15):
+                sem_seg_pred[:, :, category_idx] = (
+                    gt_category_map == category_idx
+                )
+            self.semantic_pixel_counts += np.bincount(
+                gt_category_map.astype(np.int64).ravel(), minlength=16
+            )[:16]
+            if target_category is not None:
+                gt_target = gt_category_map == target_category
+                stats = self._binary_mask_stats(gt_target)
+                self.last_semantic_source_stats = {
+                    "target_category_index": int(target_category),
+                    "source": "habitat_gt",
+                    "gt": stats,
+                }
+                self.last_target_frame_masks = {
+                    "gt": gt_target.astype(np.uint8, copy=True),
+                    "fused_union": gt_target.astype(np.uint8, copy=True),
+                }
+        else:
+            red_semantic_pred, semantic_pred = self._get_sem_pred(
+                rgb.astype(np.uint8), depth, use_seg=use_seg)
+            if target_category is not None:
+                rednet_target = (
+                    red_semantic_pred == mp_categories_mapping[target_category]
+                )
+                maskrcnn_target = semantic_pred[:, :, target_category] > 0
+                fused_target = np.logical_or(rednet_target, maskrcnn_target)
+                agreement_target = np.logical_and(
+                    rednet_target, maskrcnn_target
+                )
+                self.last_semantic_source_stats = {
+                    "target_category_index": int(target_category),
+                    "source": "rednet_maskrcnn",
+                    "rednet": self._binary_mask_stats(rednet_target),
+                    "maskrcnn": self._binary_mask_stats(maskrcnn_target),
+                    "fused_union": self._binary_mask_stats(fused_target),
+                    "source_intersection_pixels": int(
+                        agreement_target.sum()
+                    ),
+                }
+                self.last_target_frame_masks = {
+                    "rednet": rednet_target.astype(np.uint8, copy=True),
+                    "maskrcnn": maskrcnn_target.astype(np.uint8, copy=True),
+                    "fused_union": fused_target.astype(np.uint8, copy=True),
+                    "source_intersection": agreement_target.astype(
+                        np.uint8, copy=True
+                    ),
+                }
 
-        sem_seg_pred[:,:,0][semantic_pred[:,:,0] == 0] = 0
-        sem_seg_pred[:,:,1][semantic_pred[:,:,1] == 0] = 0
-        sem_seg_pred[:,:,2][semantic_pred[:,:,2] == 1] = 1
-        sem_seg_pred[:,:,3][semantic_pred[:,:,3] == 0] = 0
-        sem_seg_pred[:,:,4][semantic_pred[:,:,4] == 1] = 1
-        sem_seg_pred[:,:,5][semantic_pred[:,:,5] == 1] = 1
+            sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], 15 + 1))
+            for i in range(0, 15):
+                sem_seg_pred[:,:,i][
+                    red_semantic_pred == mp_categories_mapping[i]
+                ] = 1
+
+            sem_seg_pred[:,:,0][semantic_pred[:,:,0] == 0] = 0
+            sem_seg_pred[:,:,1][semantic_pred[:,:,1] == 0] = 0
+            sem_seg_pred[:,:,2][semantic_pred[:,:,2] == 1] = 1
+            sem_seg_pred[:,:,3][semantic_pred[:,:,3] == 0] = 0
+            sem_seg_pred[:,:,4][semantic_pred[:,:,4] == 1] = 1
+            sem_seg_pred[:,:,5][semantic_pred[:,:,5] == 1] = 1
+
+        if target_category is not None and not args.use_gtsem:
+            assert self.sem_pred is not None and self.red_sem_pred is not None
         # sem_seg_pred = self._get_sem_pred(
         #     rgb.astype(np.uint8), depth, use_seg=use_seg)
 

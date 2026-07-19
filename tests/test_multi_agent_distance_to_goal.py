@@ -17,7 +17,7 @@ HABITAT_ROOT = (
 if str(HABITAT_ROOT) not in sys.path:
     sys.path.insert(0, str(HABITAT_ROOT))
 
-from habitat.tasks.nav.nav import DistanceToGoal
+from habitat.tasks.nav.nav import DistanceToGoal, SPL
 
 
 class FakeMultiAgentSim:
@@ -65,6 +65,37 @@ class MultiAgentDistanceToGoalTests(unittest.TestCase):
 
         self.assertAlmostEqual(measure.get_metric(), 0.25, places=6)
         self.assertEqual(sim.geodesic_calls, 4)
+
+    def test_team_spl_uses_the_successful_robots_own_path(self):
+        sim = FakeMultiAgentSim([0.0, 0.0])
+        distance_measure = SimpleNamespace(
+            _agent_distances=[5.0, 2.0],
+            get_metric=lambda: 2.0,
+        )
+        success_measure = SimpleNamespace(
+            _config=SimpleNamespace(SUCCESS_DISTANCE=0.2),
+            get_metric=lambda: 0.0,
+        )
+        measures = {
+            "distance_to_goal": distance_measure,
+            "success": success_measure,
+        }
+        task = SimpleNamespace(measurements=SimpleNamespace(
+            measures=measures,
+            check_measure_dependencies=lambda *args, **kwargs: None,
+        ))
+        measure = SPL(sim=sim, config=SimpleNamespace())
+        measure.reset_metric(episode=SimpleNamespace(), task=task)
+
+        # Robot 1 succeeds after a 3 m path from a 2 m geodesic start. Robot 0
+        # travels much farther and does not succeed; team SPL must be 2/3.
+        sim.positions[0] = np.array([10.0, 0.0, 0.0], dtype=np.float32)
+        sim.positions[1] = np.array([3.0, 0.0, 0.0], dtype=np.float32)
+        distance_measure._agent_distances = [1.0, 0.1]
+        success_measure.get_metric = lambda: 1.0
+        measure.update_metric(episode=SimpleNamespace(), task=task)
+
+        self.assertAlmostEqual(measure.get_metric(), 2.0 / 3.0, places=6)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ import logging
 import time
 import json
 import re
+import subprocess
+from datetime import datetime, timezone
 import gym
 import torch.nn as nn
 import torch
@@ -29,10 +31,6 @@ if CODE_SRC not in sys.path:
 from brain import HelicaseBrain
 from kg_construction import CurrentFrontierView, KnowledgeGraph, KGUpdater
 from llm_api import OpenAICompatibleBrainAdapter, load_brain_api_config
-from mcoconav_metrics import (
-    MCoCoNavMetricTracker,
-    build_instance_category_map,
-)
 from reproducibility import reset_episode_rng
 
 from skimage import measure
@@ -1015,7 +1013,10 @@ def main():
     config_env.freeze()
 
 
-    env = Multi_Agent_Env(config_env=config_env)
+    env = Multi_Agent_Env(
+        config_env=config_env,
+        use_gtsem=bool(args.use_gtsem),
+    )
 
     total_episodes = env.number_of_episodes
     if args.start_episode_index < 0 or args.start_episode_index >= total_episodes:
@@ -1099,6 +1100,13 @@ def main():
     last_decision = []
     total_usage = []
     decision_history = []
+    try:
+        git_commit = subprocess.check_output(
+            ["git", "-C", PROJECT_ROOT, "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+    except Exception:
+        git_commit = "unknown"
 
     brain_adapter = OpenAICompatibleBrainAdapter(
         config=brain_config,
@@ -1107,14 +1115,25 @@ def main():
     )
     kg = KnowledgeGraph()
     kg_updater = KGUpdater(kg)
-    mindnav_brain = HelicaseBrain(brain_adapter, num_agents=num_agents)
-    mcoconav_tracker = MCoCoNavMetricTracker(
+    mindnav_brain = HelicaseBrain(
+        brain_adapter,
         num_agents=num_agents,
-        map_resolution_cm=args.map_resolution,
+        kg_serialization=args.kg_serialization,
+        decision_history_enabled=args.decision_history == "on",
     )
     print(f"Using MindNav core: {CODE_SRC}/brain.py + {CODE_SRC}/kg_construction.py")
 
     while count_episodes < num_episodes:
+        episode_started_at = datetime.now(timezone.utc)
+        usage_before_episode = brain_adapter.usage_snapshot()
+        episode_diagnostics = defaultdict(int, {
+            "invalid_outputs": 0,
+            "repair_calls": 0,
+            "outer_retries": 0,
+            "fallback_decisions": 0,
+            "planning_rounds": 0,
+        })
+        episode_errors = []
         episode_seed = None
         if args.reset_seed_each_episode:
             episode_seed = reset_episode_rng(args.seed, env=env)
@@ -1137,16 +1156,6 @@ def main():
         goal_points.clear()
         for i in range(num_agents):
             agent[i].reset()
-        semantic_scene = env.sim.semantic_annotations()
-        instance_categories = build_instance_category_map(
-            semantic_scene.objects,
-            getattr(env, "hm3d_semantic_mapping", None),
-        )
-        mcoconav_tracker.reset(
-            goal_name=getattr(current_episode, "object_category", "unknown"),
-            initial_world_poses=[agent[i].curr_loc[:2] for i in range(num_agents)],
-            instance_categories=instance_categories,
-        )
         target_first_found_saved = [False] * num_agents
 
         while not env.episode_over:
@@ -1277,6 +1286,10 @@ def main():
                             break
                         except Exception as e:
                             last_brain_error = e
+                            episode_diagnostics["outer_retries"] += 1
+                            episode_errors.append(
+                                f"{type(e).__name__}: {str(e)[:500]}"
+                            )
                             print(f"MindNav core brain error: {e}")
                             print('Retrying...')
                             retries -= 1
@@ -1287,6 +1300,27 @@ def main():
                             type(last_brain_error).__name__
                             if last_brain_error is not None else "brain_error"
                         )
+
+                    decision_audit = mindnav_brain.last_decision_audit
+                    episode_diagnostics["planning_rounds"] += 1
+                    episode_diagnostics["invalid_outputs"] += len(
+                        decision_audit.get("validation_errors", [])
+                    )
+                    episode_diagnostics["repair_calls"] += sum(
+                        status == "repaired"
+                        for status in decision_audit.get(
+                            "tool_status", {}
+                        ).values()
+                    )
+                    fallback_reason = decision_audit.get("fallback_reason")
+                    if fallback_reason:
+                        # The brain can return a valid deterministic fallback
+                        # directly, in which case the outer retry loop marks
+                        # the call successful and the legacy ``reason`` local
+                        # above is never assigned.  Use the audited fallback
+                        # reason as the single source of truth.
+                        reason = fallback_reason
+                        episode_diagnostics["fallback_decisions"] += 1
                         print(
                             "MindNav failed all retries; using deterministic "
                             f"current-frontier fallback ({reason})"
@@ -1330,12 +1364,15 @@ def main():
                             Frontiers_dict.get("frontier_" + str(fi), "")
                         )
 
-                    decision_history.append({
-                        "step": int(agent[0].l_step),
-                        "r0": int(goal_frontiers.get("robot_0", 0)),
-                        "r1": int(goal_frontiers.get("robot_1", 0)),
-                        "objects_found": ",".join(sorted(object_list.keys())),
-                    })
+                    if args.decision_history == "on":
+                        decision_history.append({
+                            "step": int(agent[0].l_step),
+                            "r0": int(goal_frontiers.get("robot_0", 0)),
+                            "r1": int(goal_frontiers.get("robot_1", 0)),
+                            "objects_found": ",".join(
+                                sorted(object_list.keys())
+                            ),
+                        })
 
                     chosen_0 = goal_frontiers.get("robot_0", 0)
                     chosen_1 = goal_frontiers.get("robot_1", 0)
@@ -1403,13 +1440,6 @@ def main():
             # start_act = time.time()
             for i in range(num_agents):
                 action[i] = agent[i].act(goal_points[i])
-                mcoconav_tracker.observe_agent(
-                    agent_id=i,
-                    planner_pose_inputs=agent[i].planner_pose_inputs,
-                    map_shape=agent[i].local_map.shape[-2:],
-                    predicted_find_goal=agent[i].last_found_goal,
-                    semantic_observation=observations[i].get("semantic"),
-                )
             # act_end = time.time()
             # act_time = act_end - start_act
             # print('act_time: %.3f秒'%act_time)
@@ -1535,43 +1565,65 @@ def main():
         ]) + '\n'
 
         metrics = env.get_metrics()
-        mcoconav_metrics = mcoconav_tracker.result()
-        agg_metrics["mcoconav_success"] += mcoconav_metrics["success"]
-        agg_metrics["mcoconav_navigation_success"] += mcoconav_metrics[
-            "navigation_success"
-        ]
-        agg_metrics["mcoconav_spl"] += mcoconav_metrics["spl"]
-        agg_metrics["mcoconav_any_agent_success"] += mcoconav_metrics[
-            "any_agent_success"
-        ]
         if args.jsonl_log:
+            usage_after_episode = brain_adapter.usage_snapshot()
+            episode_usage = {
+                key: int(usage_after_episode[key] - usage_before_episode[key])
+                for key in usage_after_episode
+            }
+            episode_ended_at = datetime.now(timezone.utc)
             episode_record = {
+                "schema_version": 2,
+                "run_id": args.method_name,
                 "method": args.method_name,
+                "kg_serialization": args.kg_serialization,
+                "decision_history": args.decision_history,
+                "semantic_source": (
+                    "habitat_gt" if args.use_gtsem else "predicted"
+                ),
+                "semantic_pixel_counts_by_agent": (
+                    [a.semantic_pixel_counts.tolist() for a in agent]
+                    if args.use_gtsem else None
+                ),
                 "episode": args.start_episode_index + count_episodes,
+                "episode_index": (
+                    args.start_episode_index + count_episodes - 1
+                ),
+                "episode_id": str(current_episode.episode_id),
+                "scene": os.path.basename(current_episode.scene_id),
                 "success": float(metrics.get("success", 0.0)),
                 "spl": float(metrics.get("spl", 0.0)),
                 "habitat_success": float(metrics.get("success", 0.0)),
                 "habitat_spl": float(metrics.get("spl", 0.0)),
-                "mcoconav_success": mcoconav_metrics["success"],
-                "mcoconav_navigation_success": mcoconav_metrics[
-                    "navigation_success"
-                ],
-                "mcoconav_spl": mcoconav_metrics["spl"],
-                "mcoconav_any_agent_success": mcoconav_metrics[
-                    "any_agent_success"
-                ],
-                "mcoconav_deciding_robot": mcoconav_metrics[
-                    "deciding_robot"
-                ],
-                "mcoconav_agent_metrics": mcoconav_metrics["agent_metrics"],
                 "goal": agent[0].goal_name,
                 "steps": int(agent[0].l_step),
                 "distance_to_goal": float(metrics.get("distance_to_goal", -1.0)),
+                **episode_usage,
+                **{key: int(value) for key, value in episode_diagnostics.items()},
+                "backend": brain_config.backend,
+                "base_url": brain_config.base_url,
+                "model": brain_config.model,
+                "habitat_sim_version": habitat_sim.__version__,
+                "sim_gpu_id": int(args.sim_gpu_id),
+                "sem_gpu_id": int(args.sem_gpu_id),
+                "llm_gpu_id": int(args.llm_gpu_id),
+                "success_threshold_m": float(
+                    config_env.TASK.SUCCESS.SUCCESS_DISTANCE
+                ),
                 "episode_seed": episode_seed,
+                "seed": int(args.seed),
                 "seed_mode": (
                     "fixed_global"
                     if args.reset_seed_each_episode else "continuous"
                 ),
+                "git_commit": git_commit,
+                "started_at": episode_started_at.isoformat(),
+                "ended_at": episode_ended_at.isoformat(),
+                "duration_seconds": (
+                    episode_ended_at - episode_started_at
+                ).total_seconds(),
+                "status": "complete",
+                "errors": episode_errors,
             }
             with open(args.jsonl_log, "a") as jsonl_file:
                 json.dump(episode_record, jsonl_file, ensure_ascii=False)
@@ -1585,8 +1637,8 @@ def main():
 
         log += ", ".join(k + ": {:.3f}".format(v / count_episodes) for k, v in agg_metrics.items()) + " ---({:.0f}/{:.0f})".format(count_episodes, num_episodes)
 
-        average_usage = float(np.mean(total_usage)) if total_usage else 0.0
-        log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(average_usage)
+        usage_totals = brain_adapter.usage_snapshot()
+        log += " LLM usage: " + json.dumps(usage_totals, sort_keys=True)
         print(log)
         logging.info(log)
         # ------------------------------------------------------------------

@@ -7,10 +7,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-if [[ -f "$REPO_ROOT/.env" ]]; then
+ENV_FILE=${ENV_FILE:-"$REPO_ROOT/.env"}
+case "$ENV_FILE" in
+    /*) ;;
+    *) ENV_FILE="$REPO_ROOT/$ENV_FILE" ;;
+esac
+if [[ -f "$ENV_FILE" ]]; then
     set -a
-    source "$REPO_ROOT/.env"
+    source "$ENV_FILE"
     set +a
+else
+    echo "Backend env file not found: $ENV_FILE" >&2
+    exit 2
 fi
 
 CONDA_ENV=${CONDA_ENV:-mindnav38}
@@ -36,6 +44,9 @@ EXP_NAME=${EXP_NAME:-mindnav_${SPLIT}}
 LOG=${LOG:-"$REPO_ROOT/results/runs/mindnav_${SPLIT}.log"}
 JSONL_LOG=${JSONL_LOG:-"${LOG%.log}.jsonl"}
 METHOD_NAME=${METHOD_NAME:-mindnav_main}
+KG_SERIALIZATION=${KG_SERIALIZATION:-text}
+DECISION_HISTORY=${DECISION_HISTORY:-on}
+USE_GTSEM=${USE_GTSEM:-0}
 
 abspath_from_root() {
     case "$1" in
@@ -70,5 +81,8 @@ cd "$REPO"
     --exp_name "$EXP_NAME" \
     --jsonl_log "$JSONL_LOG" \
     --method_name "$METHOD_NAME" \
+    --kg_serialization "$KG_SERIALIZATION" \
+    --decision_history "$DECISION_HISTORY" \
+    --use_gtsem "$USE_GTSEM" \
     "$@" \
     2>&1 | tee "$LOG"

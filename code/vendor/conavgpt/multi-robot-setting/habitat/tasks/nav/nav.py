@@ -629,9 +629,9 @@ class SPL(Measure):
     def __init__(
         self, sim: Simulator, config: Config, *args: Any, **kwargs: Any
     ):
-        self._previous_position: Optional[np.ndarray] = None
-        self._start_end_episode_distance: Optional[float] = None
-        self._agent_episode_distance: Optional[float] = None
+        self._previous_positions: Optional[List[np.ndarray]] = None
+        self._start_agent_distances: Optional[List[float]] = None
+        self._agent_episode_distances: Optional[List[float]] = None
         self._episode_view_points: Optional[
             List[Tuple[float, float, float]]
         ] = None
@@ -648,11 +648,16 @@ class SPL(Measure):
             self.uuid, [DistanceToGoal.cls_uuid, Success.cls_uuid]
         )
 
-        self._previous_position = self._sim.get_agent_state().position
-        self._agent_episode_distance = 0.0
-        self._start_end_episode_distance = task.measurements.measures[
-            DistanceToGoal.cls_uuid
-        ].get_metric()
+        num_agents = self._sim.habitat_config.NUM_AGENTS
+        self._previous_positions = [
+            self._sim.get_agent_state(agent_id=i).position.copy()
+            for i in range(num_agents)
+        ]
+        self._agent_episode_distances = [0.0] * num_agents
+        distance_measure = task.measurements.measures[DistanceToGoal.cls_uuid]
+        self._start_agent_distances = [
+            float(distance) for distance in distance_measure._agent_distances
+        ]
         self.update_metric(  # type:ignore
             episode=episode, task=task, *args, **kwargs
         )
@@ -665,19 +670,37 @@ class SPL(Measure):
     ):
         ep_success = task.measurements.measures[Success.cls_uuid].get_metric()
 
-        current_position = self._sim.get_agent_state().position
-        self._agent_episode_distance += self._euclidean_distance(
-            current_position, self._previous_position
-        )
-
-        self._previous_position = current_position
-
-        self._metric = ep_success * (
-            self._start_end_episode_distance
-            / max(
-                self._start_end_episode_distance, self._agent_episode_distance
+        assert self._previous_positions is not None
+        assert self._agent_episode_distances is not None
+        assert self._start_agent_distances is not None
+        for i in range(self._sim.habitat_config.NUM_AGENTS):
+            current_position = self._sim.get_agent_state(agent_id=i).position
+            self._agent_episode_distances[i] += self._euclidean_distance(
+                current_position, self._previous_positions[i]
             )
-        )
+            self._previous_positions[i] = current_position.copy()
+
+        # Team SPL is the best individual SPL among robots currently inside
+        # the shared success radius. This matches the any-robot task success
+        # semantics and never attributes robot 1's success to robot 0's path.
+        if not ep_success:
+            self._metric = 0.0
+            return
+        distance_measure = task.measurements.measures[DistanceToGoal.cls_uuid]
+        success_measure = task.measurements.measures[Success.cls_uuid]
+        success_distance = float(success_measure._config.SUCCESS_DISTANCE)
+        successful_agents = [
+            i for i, distance in enumerate(distance_measure._agent_distances)
+            if distance is not None and distance < success_distance
+        ]
+        individual_spl = []
+        for i in successful_agents:
+            shortest = self._start_agent_distances[i]
+            travelled = self._agent_episode_distances[i]
+            individual_spl.append(
+                shortest / max(shortest, travelled) if shortest > 0 else 1.0
+            )
+        self._metric = max(individual_spl, default=0.0)
 
 
 @registry.register_measure

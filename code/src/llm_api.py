@@ -112,6 +112,31 @@ class OpenAICompatibleBrainAdapter:
         self.seed = seed if config.supports_seed else None
         self.last_prompt = ""
         self.last_response = ""
+        self._usage_totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
+            "api_calls": 0,
+        }
+
+    @staticmethod
+    def _usage_value(obj, name: str, default=0):
+        """Read an OpenAI SDK usage field from objects or dictionaries."""
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
+    @classmethod
+    def _usage_int(cls, obj, name: str) -> int:
+        value = cls._usage_value(obj, name, 0)
+        return int(value) if isinstance(value, (int, float)) else 0
+
+    def usage_snapshot(self) -> Dict[str, int]:
+        """Return cumulative provider-reported usage and real request count."""
+        return dict(self._usage_totals)
 
     def _build_request(self, prompt: str, max_tokens: int) -> Dict[str, Any]:
         request = {
@@ -139,12 +164,49 @@ class OpenAICompatibleBrainAdapter:
 
     def call(self, prompt, max_tokens=300):
         self.last_prompt = prompt
-        response = self.client.chat.completions.create(
-            **self._build_request(prompt, max_tokens)
-        )
+        # Count the actual transport attempt even when the provider raises.
+        self._usage_totals["api_calls"] += 1
+        try:
+            response = self.client.chat.completions.create(
+                **self._build_request(prompt, max_tokens)
+            )
+        except Exception:
+            if self.usage_sink is not None:
+                self.usage_sink.append({
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "api_calls": 1,
+                    "request_failed": True,
+                })
+            raise
         content = response.choices[0].message.content.strip()
         self.last_response = content
-        self.usage_sink.append(0)
+        usage = getattr(response, "usage", None)
+        prompt_details = self._usage_value(usage, "prompt_tokens_details", None)
+        completion_details = self._usage_value(
+            usage, "completion_tokens_details", None
+        )
+        record = {
+            "input_tokens": self._usage_int(usage, "prompt_tokens"),
+            "output_tokens": self._usage_int(usage, "completion_tokens"),
+            "cached_input_tokens": self._usage_int(
+                prompt_details, "cached_tokens"
+            ),
+            "reasoning_tokens": self._usage_int(
+                completion_details, "reasoning_tokens"
+            ),
+            "api_calls": 1,
+            "request_failed": False,
+        }
+        for key in (
+            "input_tokens", "output_tokens", "cached_input_tokens",
+            "reasoning_tokens",
+        ):
+            self._usage_totals[key] += record[key]
+        if self.usage_sink is not None:
+            self.usage_sink.append(record)
         print(f"MindNav core brain ({self.model}) response:")
         print(content)
         return content
