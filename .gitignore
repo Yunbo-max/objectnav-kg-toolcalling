@@ -22,6 +22,11 @@ data/**/*.navmesh
 data/**/*.stage_config.json
 data/**/*.scene_instance.json
 results/*
-ablation study.md
+tests/
+code/scripts/*.py
+code/scripts/run_valmini_experiment.sh
 AGENTS.md
-kg.md
+experiment_valmini.md
+experiment.md
+findings.md
+mindnav.md

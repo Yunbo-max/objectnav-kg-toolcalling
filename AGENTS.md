@@ -1,5 +1,0 @@
-当前项目运行python代码默认使用mindnav38这个conda环境
-
-启动habitat仿真前，检查GPU情况，默认habitat仿真环境用一张显卡、语义分割等模型用一张显卡
-
-LLM/VLM（如果需要本地本地部署的情况下）单独用一张显卡（使用vllm这个conda环境）
