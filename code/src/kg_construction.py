@@ -1,10 +1,12 @@
 """MindNav persistent evidence graph and current-frontier view.
 
 The graph keeps episode-level region/object evidence, while executable frontier
-indices live only in :class:`CurrentFrontierView`.  All stored geometry uses map
-``(row, column)`` coordinates.
+indices live only in :class:`CurrentFrontierView`. Scene memory stores graph
+geometry in Habitat world ``(x, z)`` coordinates; the episode ablation retains
+map ``(row, column)`` coordinates.
 """
 import json
+import math
 
 import numpy as np
 from dataclasses import dataclass, field
@@ -12,6 +14,7 @@ from typing import Dict, List, Optional, Tuple, Set
 
 
 MAP_SIZE = 480
+ROOM_CELL_M = 2.5
 UNDIRECTED_RELATIONS = {
     "connected_to",
     "separated_by_wall",
@@ -44,6 +47,55 @@ class KGEdge:
 
 
 @dataclass(frozen=True)
+class EpisodeFrame:
+    """Rigid transform between the episode-centered map and HM3D world.
+
+    The mapper stores row/column coordinates in a 24 m square centered at the
+    episode start.  Habitat's episodic GPS uses a start-relative, rotated
+    frame, so the two horizontal axes are inverted before applying the
+    episode-start quaternion.
+    """
+
+    scene_id: str
+    start_position: Tuple[float, float, float]
+    start_rotation: Tuple[float, float, float, float]  # Habitat x, y, z, w
+    map_size_px: int = MAP_SIZE
+    map_resolution_m: float = 0.05
+
+    @property
+    def floor_id(self) -> int:
+        return int(round(float(self.start_position[1]) / 0.5))
+
+    def map_rc_to_world_xz(self, row: float, col: float) -> Tuple[float, float]:
+        center = float(self.map_size_px) / 2.0
+        # See EpisodicGPSSensor and LLM_Agent.get_pose_change.  Map row/col
+        # offsets are (-episode_x, -episode_z), respectively.
+        local_x = -(float(row) - center) * self.map_resolution_m
+        local_z = -(float(col) - center) * self.map_resolution_m
+        qx, qy, qz, qw = (float(value) for value in self.start_rotation)
+        # Quaternion rotation q * (x, 0, z) * q^-1 without a SciPy runtime
+        # dependency.  Habitat stores coefficients as x, y, z, w.
+        vx, vy, vz = local_x, 0.0, local_z
+        tx = 2.0 * (qy * vz - qz * vy)
+        ty = 2.0 * (qz * vx - qx * vz)
+        tz = 2.0 * (qx * vy - qy * vx)
+        rx = vx + qw * tx + (qy * tz - qz * ty)
+        rz = vz + qw * tz + (qx * ty - qy * tx)
+        return (
+            float(self.start_position[0]) + rx,
+            float(self.start_position[2]) + rz,
+        )
+
+    def room_id_from_map_rc(self, row: float, col: float) -> str:
+        world_x, world_z = self.map_rc_to_world_xz(row, col)
+        grid_x = math.floor(world_x / ROOM_CELL_M)
+        grid_z = math.floor(world_z / ROOM_CELL_M)
+        return (
+            f"scene_room_f{self.floor_id}_x{grid_x}_z{grid_z}"
+        )
+
+
+@dataclass(frozen=True)
 class CurrentFrontier:
     """One executable frontier candidate for the current planning step only."""
 
@@ -54,6 +106,8 @@ class CurrentFrontier:
     target_prior: float = 0.0
     room_type: str = "unknown"
     room_confidence: float = 0.0
+    world_position_xz: Optional[Tuple[float, float]] = None
+    floor_id: Optional[int] = None
 
 
 @dataclass
@@ -69,7 +123,7 @@ class CurrentFrontierView:
 
     @classmethod
     def from_enriched(cls, enriched_frontiers, room_id_resolver=None,
-                      grid_size=50):
+                      world_position_resolver=None, grid_size=50):
         if room_id_resolver is None:
             def room_id_resolver(y, x):
                 return f"room_{int(y // grid_size)}_{int(x // grid_size)}"
@@ -88,6 +142,10 @@ class CurrentFrontierView:
                 )
             cy, cx = float(centroid[0]), float(centroid[1])
             room_id = room_id_resolver(cy, cx)
+            world_position_xz = None
+            floor_id = None
+            if world_position_resolver is not None:
+                world_position_xz, floor_id = world_position_resolver(cy, cx)
             frontier = CurrentFrontier(
                 idx=idx,
                 room_id=room_id,
@@ -99,6 +157,8 @@ class CurrentFrontierView:
                 ),
                 room_type=str(enriched.get("room_type", "unknown")),
                 room_confidence=float(enriched.get("room_confidence", 0.0)),
+                world_position_xz=world_position_xz,
+                floor_id=floor_id,
             )
             frontiers[idx] = frontier
             room_to_frontiers.setdefault(room_id, []).append(idx)
@@ -170,11 +230,11 @@ class CurrentFrontierView:
         assignments = {}
         used = set()
         for robot_index in range(num_agents):
-            raw_position = (
+            pose_value = (
                 pose_pred[robot_index]
                 if robot_index < len(pose_pred) else None
             )
-            position = self.robot_pose_to_map_rc(raw_position)
+            position = self.robot_pose_to_map_rc(pose_value)
             frontier_idx = self.select_frontier(
                 robot_position=position,
                 excluded=used,
@@ -204,6 +264,28 @@ class KnowledgeGraph:
         self.nodes.clear()
         self.edges.clear()
         self._edge_set.clear()
+        self.reset_generation += 1
+
+    def reset_episode_state(self):
+        """Drop execution-time state while preserving static scene evidence."""
+        robot_ids = {
+            node_id for node_id, node in self.nodes.items()
+            if node.node_type == "robot"
+        }
+        for node_id in robot_ids:
+            self.nodes.pop(node_id, None)
+        dynamic_relations = {"in", "explored", "path_to"}
+        self.remove_edges(
+            lambda edge: (
+                edge.relation in dynamic_relations
+                or edge.source in robot_ids
+                or edge.target in robot_ids
+            )
+        )
+        for room in self.get_nodes_by_type("room"):
+            room.properties["explored"] = False
+            for property_name in TRANSIENT_ROOM_PROPERTIES:
+                room.properties.pop(property_name, None)
         self.reset_generation += 1
 
     @staticmethod
@@ -237,7 +319,16 @@ class KnowledgeGraph:
                     )
                 else:
                     existing.position = node.position
+            previous_episode_ids = set(
+                existing.properties.get("episode_ids", [])
+            )
+            incoming_episode_ids = node.properties.get("episode_ids")
             existing.properties.update(node.properties)
+            if incoming_episode_ids is not None:
+                episode_ids = previous_episode_ids
+                episode_ids.update(str(value) for value in incoming_episode_ids)
+                existing.properties["episode_ids"] = sorted(episode_ids)
+                existing.properties["episode_support_count"] = len(episode_ids)
         else:
             self.nodes[node.id] = node
 
@@ -251,7 +342,18 @@ class KnowledgeGraph:
             for e in self.edges:
                 if self._edge_key(e) == key:
                     e.distance = edge.distance
+                    previous_episode_ids = set(
+                        e.properties.get("episode_ids", [])
+                    )
+                    incoming_episode_ids = edge.properties.get("episode_ids")
                     e.properties.update(edge.properties)
+                    if incoming_episode_ids is not None:
+                        episode_ids = previous_episode_ids
+                        episode_ids.update(
+                            str(value) for value in incoming_episode_ids
+                        )
+                        e.properties["episode_ids"] = sorted(episode_ids)
+                        e.properties["episode_support_count"] = len(episode_ids)
                     break
 
     def remove_edges(self, predicate):
@@ -286,10 +388,117 @@ class KnowledgeGraph:
                     objs.append(self.nodes[e.target])
         return objs
 
+    @staticmethod
+    def _snapshot_json_value(value):
+        """Convert KG evidence values to deterministic JSON-compatible data."""
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, np.ndarray):
+            return [KnowledgeGraph._snapshot_json_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): KnowledgeGraph._snapshot_json_value(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return [KnowledgeGraph._snapshot_json_value(item) for item in value]
+        if isinstance(value, set):
+            return [
+                KnowledgeGraph._snapshot_json_value(item)
+                for item in sorted(value, key=repr)
+            ]
+        if isinstance(value, float) and not np.isfinite(value):
+            return None
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        raise TypeError(
+            f"Unsupported KG snapshot value: {type(value).__name__}"
+        )
+
+    def to_snapshot_dict(self) -> Dict:
+        """Return the complete persistent graph without LLM-view truncation.
+
+        Unlike :meth:`to_json`, this method is an analysis/audit serializer. It
+        preserves every persistent node, edge, property, and full-precision
+        geometry, and therefore must not be used as an LLM prompt projection.
+        """
+        nodes = []
+        for node in sorted(self.nodes.values(), key=lambda item: item.id):
+            coordinate_frame = node.properties.get("coordinate_frame", "local")
+            local_position = node.properties.get("position_rc")
+            if local_position is None and coordinate_frame == "local":
+                local_position = node.position
+            world_position = node.properties.get("position_world_xz")
+            if world_position is None and coordinate_frame == "world":
+                world_position = node.position
+            nodes.append({
+                "id": node.id,
+                "node_type": node.node_type,
+                "name": node.name,
+                "certainty": float(node.certainty),
+                # Both are explicit in world mode; never relabel metres as
+                # pixels in the audit format.
+                "position_rc": (
+                    [float(local_position[0]), float(local_position[1])]
+                    if local_position is not None else None
+                ),
+                "position_world_xz": (
+                    [float(world_position[0]), float(world_position[1])]
+                    if world_position is not None else None
+                ),
+                "floor_id": node.properties.get("floor_id"),
+                "episode_ids": list(node.properties.get("episode_ids", [])),
+                "episode_support_count": int(
+                    node.properties.get("episode_support_count", 0)
+                ),
+                "properties": self._snapshot_json_value(node.properties),
+            })
+
+        edges = []
+        for edge in sorted(
+            self.edges,
+            key=lambda item: (
+                item.source, item.target, item.relation, float(item.distance)
+            ),
+        ):
+            edges.append({
+                "source": edge.source,
+                "target": edge.target,
+                "relation": edge.relation,
+                "distance": float(edge.distance),
+                "properties": self._snapshot_json_value(edge.properties),
+            })
+
+        update_ids = [
+            int(properties[key])
+            for properties in (
+                item.get("properties", {}) for item in nodes + edges
+            )
+            for key in ("last_seen_update", "first_seen_update")
+            if isinstance(properties.get(key), (int, float))
+        ]
+        return {
+            "kg_schema_version": 1,
+            "reset_generation": int(self.reset_generation),
+            "update_id": max(update_ids, default=0),
+            "nodes": nodes,
+            "edges": edges,
+        }
+
     def to_text(self, current_frontier_view=None,
                 max_historical_rooms=6) -> str:
         """Render persistent context and current assignable rooms separately."""
         lines = []
+        world_coordinates = any(
+            node.properties.get("coordinate_frame") == "world"
+            for node in self.nodes.values()
+        )
+        distance_unit = "m" if world_coordinates else "px"
+
+        def format_distance(value):
+            precision = 1 if world_coordinates else 0
+            return f"{value:.{precision}f}{distance_unit}"
+
         current_room_ids = (
             current_frontier_view.room_ids
             if current_frontier_view is not None else set()
@@ -317,10 +526,18 @@ class KnowledgeGraph:
                     elif e.relation == "explored":
                         explored.append(e.target)
             paths.sort(key=lambda x: x[1])
-            path_str = ", ".join([f"{p[0]}({p[1]:.0f}px)" for p in paths[:5]])
+            path_str = ", ".join([
+                f"{room_id}({format_distance(distance)})"
+                for room_id, distance in paths[:5]
+            ])
+            position_label = (
+                "position_world_xz" if world_coordinates else "position_rc"
+            )
+            position_precision = 2 if world_coordinates else 0
             lines.append(
-                f"{r.id}: position_rc=({r.position[0]:.0f},"
-                f"{r.position[1]:.0f}), in={in_room}, "
+                f"{r.id}: {position_label}="
+                f"({r.position[0]:.{position_precision}f},"
+                f"{r.position[1]:.{position_precision}f}), in={in_room}, "
                 f"explored={len(explored)} rooms"
             )
             if paths:
@@ -353,7 +570,9 @@ class KnowledgeGraph:
                     continue
                 other = edge.target if edge.source == room.id else edge.source
                 if edge.relation == "connected_to":
-                    connections.append(f"{other}({edge.distance:.0f}px)")
+                    connections.append(
+                        f"{other}({format_distance(edge.distance)})"
+                    )
                 elif edge.relation == "separated_by_wall":
                     walls.append(other)
 
@@ -396,7 +615,8 @@ class KnowledgeGraph:
                             line += (
                                 f"\n    {obj.name} "
                                 f"──{object_edge.relation}"
-                                f"({object_edge.distance:.0f}px)──> {other.name}"
+                                f"({format_distance(object_edge.distance)})"
+                                f"──> {other.name}"
                             )
             if connections:
                 line += (
@@ -473,12 +693,25 @@ class KnowledgeGraph:
             current_frontier_view.room_ids
             if current_frontier_view is not None else set()
         )
+        world_coordinates = any(
+            node.properties.get("coordinate_frame") == "world"
+            for node in self.nodes.values()
+        )
+        position_key = (
+            "position_world_xz" if world_coordinates else "position_rc"
+        )
+        distance_key = "distance_m" if world_coordinates else "distance_px"
 
         def rounded(value):
             return int(round(float(value)))
 
         def percent(value):
             return int(round(100.0 * float(value)))
+
+        def distance_value(value):
+            if world_coordinates:
+                return round(float(value), 3)
+            return rounded(value)
 
         robots = []
         for robot in self.get_nodes_by_type("robot"):
@@ -507,19 +740,27 @@ class KnowledgeGraph:
                 if current_frontier_view is not None
                 else "reachable_unexplored"
             )
-            robots.append({
+            robot_record = {
                 "id": robot.id,
-                "position_rc": [
-                    rounded(robot.position[0]),
-                    rounded(robot.position[1]),
-                ],
+                position_key: (
+                    [round(float(robot.position[0]), 3),
+                     round(float(robot.position[1]), 3)]
+                    if world_coordinates else [
+                        rounded(robot.position[0]),
+                        rounded(robot.position[1]),
+                    ]
+                ),
                 "in_room": in_room,
                 "explored_room_count": len(explored),
                 path_label: [
-                    {"room_id": room_id, "distance_px": rounded(distance)}
+                    {
+                        "room_id": room_id,
+                        distance_key: distance_value(distance),
+                    }
                     for room_id, distance in paths[:5]
                 ],
-            })
+            }
+            robots.append(robot_record)
 
         def room_record(room, current_candidates=None):
             objects = self.get_objects_in_room(room.id)
@@ -537,7 +778,7 @@ class KnowledgeGraph:
                 if edge.relation == "connected_to":
                     connections.append({
                         "room_id": other,
-                        "distance_px": rounded(edge.distance),
+                        distance_key: distance_value(edge.distance),
                     })
                 elif edge.relation == "separated_by_wall":
                     walls.append(other)
@@ -588,7 +829,7 @@ class KnowledgeGraph:
                                 "source": obj.name,
                                 "relation": edge.relation,
                                 "target": other.name,
-                                "distance_px": rounded(edge.distance),
+                                distance_key: distance_value(edge.distance),
                             })
                 if object_relations:
                     record["object_relations"] = object_relations
@@ -608,7 +849,10 @@ class KnowledgeGraph:
             and room.id not in current_room_ids
         ]
         payload = {
-            "format": "mindnav_kg_json_v1",
+            "format": "mindnav_kg_json_v2",
+            "coordinate_frame": (
+                "world_xz" if world_coordinates else "map_rc"
+            ),
             "robots": robots,
         }
 
@@ -692,8 +936,10 @@ class KnowledgeGraph:
         triples = [[
             "kg",
             "serialization_format",
-            "mindnav_kg_triples_v1",
+            "mindnav_kg_triples_v2",
         ]]
+        world_coordinates = payload.get("coordinate_frame") == "world_xz"
+        distance_key = "distance_m" if world_coordinates else "distance_px"
 
         def add(head, relation, tail):
             triples.append([head, relation, tail])
@@ -701,8 +947,18 @@ class KnowledgeGraph:
         for robot_index, robot in enumerate(payload.get("robots", [])):
             robot_id = robot["id"]
             add(robot_id, "node_type", "robot")
-            add(robot_id, "position_row", robot["position_rc"][0])
-            add(robot_id, "position_column", robot["position_rc"][1])
+            if world_coordinates:
+                add(
+                    robot_id, "position_world_x",
+                    robot["position_world_xz"][0],
+                )
+                add(
+                    robot_id, "position_world_z",
+                    robot["position_world_xz"][1],
+                )
+            else:
+                add(robot_id, "position_row", robot["position_rc"][0])
+                add(robot_id, "position_column", robot["position_rc"][1])
             add(robot_id, "in_room", robot["in_room"])
             add(
                 robot_id,
@@ -718,7 +974,7 @@ class KnowledgeGraph:
                 path_ref = f"{robot_id}::serialized_path_{path_index}"
                 add(robot_id, path_label, path_ref)
                 add(path_ref, "target_room", path["room_id"])
-                add(path_ref, "distance_px", path["distance_px"])
+                add(path_ref, distance_key, path[distance_key])
 
         def add_room(record, context_role):
             room_id = record["room_id"]
@@ -778,8 +1034,8 @@ class KnowledgeGraph:
                 add(relation_ref, "target_name", relation["target"])
                 add(
                     relation_ref,
-                    "distance_px",
-                    relation["distance_px"],
+                    distance_key,
+                    relation[distance_key],
                 )
 
             for connection_index, connection in enumerate(
@@ -795,8 +1051,8 @@ class KnowledgeGraph:
                 )
                 add(
                     connection_ref,
-                    "distance_px",
-                    connection["distance_px"],
+                    distance_key,
+                    connection[distance_key],
                 )
 
             for wall_room_id in record.get("walls", []):
@@ -865,18 +1121,62 @@ TRANSIENT_ROOM_PROPERTIES = {
 
 
 class KGUpdater:
-    def __init__(self, kg: KnowledgeGraph):
+    def __init__(self, kg: KnowledgeGraph,
+                 frame: Optional[EpisodeFrame] = None,
+                 persistent_scene: bool = False,
+                 episode_id: Optional[str] = None):
         self.kg = kg
         self._grid_size = 50
         self._map_size = MAP_SIZE
         self._update_id = 0
+        self.frame = frame
+        self.persistent_scene = bool(persistent_scene)
+        self.episode_id = None if episode_id is None else str(episode_id)
+
+    @property
+    def _world_mode(self):
+        return self.frame is not None
+
+    def _episode_properties(self, **properties):
+        if self.episode_id is not None:
+            properties["episode_ids"] = [self.episode_id]
+        return properties
+
+    def _map_to_graph_position(self, row, col):
+        if self.frame is None:
+            return float(row), float(col)
+        return self.frame.map_rc_to_world_xz(row, col)
+
+    def _graph_position_to_room_id(self, position):
+        if self.frame is None:
+            return self._pos_to_room_id(*position)
+        world_x, world_z = position
+        grid_x = math.floor(float(world_x) / ROOM_CELL_M)
+        grid_z = math.floor(float(world_z) / ROOM_CELL_M)
+        return (
+            f"scene_room_f{self.frame.floor_id}_x{grid_x}_z{grid_z}"
+        )
 
     def _pos_to_room_id(self, y, x):
+        if self.frame is not None:
+            return self.frame.room_id_from_map_rc(y, x)
         gy = int(y // self._grid_size)
         gx = int(x // self._grid_size)
         return f"room_{gy}_{gx}"
 
     def _room_center(self, room_id):
+        if room_id.startswith("scene_room_f"):
+            try:
+                _, _, floor, x_token, z_token = room_id.split("_")
+                del floor
+                grid_x = int(x_token[1:])
+                grid_z = int(z_token[1:])
+                return (
+                    (grid_x + 0.5) * ROOM_CELL_M,
+                    (grid_z + 0.5) * ROOM_CELL_M,
+                )
+            except (TypeError, ValueError):
+                return (0, 0)
         try:
             _, gy, gx = room_id.split("_")
             return (
@@ -888,13 +1188,22 @@ class KGUpdater:
 
     def build_current_frontier_view(self, enriched_frontiers):
         """Build the per-decision mapping without mutating the persistent KG."""
+        world_position_resolver = None
+        if self.frame is not None:
+            def world_position_resolver(row, col):
+                return (
+                    self.frame.map_rc_to_world_xz(row, col),
+                    self.frame.floor_id,
+                )
         return CurrentFrontierView.from_enriched(
             enriched_frontiers,
             room_id_resolver=self._pos_to_room_id,
+            world_position_resolver=world_position_resolver,
         )
 
     def _update_room(self, room_id, categories, room_hint,
-                     room_hint_confidence, explored):
+                     room_hint_confidence, explored, position=None,
+                     local_position=None):
         existing = self.kg.nodes.get(room_id)
         categories = sorted(set(str(category) for category in categories))
         clean_hint = str(room_hint).replace("likely_", "") or "unknown"
@@ -944,6 +1253,13 @@ class KGUpdater:
         observation_count = previous_count + int(is_new_evidence)
         if observation_count == 0:
             observation_count = 1
+        # Scene-room nodes represent fixed 2.5 m cells.  Keep their graph
+        # position at the cell center so cross-episode topology is not
+        # perturbed by whichever frontier happened to observe the cell last.
+        graph_position = (
+            self._room_center(room_id) if self._world_mode
+            else (position if position is not None else self._room_center(room_id))
+        )
         node = KGNode(
             id=room_id,
             node_type="room",
@@ -952,25 +1268,36 @@ class KGUpdater:
                 stored_hint_confidence
                 if stored_name != "unknown" else 0.1
             ),
-            position=self._room_center(room_id),
-            properties={
-                "explored": bool(explored or was_explored),
-                "observation_count": observation_count,
-                "last_seen_update": self._update_id,
-                "room_hint_confidence": stored_hint_confidence,
-                "observed_categories": sorted(observed_categories),
-                "room_evidence_signatures": signatures[-32:],
-            },
+            position=graph_position,
+            properties=self._episode_properties(
+                coordinate_frame=("world" if self._world_mode else "local"),
+                floor_id=(self.frame.floor_id if self.frame else None),
+                position_rc=(
+                    [float(local_position[0]), float(local_position[1])]
+                    if local_position is not None else None
+                ),
+                position_world_xz=(
+                    [float(graph_position[0]), float(graph_position[1])]
+                    if self._world_mode else None
+                ),
+                explored=bool(explored or was_explored),
+                observation_count=observation_count,
+                last_seen_update=self._update_id,
+                room_hint_confidence=stored_hint_confidence,
+                observed_categories=sorted(observed_categories),
+                room_evidence_signatures=signatures[-32:],
+            ),
         )
         self.kg.add_node(node)
         stored = self.kg.nodes[room_id]
         stored.name = node.name
         stored.certainty = node.certainty
-        stored.position = self._room_center(room_id)
+        stored.position = node.position
         stored.properties.update(node.properties)
 
     def _find_or_create_object(self, category, pos, confidence,
-                               observation_signature=None):
+                               observation_signature=None,
+                               local_position=None):
         """Merge one unique map observation with paper-defined noisy-OR."""
         confidence = float(np.clip(confidence, 0.0, 1.0))
         if observation_signature is None:
@@ -986,7 +1313,12 @@ class KGUpdater:
                     node.position[0] - pos[0],
                     node.position[1] - pos[1],
                 ))
-                if distance < MERGE_DISTANCE:
+                merge_distance = 1.5 if self._world_mode else MERGE_DISTANCE
+                same_floor = (
+                    not self._world_mode
+                    or node.properties.get("floor_id") == self.frame.floor_id
+                )
+                if distance < merge_distance and same_floor:
                     candidates.append((distance, node))
 
         if candidates:
@@ -1007,6 +1339,14 @@ class KGUpdater:
                     0.7 * node.position[0] + 0.3 * pos[0],
                     0.7 * node.position[1] + 0.3 * pos[1],
                 )
+                if local_position is not None:
+                    node.properties["position_rc"] = [
+                        float(local_position[0]), float(local_position[1])
+                    ]
+                if self._world_mode:
+                    node.properties["position_world_xz"] = [
+                        float(node.position[0]), float(node.position[1])
+                    ]
                 count = node.properties.get("observation_count", 1) + 1
                 node.properties["observation_count"] = count
                 node.properties["detection_count"] = count
@@ -1015,14 +1355,29 @@ class KGUpdater:
                 detections = list(node.properties.get("detections", []))
                 detections.append({
                     "confidence": confidence,
-                    "position_rc": [float(pos[0]), float(pos[1])],
+                    "position_rc": (
+                        [float(local_position[0]), float(local_position[1])]
+                        if local_position is not None else None
+                    ),
+                    "position_world_xz": (
+                        [float(pos[0]), float(pos[1])]
+                        if self._world_mode else None
+                    ),
                 })
                 node.properties["detections"] = detections[-64:]
             node.properties["last_seen_update"] = self._update_id
+            if self.episode_id is not None:
+                episode_ids = set(node.properties.get("episode_ids", []))
+                episode_ids.add(self.episode_id)
+                node.properties["episode_ids"] = sorted(episode_ids)
+                node.properties["episode_support_count"] = len(episode_ids)
             return node.id, False
 
         # Create new object node
-        room_id = self._pos_to_room_id(pos[0], pos[1])
+        # ``pos`` is already in the graph frame. In scene mode this is a
+        # Habitat world ``(x, z)`` position, so transforming it as map pixels
+        # a second time would create an unstable, incorrect object ID.
+        room_id = self._graph_position_to_room_id(pos)
         obj_id = f"{category}_{room_id}"
         # If this ID exists but is far, append a counter
         if obj_id in self.kg.nodes:
@@ -1034,19 +1389,37 @@ class KGUpdater:
         self.kg.add_node(KGNode(
             id=obj_id, node_type="object", name=category,
             certainty=confidence, position=pos,
-            properties={
-                "category": category,
-                "observation_count": 1,
-                "detection_count": 1,
-                "first_seen_update": self._update_id,
-                "last_seen_update": self._update_id,
-                "observation_signatures": [observation_signature],
-                "detections": [{
+            properties=self._episode_properties(
+                coordinate_frame=("world" if self._world_mode else "local"),
+                floor_id=(self.frame.floor_id if self.frame else None),
+                position_rc=(
+                    [float(local_position[0]), float(local_position[1])]
+                    if local_position is not None else [float(pos[0]), float(pos[1])]
+                ),
+                position_world_xz=(
+                    [float(pos[0]), float(pos[1])] if self._world_mode else None
+                ),
+                category=category,
+                observation_count=1,
+                detection_count=1,
+                first_seen_update=self._update_id,
+                last_seen_update=self._update_id,
+                observation_signatures=[observation_signature],
+                detections=[{
                     "confidence": confidence,
-                    "position_rc": [float(pos[0]), float(pos[1])],
+                    "position_rc": (
+                        [float(local_position[0]), float(local_position[1])]
+                        if local_position is not None else [float(pos[0]), float(pos[1])]
+                    ),
+                    "position_world_xz": (
+                        [float(pos[0]), float(pos[1])]
+                        if self._world_mode else None
+                    ),
                 }],
-            }
+            )
         ))
+        if self.episode_id is not None:
+            self.kg.nodes[obj_id].properties["episode_support_count"] = 1
         return obj_id, True
 
     @staticmethod
@@ -1092,16 +1465,17 @@ class KGUpdater:
             and orientation(c, d, a) != orientation(c, d, b)
         )
 
-    @staticmethod
-    def _wall_segments(wall_list):
+    def _wall_segments(self, wall_list):
         segments = []
         if wall_list is None:
             return segments
         for wall in wall_list:
             try:
                 x1, y1, x2, y2 = np.asarray(wall).reshape(-1)[:4]
-                segment = ((float(y1), float(x1)),
-                           (float(y2), float(x2)))
+                segment = (
+                    self._map_to_graph_position(float(y1), float(x1)),
+                    self._map_to_graph_position(float(y2), float(x2)),
+                )
                 if all(np.isfinite(value) for point in segment for value in point):
                     segments.append(segment)
             except (TypeError, ValueError, IndexError):
@@ -1118,19 +1492,24 @@ class KGUpdater:
             for property_name in TRANSIENT_ROOM_PROPERTIES:
                 room.properties.pop(property_name, None)
 
-        self.kg.remove_edges(
-            lambda edge: edge.relation in DYNAMIC_RELATIONS
+        dynamic_relations = (
+            {"in", "explored", "path_to"}
+            if self.persistent_scene else DYNAMIC_RELATIONS
         )
+        self.kg.remove_edges(lambda edge: edge.relation in dynamic_relations)
 
         room_observations = {}
 
-        def observe_room(room_id, categories=(), room_hint="unknown",
-                         room_hint_confidence=0.0, explored=False):
+        def observe_room(room_id, position, categories=(),
+                         room_hint="unknown", room_hint_confidence=0.0,
+                         explored=False, local_position=None):
             observation = room_observations.setdefault(room_id, {
                 "categories": set(),
                 "room_hint": "unknown",
                 "room_hint_confidence": 0.0,
                 "explored": False,
+                "position": position,
+                "local_position": local_position,
             })
             observation["categories"].update(categories)
             if float(room_hint_confidence) >= observation["room_hint_confidence"]:
@@ -1147,6 +1526,7 @@ class KGUpdater:
             room_id = self._pos_to_room_id(row, col)
             observe_room(
                 room_id,
+                self._map_to_graph_position(row, col),
                 categories=frontier.get("nearby_objects", ()),
                 room_hint=frontier.get("room_type", "unknown"),
                 room_hint_confidence=frontier.get("room_confidence", 0.0),
@@ -1154,42 +1534,64 @@ class KGUpdater:
                     self.kg.nodes.get(room_id)
                     and self.kg.nodes[room_id].properties.get("explored")
                 ),
+                local_position=(row, col),
             )
 
         object_room_links = {}
         if object_list:
             for object_name, components in object_list.items():
                 for component in components[:5]:
-                    object_position = self._object_component_position(component)
-                    if object_position is None or object_position == (0, 0):
+                    object_position_rc = self._object_component_position(component)
+                    if (object_position_rc is None
+                            or object_position_rc == (0, 0)):
                         continue
+                    object_position = self._map_to_graph_position(
+                        *object_position_rc
+                    )
+                    signature = self._object_component_signature(
+                        object_name, component
+                    )
+                    if self._world_mode:
+                        signature = (
+                            f"{object_name}:world:"
+                            f"{int(round(object_position[0] / 0.2))}:"
+                            f"{int(round(object_position[1] / 0.2))}"
+                        )
                     object_id, _ = self._find_or_create_object(
                         object_name,
                         object_position,
                         confidence=0.65,
-                        observation_signature=(
-                            self._object_component_signature(
-                                object_name, component
-                            )
-                        ),
+                        observation_signature=signature,
+                        local_position=object_position_rc,
                     )
                     stored_position = self.kg.nodes[object_id].position
-                    room_id = self._pos_to_room_id(*stored_position)
+                    room_id = self._graph_position_to_room_id(stored_position)
                     object_room_links[object_id] = room_id
-                    observe_room(room_id, categories=(object_name,))
+                    observe_room(
+                        room_id,
+                        stored_position,
+                        categories=(object_name,),
+                        local_position=object_position_rc,
+                    )
 
         robot_records = []
-        for robot_index, raw_pose in enumerate(pose_pred):
+        for robot_index, pose_value in enumerate(pose_pred):
             map_position = CurrentFrontierView.robot_pose_to_map_rc(
-                raw_pose,
+                pose_value,
                 self._map_size,
             )
             if map_position is None:
                 continue
             robot_id = f"robot_{robot_index}"
-            room_id = self._pos_to_room_id(*map_position)
-            robot_records.append((robot_id, room_id, map_position))
-            observe_room(room_id, explored=True)
+            graph_position = self._map_to_graph_position(*map_position)
+            room_id = self._graph_position_to_room_id(graph_position)
+            robot_records.append(
+                (robot_id, room_id, graph_position, map_position)
+            )
+            observe_room(
+                room_id, graph_position, explored=True,
+                local_position=map_position,
+            )
 
         for room_id, observation in room_observations.items():
             self._update_room(
@@ -1198,6 +1600,8 @@ class KGUpdater:
                 observation["room_hint"],
                 observation["room_hint_confidence"],
                 observation["explored"],
+                position=observation["position"],
+                local_position=observation["local_position"],
             )
 
         for object_id, room_id in object_room_links.items():
@@ -1210,48 +1614,82 @@ class KGUpdater:
                 room_id,
                 object_id,
                 "contains",
-                properties={"last_seen_update": self._update_id},
+                properties=self._episode_properties(
+                    last_seen_update=self._update_id,
+                ),
             ))
 
-        for robot_id, room_id, map_position in robot_records:
+        for robot_id, room_id, graph_position, map_position in robot_records:
             self.kg.add_node(KGNode(
                 id=robot_id,
                 node_type="robot",
                 name=robot_id,
                 certainty=1.0,
-                position=map_position,
-                properties={"last_seen_update": self._update_id},
+                position=graph_position,
+                properties=self._episode_properties(
+                    coordinate_frame=("world" if self._world_mode else "local"),
+                    floor_id=(self.frame.floor_id if self.frame else None),
+                    position_rc=[
+                        float(map_position[0]), float(map_position[1])
+                    ],
+                    position_world_xz=(
+                        [float(graph_position[0]), float(graph_position[1])]
+                        if self._world_mode else None
+                    ),
+                    last_seen_update=self._update_id,
+                ),
             ))
             self.kg.add_edge(KGEdge(robot_id, room_id, "in"))
             self.kg.add_edge(KGEdge(robot_id, room_id, "explored"))
 
         objects = self.kg.get_nodes_by_type("object")
+        object_next_to_threshold = 1.0 if self._world_mode else 20
+        object_near_threshold = 3.0 if self._world_mode else 60
         for first_index, first in enumerate(objects):
             for second in objects[first_index + 1:]:
+                if (self._world_mode
+                        and first.properties.get("floor_id")
+                        != second.properties.get("floor_id")):
+                    continue
                 if first.position == (0, 0) or second.position == (0, 0):
                     continue
                 distance = float(np.hypot(
                     first.position[0] - second.position[0],
                     first.position[1] - second.position[1],
                 ))
-                if distance < 20:
+                if distance < object_next_to_threshold:
                     self.kg.add_edge(KGEdge(
-                        first.id, second.id, "next_to", distance=distance
+                        first.id, second.id, "next_to", distance=distance,
+                        properties=self._episode_properties(
+                            last_seen_update=self._update_id,
+                        ),
                     ))
-                elif distance < 60:
+                elif distance < object_near_threshold:
                     self.kg.add_edge(KGEdge(
-                        first.id, second.id, "near", distance=distance
+                        first.id, second.id, "near", distance=distance,
+                        properties=self._episode_properties(
+                            last_seen_update=self._update_id,
+                        ),
                     ))
 
         wall_segments = self._wall_segments(wall_list)
         rooms = self.kg.get_nodes_by_type("room")
-        for first_index, first in enumerate(rooms):
-            for second in rooms[first_index + 1:]:
+        current_rooms = [
+            self.kg.nodes[room_id] for room_id in room_observations
+            if room_id in self.kg.nodes
+        ]
+        connection_threshold = 3.75 if self._world_mode else 150
+        for first_index, first in enumerate(current_rooms):
+            for second in current_rooms[first_index + 1:]:
+                if (self._world_mode
+                        and first.properties.get("floor_id")
+                        != second.properties.get("floor_id")):
+                    continue
                 distance = float(np.hypot(
                     first.position[0] - second.position[0],
                     first.position[1] - second.position[1],
                 ))
-                if distance >= 150:
+                if distance >= connection_threshold:
                     continue
                 blocked = any(
                     self._segments_intersect(
@@ -1269,26 +1707,29 @@ class KGUpdater:
                     second.id,
                     relation,
                     distance=distance,
-                    properties={
-                        "confidence": confidence,
-                        "last_seen_update": self._update_id,
-                    },
+                    properties=self._episode_properties(
+                        confidence=confidence,
+                        last_seen_update=self._update_id,
+                    ),
                 ))
 
         # Compute reachability only after all rooms for this update exist.
-        for robot_id, _, map_position in robot_records:
+        reachability_threshold = 15.0 if self._world_mode else 300
+        for robot_id, _, graph_position, _ in robot_records:
             for room in rooms:
                 if room.properties.get("explored"):
                     continue
                 distance = float(np.hypot(
-                    map_position[0] - room.position[0],
-                    map_position[1] - room.position[1],
+                    graph_position[0] - room.position[0],
+                    graph_position[1] - room.position[1],
                 ))
-                if distance < 300:
+                if distance < reachability_threshold:
                     self.kg.add_edge(KGEdge(
                         robot_id,
                         room.id,
                         "path_to",
                         distance=distance,
-                        properties={"last_seen_update": self._update_id},
+                        properties=self._episode_properties(
+                            last_seen_update=self._update_id,
+                        ),
                     ))

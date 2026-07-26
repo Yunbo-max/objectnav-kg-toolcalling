@@ -19,6 +19,7 @@ class BrainAPIConfig:
     extra_body: Optional[Dict[str, Any]] = None
     response_format: Optional[Dict[str, str]] = None
     supports_seed: bool = True
+    uses_max_completion_tokens: bool = False
     loads_local_model: bool = False
 
 
@@ -62,6 +63,37 @@ def load_brain_api_config(repo_root: str) -> BrainAPIConfig:
             supports_seed=False,
         )
 
+    if backend == "qqqapi":
+        api_key = os.environ.get(
+            "QQQAPI_API_KEY", os.environ.get("BRAIN_API_KEY", "")
+        ).strip()
+        if not api_key:
+            raise RuntimeError(
+                "QQQAPI_API_KEY is required for BRAIN_BACKEND=qqqapi; "
+                "set it in the repository .env file"
+            )
+
+        reasoning_effort = os.environ.get(
+            "QQQAPI_REASONING_EFFORT", "none"
+        ).strip().lower()
+        if reasoning_effort not in {"none", "low", "medium", "high", "xhigh"}:
+            raise ValueError(
+                "QQQAPI_REASONING_EFFORT must be one of: "
+                "none, low, medium, high, xhigh"
+            )
+        return BrainAPIConfig(
+            backend=backend,
+            base_url=os.environ.get(
+                "QQQAPI_BASE_URL", "https://qqqapi.com/v1"
+            ).rstrip("/"),
+            api_key=api_key,
+            model=os.environ.get("QQQAPI_MODEL", "gpt-5.4"),
+            extra_body={"reasoning_effort": reasoning_effort},
+            response_format={"type": "json_object"},
+            supports_seed=False,
+            uses_max_completion_tokens=True,
+        )
+
     if backend == "vllm":
         return BrainAPIConfig(
             backend=backend,
@@ -86,7 +118,7 @@ def load_brain_api_config(repo_root: str) -> BrainAPIConfig:
         )
 
     raise ValueError(
-        "BRAIN_BACKEND must be one of: deepseek, siliconflow, vllm"
+        "BRAIN_BACKEND must be one of: deepseek, qqqapi, siliconflow, vllm"
     )
 
 
@@ -101,6 +133,7 @@ class OpenAICompatibleBrainAdapter:
     ):
         import openai
 
+        self.config = config
         self.client = openai.OpenAI(
             api_key=config.api_key,
             base_url=config.base_url,
@@ -151,9 +184,12 @@ class OpenAICompatibleBrainAdapter:
                 },
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": max_tokens,
             "temperature": 0,
         }
+        if self.config.uses_max_completion_tokens:
+            request["max_completion_tokens"] = max_tokens
+        else:
+            request["max_tokens"] = max_tokens
         if self.seed is not None:
             request["seed"] = int(self.seed)
         if self.extra_body is not None:
@@ -209,4 +245,104 @@ class OpenAICompatibleBrainAdapter:
             self.usage_sink.append(record)
         print(f"MindNav core brain ({self.model}) response:")
         print(content)
+        return content
+
+
+class OpenAICompatibleTextAdapter:
+    """OpenAI-compatible chat adapter for plain-text navigation brains.
+
+    Co-NavGPT expects ``robot_i: frontier_j`` lines rather than MindNav's JSON
+    tool calls, so it must not inherit the JSON response-format constraint.
+    """
+
+    def __init__(
+        self,
+        config: BrainAPIConfig,
+        usage_sink=None,
+        seed: Optional[int] = None,
+    ):
+        import openai
+
+        self.config = config
+        self.client = openai.OpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
+        self.model = config.model
+        self.usage_sink = usage_sink
+        self.seed = seed if config.supports_seed else None
+        self.last_response = ""
+        self._usage_totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
+            "api_calls": 0,
+        }
+
+    def usage_snapshot(self) -> Dict[str, int]:
+        return dict(self._usage_totals)
+
+    def call(self, messages, max_tokens: int = 256) -> str:
+        self._usage_totals["api_calls"] += 1
+        request = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0,
+        }
+        if self.config.uses_max_completion_tokens:
+            request["max_completion_tokens"] = max_tokens
+        else:
+            request["max_tokens"] = max_tokens
+        if self.seed is not None:
+            request["seed"] = int(self.seed)
+        if self.config.extra_body is not None:
+            request["extra_body"] = self.config.extra_body
+
+        try:
+            response = self.client.chat.completions.create(**request)
+        except Exception:
+            if self.usage_sink is not None:
+                self.usage_sink.append({
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "api_calls": 1,
+                    "request_failed": True,
+                })
+            raise
+
+        content = (response.choices[0].message.content or "").strip()
+        self.last_response = content
+        usage = getattr(response, "usage", None)
+        prompt_details = OpenAICompatibleBrainAdapter._usage_value(
+            usage, "prompt_tokens_details", None
+        )
+        completion_details = OpenAICompatibleBrainAdapter._usage_value(
+            usage, "completion_tokens_details", None
+        )
+        record = {
+            "input_tokens": OpenAICompatibleBrainAdapter._usage_int(
+                usage, "prompt_tokens"
+            ),
+            "output_tokens": OpenAICompatibleBrainAdapter._usage_int(
+                usage, "completion_tokens"
+            ),
+            "cached_input_tokens": OpenAICompatibleBrainAdapter._usage_int(
+                prompt_details, "cached_tokens"
+            ),
+            "reasoning_tokens": OpenAICompatibleBrainAdapter._usage_int(
+                completion_details, "reasoning_tokens"
+            ),
+            "api_calls": 1,
+            "request_failed": False,
+        }
+        for key in (
+            "input_tokens", "output_tokens", "cached_input_tokens",
+            "reasoning_tokens",
+        ):
+            self._usage_totals[key] += record[key]
+        if self.usage_sink is not None:
+            self.usage_sink.append(record)
         return content

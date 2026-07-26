@@ -49,6 +49,18 @@ def get_args():
     parser.add_argument('--decision_history', type=str, default='on',
                         choices=('on', 'off'),
                         help='whether LLM prompts include recent decision history')
+    parser.add_argument('--kg_coordinate_frame', type=str, default='world',
+                        choices=('local', 'world'),
+                        help='KG coordinate frame; world is the Scene Memory default')
+    parser.add_argument('--kg_memory_mode', type=str, default='scene',
+                        choices=('episode', 'scene'),
+                        help='KG lifetime; scene is the canonical MindNav path, while episode is an ablation')
+    parser.add_argument('--kg_alignment_median_threshold_m', type=float,
+                        default=0.10,
+                        help='maximum median robot map-to-world alignment error')
+    parser.add_argument('--kg_alignment_max_threshold_m', type=float,
+                        default=0.25,
+                        help='maximum robot map-to-world alignment error')
     parser.add_argument('--save_periodic', type=int, default=500000,
                         help='Model save frequency in number of updates')
     parser.add_argument('-v', '--visualize', type=int, default=0,

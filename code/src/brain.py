@@ -65,11 +65,44 @@ class HelicaseBrain:
                 and response_lines[0].strip().lower() in {"```", "```json"}
                 and response_lines[-1].strip() == "```"):
             response_text = "\n".join(response_lines[1:-1]).strip()
+        class _JSONObjectPairs(list):
+            """Distinguish decoded JSON objects from JSON arrays."""
+
+        def materialize_json(value):
+            if isinstance(value, _JSONObjectPairs):
+                result = {}
+                for key, nested_value in value:
+                    if key in result:
+                        raise ValueError(f"duplicate JSON key: {key}")
+                    result[key] = materialize_json(nested_value)
+                return result
+            if isinstance(value, list):
+                return [materialize_json(item) for item in value]
+            return value
+
         try:
-            payload = json.loads(
+            decoded = json.loads(
                 response_text,
                 parse_constant=cls._reject_json_constant,
+                object_pairs_hook=_JSONObjectPairs,
             )
+            # A common tool-emulation response uses one repeated top-level
+            # stage key per call.  Standard JSON object decoding silently
+            # drops all but the last call.  Preserve this one unambiguous
+            # stage-local form as an argument list; reject duplicate keys at
+            # every other level.
+            if (isinstance(decoded, _JSONObjectPairs)
+                    and len(decoded) > 1
+                    and isinstance(expected_tool_name, str)
+                    and all(key == expected_tool_name
+                            for key, _ in decoded)):
+                payload = {
+                    expected_tool_name: [
+                        materialize_json(value) for _, value in decoded
+                    ]
+                }
+            else:
+                payload = materialize_json(decoded)
         except (AttributeError, json.JSONDecodeError, TypeError, ValueError) as error:
             raise ValueError(f"invalid_json: {error}") from error
         # Qwen commonly emits the semantically equivalent compact form
@@ -181,6 +214,34 @@ class HelicaseBrain:
             }
         if not isinstance(payload, dict):
             raise ValueError("schema_error: top level must be an object")
+        # OpenAI-compatible endpoints may preserve the stage name as the
+        # enclosing JSON key instead of emitting an explicit tool_calls list,
+        # e.g. {"estimate_room_probability": [{...}, {...}]}.  This is an
+        # equivalent wire representation, so canonicalize only the exact
+        # stage-local wrapper.  The stage validator below still checks every
+        # argument, value, room identity, and evidence citation.
+        if (isinstance(expected_tool_name, str)
+                and set(payload) == {expected_tool_name}
+                and isinstance(payload[expected_tool_name], (dict, list))):
+            stage_arguments = payload[expected_tool_name]
+            if isinstance(stage_arguments, dict):
+                stage_arguments = [stage_arguments]
+            if any(not isinstance(arguments, dict)
+                   for arguments in stage_arguments):
+                raise ValueError(
+                    "schema_error: stage wrapper entries must be objects"
+                )
+            payload = {
+                "tool_calls": [{
+                    "name": expected_tool_name,
+                    "arguments": arguments,
+                } for arguments in stage_arguments]
+            }
+        elif (set(payload) == {"name", "arguments"}
+              and isinstance(payload.get("name"), str)):
+            # Some endpoints return the canonical call itself but omit only
+            # the outer tool_calls array.
+            payload = {"tool_calls": [payload]}
         # Qwen may place the stage name beside an empty ``tool_calls`` list,
         # while keeping the complete stage arguments under that name.  This
         # exact, unambiguous wrapper is safe to canonicalize: the strict stage
@@ -264,7 +325,9 @@ class HelicaseBrain:
             "come from that SAME room's allowed_evidence_ids in "
             "REQUIRED_CALL_IDENTITIES. Delete every ID named as unknown by "
             "VALIDATION_ERROR; an empty evidence_ids list is valid when no "
-            "grounded ID is needed.\n\n"
+            "grounded ID is needed. confidence must be a JSON NUMBER from "
+            "0.0 to 1.0, for example 0.25. Never output confidence as a "
+            "string or label such as low, medium, or high.\n\n"
             f"VALIDATION_ERROR:\n{errors[-1]}\n\n"
             f"INVALID_RESPONSE:\n{response}\n\n"
             f"ORIGINAL_TOOL_TASK:\n{prompt}"
@@ -306,7 +369,7 @@ class HelicaseBrain:
                     )), 1)
                     if position is not None else None
                 )
-            options.append({
+            option = {
                 "frontier_id": int(frontier.idx),
                 "room_id": frontier.room_id,
                 "centroid_rc": [
@@ -315,11 +378,13 @@ class HelicaseBrain:
                 ],
                 "area_px": round(float(frontier.area), 1),
                 "distance_by_robot_px": distances,
-            })
+            }
+            options.append(option)
         return options
 
     @staticmethod
-    def _query_room_objects(kg, current_frontiers, room_ids):
+    def _query_room_objects(kg, current_frontiers, room_ids,
+                            current_episode_id=None):
         """Execute query_room_objects against the live persistent KG."""
         results = []
         allowed_evidence = {}
@@ -329,18 +394,49 @@ class HelicaseBrain:
                 kg.get_objects_in_room(room_id),
                 key=lambda obj: (-float(obj.certainty), obj.id),
             )
-            object_records = [{
-                "evidence_id": obj.id,
-                "category": obj.name,
-                "certainty": round(float(obj.certainty), 3),
-                "position_rc": [
-                    round(float(obj.position[0]), 1),
-                    round(float(obj.position[1]), 1),
-                ],
-                "observation_count": int(
-                    obj.properties.get("observation_count", 1)
-                ),
-            } for obj in objects]
+            object_records = []
+            for obj in objects:
+                coordinate_frame = obj.properties.get(
+                    "coordinate_frame", "local"
+                )
+                local_position = obj.properties.get("position_rc")
+                if local_position is None and coordinate_frame == "local":
+                    local_position = obj.position
+                world_position = obj.properties.get("position_world_xz")
+                if world_position is None and coordinate_frame == "world":
+                    world_position = obj.position
+                episode_ids = sorted(str(value) for value in obj.properties.get(
+                    "episode_ids", []
+                ))
+                prior_episode_ids = [
+                    value for value in episode_ids
+                    if value != str(current_episode_id)
+                ]
+                object_records.append({
+                    "evidence_id": obj.id,
+                    "category": obj.name,
+                    "certainty": round(float(obj.certainty), 3),
+                    "coordinate_frame": coordinate_frame,
+                    "position_rc": (
+                        [round(float(local_position[0]), 1),
+                         round(float(local_position[1]), 1)]
+                        if local_position is not None else None
+                    ),
+                    "position_world_xz": (
+                        [round(float(world_position[0]), 3),
+                         round(float(world_position[1]), 3)]
+                        if world_position is not None else None
+                    ),
+                    "observation_count": int(
+                        obj.properties.get("observation_count", 1)
+                    ),
+                    "episode_ids": episode_ids,
+                    "prior_episode_ids": prior_episode_ids,
+                    "observed_in_current_episode": (
+                        str(current_episode_id) in episode_ids
+                        if current_episode_id is not None else False
+                    ),
+                })
 
             evidence_ids = {room_id}
             evidence_ids.update(obj.id for obj in objects)
@@ -348,7 +444,7 @@ class HelicaseBrain:
             frontier_ids = list(
                 current_frontiers.room_to_frontiers.get(room_id, ())
             )
-            results.append({
+            result = {
                 "room_id": room_id,
                 "observed_type": (
                     room.name if room is not None else "unknown"
@@ -364,10 +460,15 @@ class HelicaseBrain:
                     room.properties.get("observation_count", 0)
                     if room is not None else 0
                 ),
+                "room_episode_ids": sorted(str(value) for value in (
+                    room.properties.get("episode_ids", [])
+                    if room is not None else []
+                )),
                 "objects": object_records,
                 "current_frontier_ids": frontier_ids,
                 "allowed_evidence_ids": sorted(evidence_ids),
-            })
+            }
+            results.append(result)
             allowed_evidence[room_id] = evidence_ids
         return results, allowed_evidence
 
@@ -552,6 +653,9 @@ class HelicaseBrain:
                 "type_certainty": query["type_certainty"],
                 "target_probability": probability["probability"],
                 "probability_confidence": probability["confidence"],
+                "probability_source": probability.get(
+                    "probability_source", "llm"
+                ),
                 "object_evidence_ids": [
                     evidence_id
                     for evidence_id in probability["evidence_ids"]
@@ -562,11 +666,18 @@ class HelicaseBrain:
                     "id": obj["evidence_id"],
                     "name": obj["category"],
                     "certainty": obj["certainty"],
+                    "coordinate_frame": obj["coordinate_frame"],
                     "position_rc": obj["position_rc"],
+                    "position_world_xz": obj["position_world_xz"],
                     "observation_count": obj["observation_count"],
+                    "prior_episode_ids": obj["prior_episode_ids"],
+                    "observed_in_current_episode": obj[
+                        "observed_in_current_episode"
+                    ],
                 } for obj in query["objects"]],
                 "explored": query["explored"],
                 "observation_count": query["observation_count"],
+                "room_episode_ids": query["room_episode_ids"],
                 "frontiers": sorted(
                     frontiers_by_room.get(room_id, []),
                     key=lambda option: option["frontier_id"],
@@ -622,6 +733,63 @@ class HelicaseBrain:
         return packet, history_summary
 
     @staticmethod
+    def _normalize_probability_confidence(value):
+        """Return a conservative numeric confidence plus audit metadata.
+
+        Confidence is advisory context for the allocation stage, not an
+        executable action or a target probability.  Remote models sometimes
+        return qualitative labels despite the JSON contract; treating that
+        formatting mistake as a whole-decision failure discards otherwise
+        valid room probabilities and skips the allocation stage.  Normalize
+        the small, explicit compatibility surface here and keep every
+        conversion auditable.
+        """
+        if (not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and 0.0 <= float(value) <= 1.0):
+            return float(value), None
+
+        if isinstance(value, str):
+            text = value.strip().lower()
+            try:
+                numeric = float(text)
+            except ValueError:
+                numeric = None
+            if (numeric is not None and math.isfinite(numeric)
+                    and 0.0 <= numeric <= 1.0):
+                return numeric, {
+                    "original": value,
+                    "normalized": numeric,
+                    "reason": "numeric_string",
+                }
+
+            qualitative = {
+                "low": 0.25,
+                "medium": 0.50,
+                "moderate": 0.50,
+                "high": 0.75,
+            }
+            if text in qualitative:
+                normalized = qualitative[text]
+                return normalized, {
+                    "original": value,
+                    "normalized": normalized,
+                    "reason": "qualitative_label",
+                }
+
+        # Unknown, missing, boolean, non-finite, and out-of-range values are
+        # conservatively unresolved.  They must never become positive
+        # grounding evidence merely because their representation was invalid.
+        return 0.0, {
+            "original": value,
+            "normalized": 0.0,
+            "reason": (
+                "missing_default" if value is None else "invalid_default"
+            ),
+        }
+
+    @staticmethod
     def _validate_probability_calls(payload, expected_room_ids, target_name,
                                     allowed_evidence):
         if set(payload) != {"tool_calls"}:
@@ -635,10 +803,11 @@ class HelicaseBrain:
             "room_id",
             "target",
             "probability",
-            "confidence",
             "evidence_ids",
             "reason",
         }
+        allowed_arguments = required_arguments | {"confidence"}
+        expected = set(expected_room_ids)
         for call in calls:
             if (not isinstance(call, dict)
                     or set(call) != {"name", "arguments"}
@@ -648,36 +817,43 @@ class HelicaseBrain:
                 )
             arguments = call["arguments"]
             if (not isinstance(arguments, dict)
-                    or set(arguments) != required_arguments):
+                    or not required_arguments.issubset(arguments)
+                    or not set(arguments).issubset(allowed_arguments)):
                 raise ValueError(
                     "estimate_room_probability arguments have wrong schema"
                 )
             room_id = arguments["room_id"]
             if not isinstance(room_id, str):
                 raise ValueError("probability room_id must be a string")
+            if room_id not in expected:
+                raise ValueError(
+                    f"unexpected probability room_id: {room_id}; expected "
+                    f"one of {sorted(expected)}"
+                )
             if room_id in records:
                 raise ValueError(f"duplicate probability room_id: {room_id}")
             if arguments["target"] != target_name:
                 raise ValueError(
                     f"probability target must be exactly {target_name}"
                 )
-
-            for field_name in ("probability", "confidence"):
-                value = arguments[field_name]
-                if (isinstance(value, bool)
-                        or not isinstance(value, (int, float))
-                        or not math.isfinite(float(value))
-                        or not 0.0 <= float(value) <= 1.0):
-                    raise ValueError(
-                        f"invalid {field_name} for room {room_id}"
-                    )
+            probability = arguments["probability"]
+            if (isinstance(probability, bool)
+                    or not isinstance(probability, (int, float))
+                    or not math.isfinite(float(probability))
+                    or not 0.0 <= float(probability) <= 1.0):
+                raise ValueError(
+                    f"invalid probability for room {room_id}"
+                )
+            confidence, confidence_normalization = (
+                HelicaseBrain._normalize_probability_confidence(
+                    arguments.get("confidence")
+                )
+            )
             evidence_ids = arguments["evidence_ids"]
             if (not isinstance(evidence_ids, list)
                     or any(not isinstance(item, str) for item in evidence_ids)
                     or len(evidence_ids) != len(set(evidence_ids))):
-                raise ValueError(
-                    f"invalid evidence_ids for room {room_id}"
-                )
+                raise ValueError(f"invalid evidence_ids for room {room_id}")
             unknown_evidence = sorted(
                 set(evidence_ids) - set(allowed_evidence.get(room_id, ()))
             )
@@ -690,21 +866,39 @@ class HelicaseBrain:
             if (not isinstance(arguments["reason"], str)
                     or not arguments["reason"].strip()):
                 raise ValueError(f"missing reason for room {room_id}")
-
             records[room_id] = {
-                "probability": float(arguments["probability"]),
-                "confidence": float(arguments["confidence"]),
+                "probability": float(probability),
+                "confidence": confidence,
                 "evidence_ids": list(evidence_ids),
                 "reason": arguments["reason"].strip(),
+                "probability_source": "llm",
             }
-
-        expected = set(expected_room_ids)
-        if set(records) != expected:
-            raise ValueError(
-                "probability coverage mismatch: "
-                f"missing={sorted(expected - set(records))}, "
-                f"extra={sorted(set(records) - expected)}"
-            )
+            if confidence_normalization is not None:
+                records[room_id]["confidence_normalization"] = (
+                    confidence_normalization
+                )
+        # A partial but otherwise valid Stage-1 response must not suppress the
+        # allocation stage.  Preserve every valid estimate and represent each
+        # omitted room as explicitly unresolved.  The low-confidence baseline
+        # is an exploration placeholder, not negative or positive evidence.
+        for room_id in expected_room_ids:
+            if room_id in records:
+                continue
+            records[room_id] = {
+                "probability": 0.1,
+                "confidence": 0.0,
+                "evidence_ids": [],
+                "reason": (
+                    "Stage 1 omitted this current room; unresolved default "
+                    "retained for Stage 2 allocation."
+                ),
+                "probability_source": "missing_room_default",
+                "confidence_normalization": {
+                    "original": None,
+                    "normalized": 0.0,
+                    "reason": "missing_room_call",
+                },
+            }
         return records
 
     def _validate_assignment_calls(self, payload, current_frontiers):
@@ -803,12 +997,12 @@ class HelicaseBrain:
         )
         robot_positions = []
         for robot_index in range(self.num_agents):
-            raw_position = (
+            pose_value = (
                 pose_pred[robot_index]
                 if robot_index < len(pose_pred) else None
             )
             robot_positions.append(
-                CurrentFrontierView.robot_pose_to_map_rc(raw_position)
+                CurrentFrontierView.robot_pose_to_map_rc(pose_value)
             )
 
         feasible = []
@@ -883,7 +1077,6 @@ class HelicaseBrain:
             len(current_frontiers.room_ids) >= self.num_agents
         )
         selected_room_values = list(selected_rooms.values())
-
         frontier_details = {}
         for frontier_id, frontier in current_frontiers.frontiers.items():
             record = probability_records.get(frontier.room_id, {})
@@ -902,9 +1095,9 @@ class HelicaseBrain:
         self.last_decision_audit = {
             "allowed_room_ids": sorted(current_frontiers.room_ids),
             "allowed_frontier_ids": sorted(current_frontiers.frontiers),
-            "raw_room_probabilities": dict(probabilities),
+            "reported_room_probabilities": dict(probabilities),
             "accepted_room_probabilities": dict(probabilities),
-            "raw_room_assignments": dict(assigned_rooms),
+            "proposed_room_assignments": dict(assigned_rooms),
             "accepted_llm_rooms": (
                 dict(assigned_rooms) if not fallback else {}
             ),
@@ -927,6 +1120,26 @@ class HelicaseBrain:
             "probability_reason_by_room": {
                 room_id: record.get("reason", "")
                 for room_id, record in probability_records.items()
+            },
+            "probability_source_by_room": {
+                room_id: record.get("probability_source", "llm")
+                for room_id, record in probability_records.items()
+            },
+            "defaulted_probability_room_ids": sorted(
+                room_id
+                for room_id, record in probability_records.items()
+                if record.get("probability_source")
+                == "missing_room_default"
+            ),
+            "stage1_partial_default_used": any(
+                record.get("probability_source")
+                == "missing_room_default"
+                for record in probability_records.values()
+            ),
+            "probability_confidence_normalization_by_room": {
+                room_id: record["confidence_normalization"]
+                for room_id, record in probability_records.items()
+                if "confidence_normalization" in record
             },
             "assignment_reason_by_robot": dict(assignment_reasons),
             "llm_probability_spread": round(float(probability_spread), 6),
@@ -998,7 +1211,8 @@ class HelicaseBrain:
     def decide(self, kg: KnowledgeGraph, target_name: str,
                enriched_frontiers, pose_pred, step: int, max_steps: int,
                decision_history: list,
-               current_frontiers: Optional[CurrentFrontierView] = None
+               current_frontiers: Optional[CurrentFrontierView] = None,
+               current_episode_id=None,
                ) -> Tuple[Dict, List[str], str]:
         """Run two LLM stages and return a validated room-first assignment."""
         _ = decision_history  # Stable history is maintained internally.
@@ -1010,9 +1224,9 @@ class HelicaseBrain:
             self.last_decision_audit = {
                 "allowed_room_ids": [],
                 "allowed_frontier_ids": [],
-                "raw_room_probabilities": {},
+                "reported_room_probabilities": {},
                 "accepted_room_probabilities": {},
-                "raw_room_assignments": {},
+                "proposed_room_assignments": {},
                 "accepted_llm_rooms": {},
                 "selected_room_by_robot": {},
                 "selection_source_by_robot": {},
@@ -1039,9 +1253,7 @@ class HelicaseBrain:
             )
         current_room_ids = sorted(current_frontiers.room_ids)
         frontier_options = self._frontier_options(
-            current_frontiers,
-            pose_pred,
-            self.num_agents,
+            current_frontiers, pose_pred, self.num_agents
         )
         if self.decision_history_enabled:
             recent_history = self._prepare_recent_history(kg, step)
@@ -1060,6 +1272,7 @@ class HelicaseBrain:
             kg,
             current_frontiers,
             current_room_ids,
+            current_episode_id=current_episode_id,
         )
         tool_trace = [{
             "tool": "query_room_objects",
@@ -1088,19 +1301,24 @@ class HelicaseBrain:
             "query results. For every current room, call "
             "estimate_room_probability exactly once. probability means "
             "P(target is physically present in this region | accumulated "
-            "semantic evidence). It "
-            "is a semantic belief only: do NOT include robot distance, "
-            "frontier area, navigation cost, robot assignment, or exploration "
-            "utility. Independent room probabilities need not sum to one. Do "
-            "not use a Python target prior; none is provided.\n\n"
+            "semantic evidence). It is a semantic belief only: do NOT include "
+            "robot distance, frontier area, navigation cost, robot assignment, "
+            "or exploration utility. Independent room probabilities need not "
+            "sum to one. Do not use a Python target prior; none is provided.\n\n"
+            "PROVENANCE: prior_episode_ids are evidence from earlier tasks in "
+            "this same scene; observed_in_current_episode is evidence gathered "
+            "after this task began. Do not describe current evidence as "
+            "historical, and do not treat historical robot/frontier/path state "
+            "as executable.\n\n"
             "Use this evidence order for each region: (1) same-region direct "
             "target or target-diagnostic objects, including certainty and "
             "observation count; (2) a compatible observed room type, weighted "
-            "by type_certainty; (3) explored and observation_count only as "
-            "weak negative evidence, because visited does not mean "
-            "exhaustively searched; and (4) graph topology or historical "
-            "context only as weak context. Never transfer an object, room "
-            "type, or other factual evidence across room IDs.\n\n"
+            "by type_certainty; (3) "
+            "explored and observation_count only as weak negative evidence, "
+            "because visited does not mean exhaustively searched; and (4) "
+            "graph topology or uncited historical context only as weak context. "
+            "Never transfer an object, room type, or other factual evidence "
+            "across room IDs.\n\n"
             "UNKNOWN POLICY: unknown means unresolved, not target-incompatible. "
             "If evidence-equivalent unknown regions have no target-relevant "
             "evidence, give them an honest shared baseline belief with low "
@@ -1114,7 +1332,11 @@ class HelicaseBrain:
             "evidence; low probability plus high confidence means grounded "
             "negative evidence; low confidence means unresolved. Keep reason "
             "concise and factual, using only evidence belonging to that same "
-            "region.\n\n"
+            "region. confidence MUST be a JSON number in [0.0, 1.0]: use "
+            "0.0--0.3 for unresolved, 0.4--0.6 for moderate reliability, and "
+            "0.7--1.0 for strong reliability. Valid example: "
+            "confidence=0.25. Invalid example: confidence=\"low\". Never use "
+            "low, medium, moderate, or high as the confidence value.\n\n"
             "Return pure JSON with only tool_calls. Each call arguments must "
             "contain exactly room_id, target, probability, confidence, "
             "evidence_ids, reason. Copy evidence_ids only from that room's "
@@ -1144,9 +1366,6 @@ class HelicaseBrain:
                     target_name,
                     allowed_evidence,
                 ),
-                # Keep enough completion headroom for four complete room
-                # records.  DeepSeek JSON mode can still be cut mid-object if
-                # max_tokens is too small.
                 max_tokens=2048,
             )
         )
@@ -1156,7 +1375,7 @@ class HelicaseBrain:
         tool_trace.append({
             "tool": "estimate_room_probability",
             "status": probability_status,
-            "raw_response": responses[-1][:6000],
+            "model_response": responses[-1][:6000],
         })
         if probability_records is None:
             return self._finish_fallback(
@@ -1175,11 +1394,9 @@ class HelicaseBrain:
             )
 
         tools_called.append("estimate_room_probability")
-        probability_tool_result = [{
-            "room_id": room_id,
-            **probability_records[room_id],
+        tool_trace[-1]["result"] = [{
+            "room_id": room_id, **probability_records[room_id],
         } for room_id in current_room_ids]
-        tool_trace[-1]["result"] = probability_tool_result
 
         decision_packet, room_history_summary = (
             self._build_current_decision_packet(
@@ -1212,6 +1429,21 @@ class HelicaseBrain:
                 "do not guarantee non-overlapping views. Use frontier area only as "
                 "a weak tie-breaker, not as evidence that the target is present.\n\n"
             )
+        partial_stage1_guidance = ""
+        if any(
+                room.get("probability_source") == "missing_room_default"
+                for room in decision_packet["current_rooms"].values()):
+            partial_stage1_guidance = (
+                "PARTIAL CALL-1 OUTPUT: probability_source="
+                "missing_room_default means CALL 1 omitted that current room. "
+                "Its target_probability=0.1 and probability_confidence=0.0 "
+                "are unresolved protocol placeholders, not semantic positive "
+                "or negative evidence. Keep that room eligible and judge it "
+                "from its current facts, frontier coverage, spatial "
+                "complementarity, and travel. Never describe the placeholder "
+                "as an LLM estimate or as evidence that the target is absent."
+                "\n\n"
+            )
         assignment_prompt = (
             "You are the central MindNav allocation LLM. This is LLM CALL "
             "2/2. Your objective is to choose the joint "
@@ -1234,10 +1466,10 @@ class HelicaseBrain:
             "exploration coverage. Do not let small numerical differences "
             "between low-confidence unknown regions drive the assignment.\n\n"
             "First identify GROUNDED_PROMISING regions. A region is grounded "
-            "only when its target belief is supported by same-region "
-            "target-related objects or by a compatible non-unknown room type "
-            "with meaningful certainty. A larger probability alone is not "
-            "grounding. Then follow this adaptive room-first policy:\n"
+            "when its target belief is supported by same-region target-related "
+            "objects or a compatible non-unknown room type with meaningful "
+            "certainty. A larger probability alone is not grounding. "
+            "Then follow this adaptive room-first policy:\n"
             "(A) If at least two distinct grounded promising regions exist, "
             "select the best distinct grounded regions.\n"
             "(B) If exactly one grounded promising region exists, assign one "
@@ -1252,6 +1484,7 @@ class HelicaseBrain:
             "fresh coverage. For broadly distributed chair and plant, rely on "
             "semantic evidence only when it is strong; otherwise emphasize "
             "complementary coverage.\n\n"
+            f"{partial_stage1_guidance}"
             f"{history_guidance}"
             "After choosing the distinct room/frontier set, jointly match "
             "robots to it to minimize total distance and avoid crossing or "
@@ -1315,7 +1548,7 @@ class HelicaseBrain:
         tool_trace.append({
             "tool": "assign_frontiers",
             "status": assignment_status,
-            "raw_response": responses[-1][:5000],
+            "model_response": responses[-1][:5000],
         })
         if assignment_result is None:
             return self._finish_fallback(

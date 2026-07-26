@@ -1,4 +1,5 @@
 from collections import deque, defaultdict
+import copy
 from typing import Dict
 from itertools import count
 import os
@@ -29,7 +30,9 @@ CODE_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "
 if CODE_SRC not in sys.path:
     sys.path.insert(0, CODE_SRC)
 from brain import HelicaseBrain
-from kg_construction import CurrentFrontierView, KnowledgeGraph, KGUpdater
+from kg_construction import (
+    MAP_SIZE, CurrentFrontierView, EpisodeFrame, KnowledgeGraph, KGUpdater,
+)
 from llm_api import OpenAICompatibleBrainAdapter, load_brain_api_config
 from reproducibility import reset_episode_rng
 
@@ -298,6 +301,43 @@ def build_room_frontier_audit(
             "duplicate_final_frontiers": int(duplicate_final_frontiers),
         },
     }
+
+
+def build_kg_snapshot_record(
+        episode_index, episode_id, scene, goal_name, step, kg,
+        snapshot_type, metrics=None, frame=None, memory_mode="episode"):
+    """Attach episode provenance to a complete persistent-KG snapshot."""
+    if snapshot_type not in {"decision", "final"}:
+        raise ValueError(f"Unsupported KG snapshot type: {snapshot_type}")
+    record = {
+        "schema_version": 2,
+        "snapshot_type": snapshot_type,
+        "episode_index": int(episode_index),
+        "episode_id": str(episode_id),
+        "scene": os.path.basename(scene),
+        "goal": str(goal_name),
+        "step": int(step),
+        "kg_memory_mode": str(memory_mode),
+    }
+    if frame is not None:
+        record.update({
+            "coordinate_frame": "world",
+            "start_position": [float(value) for value in frame.start_position],
+            "start_rotation": [float(value) for value in frame.start_rotation],
+            "floor_id": int(frame.floor_id),
+            "map_size_px": int(frame.map_size_px),
+            "map_resolution_m": float(frame.map_resolution_m),
+        })
+    record.update(kg.to_snapshot_dict())
+    if metrics is not None:
+        record["episode_metrics"] = {
+            "habitat_success": float(metrics.get("success", 0.0)),
+            "habitat_spl": float(metrics.get("spl", 0.0)),
+            "distance_to_goal": float(
+                metrics.get("distance_to_goal", -1.0)
+            ),
+        }
+    return record
 
 
 def get_per_agent_goal_distances(env, episode, num_agents):
@@ -946,6 +986,11 @@ class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
 
 def main():
     args = get_args()
+    if (args.kg_memory_mode == "scene"
+            and args.kg_coordinate_frame != "world"):
+        raise ValueError(
+            "--kg_memory_mode scene requires --kg_coordinate_frame world"
+        )
 
     brain_config = load_brain_api_config(PROJECT_ROOT)
     if brain_config.backend == "vllm":
@@ -972,6 +1017,14 @@ def main():
             f"thinking={thinking})"
         )
         print("Skipping in-process Qwen loading; DeepSeek is API-hosted.")
+    elif brain_config.backend == "qqqapi":
+        reasoning_effort = brain_config.extra_body["reasoning_effort"]
+        print(
+            "Using qqqapi API brain: "
+            f"{brain_config.base_url} ({brain_config.model}, "
+            f"reasoning_effort={reasoning_effort})"
+        )
+        print("Skipping in-process Qwen loading; qqqapi is API-hosted.")
     else:
         # Preserve the original local-model initialization outside vLLM mode.
         model_path = args.llm_path or LOCAL_MODEL_PATHS[args.gpt_type]
@@ -1069,14 +1122,23 @@ def main():
     # print(args)
     logging.info(args)
     mapping_jsonl_log = None
+    kg_jsonl_log = None
+    scene_kg_jsonl_log = None
     if args.jsonl_log:
         jsonl_dir = os.path.dirname(os.path.abspath(args.jsonl_log))
         os.makedirs(jsonl_dir, exist_ok=True)
         open(args.jsonl_log, "w").close()
         mapping_jsonl_log = os.path.splitext(args.jsonl_log)[0] + ".mapping.jsonl"
+        kg_jsonl_log = os.path.splitext(args.jsonl_log)[0] + ".kg.jsonl"
+        scene_kg_jsonl_log = (
+            os.path.splitext(args.jsonl_log)[0] + ".scene-kg.jsonl"
+        )
         open(mapping_jsonl_log, "w").close()
+        open(kg_jsonl_log, "w").close()
+        open(scene_kg_jsonl_log, "w").close()
         print(f"Writing per-episode JSONL to {args.jsonl_log}")
         print(f"Writing room/frontier mapping audit to {mapping_jsonl_log}")
+        print(f"Writing complete KG snapshots to {kg_jsonl_log}")
     if args.stop_diag_jsonl:
         stop_diag_dir = os.path.dirname(
             os.path.abspath(args.stop_diag_jsonl)
@@ -1124,7 +1186,11 @@ def main():
         seed=args.seed if args.reset_seed_each_episode else None,
     )
     kg = KnowledgeGraph()
-    kg_updater = KGUpdater(kg)
+    scene_kgs = {}
+    # This is deliberately separate from node provenance.  A valid task can
+    # finish without leaving a static node, but it still counts as a prior
+    # same-scene task for the next episode's memory audit.
+    scene_completed_episode_counts = defaultdict(int)
     brain_class = HelicaseBrain
     if num_agents != 2:
         from brain_robot_ablation import RobotCountAblationBrain
@@ -1158,6 +1224,53 @@ def main():
             )
         observations = env.reset()
         current_episode = env.current_episode
+        scene_key = os.path.basename(current_episode.scene_id)
+        frame = None
+        if args.kg_coordinate_frame == "world":
+            frame = EpisodeFrame(
+                scene_id=scene_key,
+                start_position=tuple(
+                    float(value) for value in current_episode.start_position
+                ),
+                start_rotation=tuple(
+                    float(value) for value in current_episode.start_rotation
+                ),
+                map_size_px=MAP_SIZE,
+                map_resolution_m=float(args.map_resolution) / 100.0,
+            )
+        if args.kg_memory_mode == "scene":
+            kg = scene_kgs.setdefault(scene_key, KnowledgeGraph())
+            kg.reset_episode_state()
+            scene_memory_previous_episodes = scene_completed_episode_counts[
+                scene_key
+            ]
+            scene_memory_nodes_before = len(kg.nodes)
+            scene_memory_edges_before = len(kg.edges)
+        else:
+            kg.reset()
+            scene_memory_previous_episodes = 0
+            scene_memory_nodes_before = 0
+            scene_memory_edges_before = 0
+        episode_target_name = str(
+            getattr(current_episode, "object_category", "")
+        )
+        historical_target_node_ids = {
+            node.id for node in kg.get_nodes_by_type("object")
+            if node.name == episode_target_name
+        }
+        historical_target_room_ids = {
+            edge.source for edge in kg.edges
+            if edge.relation == "contains"
+            and edge.target in historical_target_node_ids
+        }
+        historical_target_seen = bool(historical_target_node_ids)
+        kg_updater = KGUpdater(
+            kg,
+            frame=frame,
+            persistent_scene=args.kg_memory_mode == "scene",
+            episode_id=str(current_episode.episode_id),
+        )
+        alignment_errors_m = []
         initial_agent_poses = None
         if num_agents != 2:
             initial_agent_poses = robot_count_runtime.capture_initial_agent_poses(
@@ -1169,7 +1282,6 @@ def main():
             f"scene={os.path.basename(current_episode.scene_id)} "
             f"target={getattr(current_episode, 'object_category', 'unknown')}"
         )
-        kg.reset()
         decision_history.clear()
         last_decision.clear()
         goal_points.clear()
@@ -1201,6 +1313,25 @@ def main():
                     np.deg2rad(-start_o)
                 )
                 pose_pred.append(pos)
+                if frame is not None:
+                    try:
+                        map_rc = CurrentFrontierView.robot_pose_to_map_rc(
+                            pos, MAP_SIZE
+                        )
+                        predicted_xz = frame.map_rc_to_world_xz(*map_rc)
+                        agent_state = env.sim.get_agent_state(i)
+                        actual_xz = (
+                            float(agent_state.position[0]),
+                            float(agent_state.position[2]),
+                        )
+                        alignment_errors_m.append(float(np.hypot(
+                            predicted_xz[0] - actual_xz[0],
+                            predicted_xz[1] - actual_xz[1],
+                        )))
+                    except Exception as alignment_error:
+                        episode_errors.append(
+                            f"alignment_audit: {alignment_error}"
+                        )
                 
             if num_agents == 2:
                 full_map2 = torch.cat((full_map[0].unsqueeze(0), full_map[1].unsqueeze(0)), 0)
@@ -1259,6 +1390,25 @@ def main():
                         pose_pred,
                         Wall_list,
                     )
+                    if kg_jsonl_log:
+                        kg_snapshot = build_kg_snapshot_record(
+                            args.start_episode_index + count_episodes,
+                            current_episode.episode_id,
+                            current_episode.scene_id,
+                            agent[0].goal_name,
+                            agent[0].l_step,
+                            kg,
+                            "decision",
+                            frame=frame,
+                            memory_mode=args.kg_memory_mode,
+                        )
+                        with open(kg_jsonl_log, "a") as kg_file:
+                            json.dump(
+                                kg_snapshot,
+                                kg_file,
+                                ensure_ascii=False,
+                            )
+                            kg_file.write("\n")
 
                     retries = 3
                     vlm_success = False
@@ -1278,6 +1428,7 @@ def main():
                                 args.max_episode_length,
                                 decision_history,
                                 current_frontiers=current_frontiers,
+                                current_episode_id=str(current_episode.episode_id),
                             )
                             last_llm_response = brain_adapter.last_response
                             print(
@@ -1323,6 +1474,19 @@ def main():
                         reason = (
                             type(last_brain_error).__name__
                             if last_brain_error is not None else "brain_error"
+                        )
+                        # Transport failures and unexpected exceptions can
+                        # exhaust the outer retry loop before ``decide``
+                        # returns a complete two-robot assignment.  They must
+                        # degrade to the same current-frontier-only fallback
+                        # as validated model-output failures, not fall through
+                        # with a partial/stale assignment and abort the run.
+                        goal_frontiers, tools_called, decision_method = (
+                            mindnav_brain.deterministic_fallback(
+                                current_frontiers,
+                                pose_pred,
+                                reason=reason,
+                            )
                         )
 
                     decision_audit = mindnav_brain.last_decision_audit
@@ -1379,6 +1543,7 @@ def main():
                             raise ValueError(
                                 "Final current-frontier assignments are not unique"
                             )
+
 
                     last_decision.clear()
                     for i in range(num_agents):
@@ -1614,6 +1779,65 @@ def main():
         ]) + '\n'
 
         metrics = env.get_metrics()
+        if frame is not None:
+            median_alignment_error = (
+                float(np.median(alignment_errors_m))
+                if alignment_errors_m else float("inf")
+            )
+            max_alignment_error = (
+                float(np.max(alignment_errors_m))
+                if alignment_errors_m else float("inf")
+            )
+            if (median_alignment_error > args.kg_alignment_median_threshold_m
+                    or max_alignment_error > args.kg_alignment_max_threshold_m):
+                raise RuntimeError(
+                    "KG world-coordinate alignment failed: "
+                    f"median={median_alignment_error:.4f} m "
+                    f"(limit={args.kg_alignment_median_threshold_m:.4f}), "
+                    f"max={max_alignment_error:.4f} m "
+                    f"(limit={args.kg_alignment_max_threshold_m:.4f})"
+                )
+        if kg_jsonl_log:
+            final_kg_snapshot = build_kg_snapshot_record(
+                args.start_episode_index + count_episodes - 1,
+                current_episode.episode_id,
+                current_episode.scene_id,
+                agent[0].goal_name,
+                agent[0].l_step,
+                kg,
+                "final",
+                metrics=metrics,
+                frame=frame,
+                memory_mode=args.kg_memory_mode,
+            )
+            with open(kg_jsonl_log, "a") as kg_file:
+                json.dump(
+                    final_kg_snapshot,
+                    kg_file,
+                    ensure_ascii=False,
+                )
+                kg_file.write("\n")
+        if scene_kg_jsonl_log:
+            # This audit stream represents reusable scene memory, not the
+            # live episode graph.  Strip robots and all transient execution
+            # relations from a copy so it cannot be mistaken for history.
+            scene_kg_for_snapshot = copy.deepcopy(kg)
+            scene_kg_for_snapshot.reset_episode_state()
+            scene_kg_snapshot = build_kg_snapshot_record(
+                args.start_episode_index + count_episodes - 1,
+                current_episode.episode_id,
+                current_episode.scene_id,
+                agent[0].goal_name,
+                agent[0].l_step,
+                scene_kg_for_snapshot,
+                "final",
+                metrics=metrics,
+                frame=frame,
+                memory_mode=args.kg_memory_mode,
+            )
+            with open(scene_kg_jsonl_log, "a") as scene_kg_file:
+                json.dump(scene_kg_snapshot, scene_kg_file, ensure_ascii=False)
+                scene_kg_file.write("\n")
         if args.jsonl_log:
             usage_after_episode = brain_adapter.usage_snapshot()
             episode_usage = {
@@ -1622,10 +1846,12 @@ def main():
             }
             episode_ended_at = datetime.now(timezone.utc)
             episode_record = {
-                "schema_version": 2,
+                "schema_version": 4,
                 "run_id": args.method_name,
                 "method": args.method_name,
                 "kg_serialization": args.kg_serialization,
+                "kg_coordinate_frame": args.kg_coordinate_frame,
+                "kg_memory_mode": args.kg_memory_mode,
                 "decision_history": args.decision_history,
                 "semantic_source": (
                     "habitat_gt" if args.use_gtsem else "predicted"
@@ -1640,6 +1866,32 @@ def main():
                 ),
                 "episode_id": str(current_episode.episode_id),
                 "scene": os.path.basename(current_episode.scene_id),
+                "start_position": [
+                    float(value) for value in current_episode.start_position
+                ],
+                "start_rotation": [
+                    float(value) for value in current_episode.start_rotation
+                ],
+                "floor_id": frame.floor_id if frame is not None else None,
+                "scene_memory_previous_episodes": (
+                    scene_memory_previous_episodes
+                ),
+                "scene_memory_nodes_before_episode": scene_memory_nodes_before,
+                "scene_memory_edges_before_episode": scene_memory_edges_before,
+                "scene_memory_nodes_after_episode": len(kg.nodes),
+                "scene_memory_edges_after_episode": len(kg.edges),
+                "alignment_robot_median_error_m": (
+                    float(np.median(alignment_errors_m))
+                    if alignment_errors_m else None
+                ),
+                "alignment_robot_max_error_m": (
+                    float(np.max(alignment_errors_m))
+                    if alignment_errors_m else None
+                ),
+                "historical_target_seen": historical_target_seen,
+                "historical_target_room_count": int(
+                    len(historical_target_room_ids)
+                ),
                 "success": float(metrics.get("success", 0.0)),
                 "spl": float(metrics.get("spl", 0.0)),
                 "habitat_success": float(metrics.get("success", 0.0)),
@@ -1685,6 +1937,8 @@ def main():
             with open(args.jsonl_log, "a") as jsonl_file:
                 json.dump(episode_record, jsonl_file, ensure_ascii=False)
                 jsonl_file.write("\n")
+        if args.kg_memory_mode == "scene":
+            scene_completed_episode_counts[scene_key] += 1
         for m, v in metrics.items():
             if isinstance(v, dict):
                 for sub_m, sub_v in v.items():

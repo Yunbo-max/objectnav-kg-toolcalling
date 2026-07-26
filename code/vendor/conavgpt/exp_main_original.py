@@ -2,9 +2,12 @@ from collections import deque, defaultdict
 from typing import Dict
 from itertools import count
 import os
+import sys
 import logging
 import time
 import json
+import subprocess
+from datetime import datetime, timezone
 import gym
 import torch.nn as nn
 import torch
@@ -28,6 +31,12 @@ import habitat
 # import openai
 # from openai import OpenAIError
 from local_vlm import load_model, chat_completion_create
+
+CODE_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+if CODE_SRC not in sys.path:
+    sys.path.insert(0, CODE_SRC)
+from llm_api import OpenAICompatibleTextAdapter, load_brain_api_config
+from reproducibility import reset_episode_rng
 
 import habitat_sim
 from habitat.sims.habitat_simulator.actions import (
@@ -99,6 +108,7 @@ LOCAL_MODEL_PATHS = [
     '/tf/notebooks/models/Qwen2.5-3B-Instruct',
     '/tf/notebooks/models/Qwen2.5-7B-Instruct',
 ]
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 # GPT Type
 gpt_name = [
     'text-davinci-003',
@@ -477,8 +487,33 @@ def main():
 
     brain_backend = os.environ.get("BRAIN_BACKEND", "local").strip().lower()
     brain_client = None
+    brain_adapter = None
+    brain_config = None
     brain_model = None
-    if brain_backend == "vllm":
+    if brain_backend in {"deepseek", "qqqapi"}:
+        brain_config = load_brain_api_config(PROJECT_ROOT)
+        brain_model = brain_config.model
+        brain_adapter = OpenAICompatibleTextAdapter(
+            config=brain_config,
+            usage_sink=[],
+            seed=args.seed if args.reset_seed_each_episode else None,
+        )
+        if brain_backend == "deepseek":
+            thinking = brain_config.extra_body["thinking"]["type"]
+            print(
+                "Using DeepSeek API brain: "
+                f"{brain_config.base_url} ({brain_model}, thinking={thinking})"
+            )
+        else:
+            reasoning = (brain_config.extra_body or {}).get(
+                "reasoning_effort", "provider_default"
+            )
+            print(
+                "Using qqqapi text brain: "
+                f"{brain_config.base_url} ({brain_model}, reasoning={reasoning})"
+            )
+        print("Skipping in-process Qwen loading; the brain is API-hosted.")
+    elif brain_backend == "vllm":
         import openai
 
         brain_base_url = os.environ.get(
@@ -602,8 +637,43 @@ def main():
     log_start = time.time()
     last_decision = []
     total_usage = []
+    try:
+        git_commit = subprocess.check_output(
+            ["git", "-C", PROJECT_ROOT, "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+    except Exception:
+        git_commit = "unknown"
 
     while count_episodes < num_episodes:
+        episode_started_at = datetime.now(timezone.utc)
+        usage_before_episode = (
+            brain_adapter.usage_snapshot()
+            if brain_adapter is not None else {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 0,
+                "api_calls": 0,
+            }
+        )
+        episode_diagnostics = defaultdict(int, {
+            "invalid_outputs": 0,
+            "repair_calls": 0,
+            "outer_retries": 0,
+            "fallback_decisions": 0,
+            "planning_rounds": 0,
+            "request_failures": 0,
+        })
+        episode_errors = []
+        episode_seed = None
+        if args.reset_seed_each_episode:
+            episode_seed = reset_episode_rng(args.seed, env=env)
+            print(
+                f"[EPISODE_SEED] index="
+                f"{args.start_episode_index + count_episodes} "
+                f"seed={episode_seed} mode=fixed_global"
+            )
         observations = env.reset()
         current_episode = env.current_episode
         print(
@@ -665,11 +735,16 @@ def main():
                     message_list.append({"role": "system", "content": system_prompt})
                     message_list.append({"role": "user", "content": User_prompt})
 
+                    episode_diagnostics["planning_rounds"] += 1
                     retries = 10    
                     while retries > 0:  
                         response_message = None
                         try: 
-                            if brain_client is not None:
+                            if brain_adapter is not None:
+                                response_message = brain_adapter.call(
+                                    message_list, max_tokens=256
+                                )
+                            elif brain_client is not None:
                                 response = brain_client.chat.completions.create(
                                     model=brain_model,
                                     messages=message_list,
@@ -686,9 +761,9 @@ def main():
                             usage = 0
                             print((brain_model or gpt_name[args.gpt_type]) + " response: ")
                             print(response_message)
-                            if brain_client is None and gpt_name[args.gpt_type] == 'gpt-4':
+                            if brain_adapter is None and brain_client is None and gpt_name[args.gpt_type] == 'gpt-4':
                                 usage = response['usage']['prompt_tokens'] * 0.03 / 1000 + response['usage']['completion_tokens'] * 0.06 / 1000
-                            elif brain_client is None and gpt_name[args.gpt_type] == 'gpt-3.5-turbo':
+                            elif brain_adapter is None and brain_client is None and gpt_name[args.gpt_type] == 'gpt-3.5-turbo':
                                 usage = response['usage']['total_tokens'] * 0.002 / 1000
                             total_usage.append(usage)
                             goal_frontiers = parse_answer(response_message)
@@ -711,8 +786,15 @@ def main():
                         except Exception as e:
                             print(e)
                             print('LLM request failed, retrying...')
+                            episode_diagnostics["outer_retries"] += 1
+                            if response_message:
+                                episode_diagnostics["invalid_outputs"] += 1
+                            else:
+                                episode_diagnostics["request_failures"] += 1
+                            episode_errors.append(str(e)[:500])
                             retries -= 1
                             if retries == 0:
+                                episode_diagnostics["fallback_decisions"] += 1
                                 fallback_indices = [
                                     i % len(target_point_map)
                                     for i in range(num_agents)
@@ -731,6 +813,7 @@ def main():
                                 )
                                 break
                             if response_message:
+                                episode_diagnostics["repair_calls"] += 1
                                 message_list.extend([
                                     {
                                         "role": "assistant",
@@ -788,18 +871,67 @@ def main():
 
         metrics = env.get_metrics()
         if args.jsonl_log:
+            usage_after_episode = (
+                brain_adapter.usage_snapshot()
+                if brain_adapter is not None else usage_before_episode
+            )
+            episode_usage = {
+                key: int(usage_after_episode[key] - usage_before_episode[key])
+                for key in usage_before_episode
+            }
+            episode_ended_at = datetime.now(timezone.utc)
+            resolved_model = brain_model
+            if resolved_model is None:
+                resolved_model = os.path.basename(
+                    args.llm_path or LOCAL_MODEL_PATHS[args.gpt_type]
+                )
             episode_record = {
+                "schema_version": 2,
+                "run_id": args.method_name,
                 "method": args.method_name,
+                "kg_serialization": "flat_text",
+                "decision_history": "on",
+                "semantic_source": "predicted",
                 "episode": args.start_episode_index + count_episodes,
+                "episode_index": args.start_episode_index + count_episodes - 1,
                 "episode_id": str(current_episode.episode_id),
                 "scene": os.path.basename(current_episode.scene_id),
                 "goal": agent[0].goal_name,
                 "steps": int(agent[0].l_step),
                 "success": float(metrics.get("success", 0.0)),
                 "spl": float(metrics.get("spl", 0.0)),
+                "habitat_success": float(metrics.get("success", 0.0)),
+                "habitat_spl": float(metrics.get("spl", 0.0)),
                 "distance_to_goal": float(metrics.get("distance_to_goal", -1.0)),
+                **episode_usage,
+                **{key: int(value) for key, value in episode_diagnostics.items()},
+                "backend": brain_backend,
+                "base_url": (
+                    brain_config.base_url if brain_config is not None
+                    else os.environ.get("BRAIN_BASE_URL", "local")
+                ),
+                "model": resolved_model,
+                "habitat_sim_version": habitat_sim.__version__,
+                "sim_gpu_id": int(args.sim_gpu_id),
+                "sem_gpu_id": int(args.sem_gpu_id),
+                "llm_gpu_id": int(args.llm_gpu_id),
+                "success_threshold_m": float(
+                    config_env.TASK.SUCCESS.SUCCESS_DISTANCE
+                ),
+                "episode_seed": episode_seed,
                 "seed": int(args.seed),
-                "seed_mode": "continuous",
+                "seed_mode": (
+                    "fixed_global"
+                    if args.reset_seed_each_episode else "continuous"
+                ),
+                "git_commit": git_commit,
+                "started_at": episode_started_at.isoformat(),
+                "ended_at": episode_ended_at.isoformat(),
+                "duration_seconds": (
+                    episode_ended_at - episode_started_at
+                ).total_seconds(),
+                "status": "complete",
+                "errors": episode_errors,
             }
             with open(args.jsonl_log, "a") as jsonl_file:
                 json.dump(episode_record, jsonl_file, ensure_ascii=False)
@@ -813,8 +945,13 @@ def main():
 
         log += ", ".join(k + ": {:.3f}".format(v / count_episodes) for k, v in agg_metrics.items()) + " ---({:.0f}/{:.0f})".format(count_episodes, num_episodes)
 
-        average_usage = float(np.mean(total_usage)) if total_usage else 0.0
-        log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(average_usage)
+        if brain_adapter is not None:
+            log += " LLM usage: " + json.dumps(
+                brain_adapter.usage_snapshot(), sort_keys=True
+            )
+        else:
+            average_usage = float(np.mean(total_usage)) if total_usage else 0.0
+            log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(average_usage)
         print(log)
         logging.info(log)
         # ------------------------------------------------------------------
